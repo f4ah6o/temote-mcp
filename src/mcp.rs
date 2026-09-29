@@ -1782,6 +1782,10 @@ fn compact_task_list_view(view: &mut Value) {
                 "status": task["status"],
                 "revision": task["revision"],
                 "last_updated_at": task["last_updated_at"],
+                "pending_interaction": task
+                    .get("pending_interaction")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"state": "unsupported"})),
             });
         }
     }
@@ -3103,9 +3107,27 @@ mod tests {
                 "status": "completed",
                 "revision": 9,
                 "last_updated_at": 42,
+                "pending_interaction": {
+                    "state": "pending",
+                    "count": 1,
+                    "types": ["approval"],
+                    "summary_revision": 3,
+                    "observed_at": 40,
+                    "producer_kind": "runtime_owner",
+                    "producer_epoch": 2,
+                    "expires_at": 70,
+                    "truncated": false
+                },
                 "report": {"summary": "private result"},
                 "last_error": "private error",
                 "raw_result": "private output"
+            }, {
+                "backend": "devin_cloud",
+                "task_id": Uuid::new_v4(),
+                "status": "running",
+                "revision": 2,
+                "last_updated_at": 41,
+                "report": {"summary": "private result"}
             }],
             "backends": {"opencode": {"status": "ok", "total": 1, "skipped": 0}},
             "total": 1,
@@ -3118,10 +3140,15 @@ mod tests {
         assert_eq!(item["status"], "completed");
         assert_eq!(item["revision"], 9);
         assert_eq!(item["last_updated_at"], 42);
+        assert_eq!(item["pending_interaction"]["state"], "pending");
+        assert_eq!(item["pending_interaction"]["types"][0], "approval");
         assert!(item["task_id"].is_string());
         assert!(item.get("report").is_none());
         assert!(item.get("last_error").is_none());
         assert!(item.get("raw_result").is_none());
+        let legacy_item = &view["tasks"][1];
+        assert_eq!(legacy_item["pending_interaction"]["state"], "unsupported");
+        assert!(legacy_item.get("report").is_none());
         assert_eq!(view["backends"]["opencode"]["status"], "ok");
     }
 

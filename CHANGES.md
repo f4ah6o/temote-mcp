@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an Access-protected read-only Fabric dashboard at `/dash/`, with configured host inventory, retained task interaction summaries, scoped context, and replicated timeline metadata. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - `temote-mcp upgrade --dry-run` now lists each unrestorable session's `session_id` and reason in `blocked_sessions`, and `temote-mcp upgrade --force` stops those sessions before the handoff (they are not restored) instead of aborting; protocol, ingress, and helper compatibility gates still apply. ([upgrade force and blocked session list](issues/open/20260928-upgrade-force-blocked-sessions.md))
 - Added `repository_clone_bare`, an idempotent public tool that admits an active non-yolo session at an exact supervisor-configured named root, accepts same-root local or credential-free HTTPS sources, rejects existing or escaping destinations, and delegates an atomically claimed bare Git clone through the retained Codex task lifecycle without exposing an absolute host path.
 - `temote-mcp doctor` checks Jujutsu (`jj --version`) for development readiness and warns when jj is missing or unusable without requiring it for normal operation.
@@ -19,12 +20,14 @@
 
 ### Changed
 
+- Devin Cloud retained task records use schema 3 for durable observation ownership; older binaries reject promoted records, so Host rollback needs a compatible reader or reviewed record recovery. OpenCode metadata reads are bounded and refuse redirects. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - Dogfood comparisons accept completed, verified issue work without requiring a measured Temote improvement; reports distinguish `improved`, `unchanged`, and `regressed`, while regressions and missing acceptance evidence remain blocked.
 - Supervisor upgrades now coordinate session restore, direct-ingress recovery, endpoint checks, and binary-owned Codex plugin reconciliation before reporting terminal status.
 - `agent` permission mode now runs ordinary `execute`/`start_command` in the same sandbox and path containment with the network-enabled development profile, so localhost, LAN, and Internet development traffic works without yolo. `ask` keeps ordinary commands network-disabled, and public HTTP still cannot expose `without_sandbox` or create/promote `yolo`. ([agent development network access](issues/open/20260915-agent-development-network-access.md))
 
 ### Fixed
 
+- Codex and Devin ACP runtime actors retain bounded partial JSONL messages while processing another command, preventing cancelled reads from discarding a message prefix. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - Accepted Codex task runtimes now tolerate one-off session metadata or liveness probe failures while monitoring their already-authorized owner. Verified inactive or replaced sessions still stop immediately, and three consecutive unknown observations stop fail-closed.
 - Session lifecycle admission now accepts standard linked worktrees backed by bare repositories, using the validated canonical common Git directory as the repository reservation identity. Managed-worktree authority and Git mutation brokers still require the supported primary-checkout layout, and malformed reciprocal pointers or symlinked `.git` metadata remain rejected.
 - Completed OpenCode and Devin ACP tasks keep malformed final replies recoverable through scoped evidence. Task responses show report decode status and truncation without changing execution status. ([completed task result recovery](issues/open/20260927-completed-task-malformed-final-report-json.md))

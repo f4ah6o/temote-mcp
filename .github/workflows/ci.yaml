@@ -24,11 +24,17 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install pinned gateway tooling
+        run: npm ci --prefix gateway
+
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
 
       - name: Test D1 schema integrity
         run: python3 gateway/test/cloud_observation_schema_sqlite.py
+
+      - name: Test dashboard projection SQL scope
+        run: python3 gateway/test/dashboard_schema_sqlite.py
 
   rust:
     strategy:

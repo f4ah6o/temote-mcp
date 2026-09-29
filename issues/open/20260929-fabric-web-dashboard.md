@@ -1,12 +1,16 @@
 # Fabric Dashboard: Zero Trust 配下の `/dash` Web dashboard
 
-Status: open / design ready  
-Repository: `f4ah6o/temote-mcp`  
-Priority: P1 operator visibility  
-Created: 2026-09-29 (Asia/Tokyo)  
-Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
-Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
-Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
+Status: open / implemented locally; deployed acceptance blocked
+Repository: `f4ah6o/temote-mcp`
+Priority: P1 operator visibility
+Created: 2026-09-29 (Asia/Tokyo)
+Updated: 2026-09-29
+Model: gpt-6-sol
+Branch: feat/fabric-web-dashboard
+PR: https://github.com/f4ah6o/temote-mcp/pull/88 (Draft; deployed acceptance blocked)
+Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`
+Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`
+Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`
 Related local viewer: `issues/done/20260914-local-activity-viewer.md`
 
 ## 1. Decision
@@ -1036,41 +1040,41 @@ real deployed Fabric hostname で:
 ## 14. Acceptance criteria
 
 - [ ] Dashboard は existing Fabric Worker と同じ deployment に含まれる。
-- [ ] canonical entry is `/dash/`; `/dash` は authenticated redirect。
+- [x] canonical entry is `/dash/`; `/dash` は authenticated redirect。
 - [ ] Cloudflare Access を通らない public dashboard route が存在しない。
-- [ ] Worker 側で検証済み Access JWT(signature / issuer / audience / expiry / subject / `ACCESS_ALLOWED_EMAILS`)を必須とする。
-- [ ] `CLIENT_TOKEN` / `HOST_TOKEN` / federated host token は dashboard 認証の代替にならない。
-- [ ] Dashboard v1 は read-only。
-- [ ] Existing `/mcp`, `/healthz`, host API, observation ingest の behavior を壊さない。
-- [ ] host/session/task live state と Fabric replica の authority が UI/API で区別される。
-- [ ] offline/unavailable を empty/success/current に正規化しない。
-- [ ] host inventory が server-side configured membership と owner-scoped replica metadata で構成され、`readOnlineHosts` は liveness overlay に限定される。
-- [ ] offline host が registry prune / page reload 後も識別できる。
-- [ ] availability (`online` / `offline` / `unknown`) は live route の有無のみを表し、判別不能な接続履歴や切断理由を断定しない (ケース A / B に未確認の履歴を付与しない)。
-- [ ] host の接続 / 同期履歴は証拠が存在する場合のみ表示され、証拠なしは `unknown`、履歴取得元の失敗は `unavailable`。`configured_only` は情報源属性であり「未接続」の意味を持たない。
-- [ ] configured membership 認可が host 一覧と host 配下の直接参照に一貫して適用され、stale D1 row からの復元表示をしない。
-- [ ] unknown / offline / unavailable と evidence 属性を混同しない。
-- [ ] pending interaction は `runtime_owner` producer または `host_remote_observer` が生成し task metadata に保存された bounded summary を `task_list` が読み取る経路で表示され、欠落 field を「なし」と表示しない。
-- [ ] pending summary は `summary_revision` / `observed_at` / `producer_kind` / `producer_epoch` / `expires_at` を持ち、期限切れ・一部 endpoint 失敗・observer 停止を「対話待ちなし」と表示しない。
-- [ ] task status / revision 非依存の summary 変更が UI に反映される。
-- [ ] `task_list` / dashboard GET だけでは task/runtime の spawn・resume・reconciliation・answer が発生しない。
-- [ ] Devin Cloud の summary は D2 の Host-side read-only observer が更新し、dashboard GET / task_list / browser access を契機に起動・取得しない。
-- [ ] 観測所有権 (`producer_kind` / `producer_epoch`) と実行所有権を混同せず、旧 owner の遅延結果を拒否する。
-- [ ] Cloud observer は binding 済み remote session の status read のみを行い、task status / operation receipt / backend generation / remote session binding を観測の都合で変更しない。
-- [ ] 観測所有権は `observer_owner_id` / 永続 `producer_epoch` / 15 秒 lease を同一排他区間で比較更新し、acquire・renew・expire・takeover・publish・release の許可条件と保存内容が一意に決まる。
-- [ ] 観測 metadata 更新は task `updated_at` / `created_at` / status / revision / generation / receipts / binding / owner / scope / org_id を変更しない。
-- [ ] Host / observer 停止時、summary は期限切れとして扱うが remote task は停止しない。
-- [ ] process restart 後、保存済み summary を現在の owner・接続状態・鮮度の確認なしに heartbeat だけで fresh に戻さない。
-- [ ] task list の backend-level unavailable が表示可能。
-- [ ] context freshness / gap / degradation が表示可能。
-- [ ] timeline は sanitized replicated observation の bounded projection のみ。
-- [ ] prompt/stdout/stderr/argv/environment/credential/raw evidence を dashboard data に追加しない。
-- [ ] dashboard API は no-store + same-origin + strict security headers。
-- [ ] dashboard assets は third-party runtime/CDN に依存しない。
-- [ ] `npm test --prefix gateway` PASS。
-- [ ] `wrangler deploy --dry-run` PASS。
+- [x] Worker 側で検証済み Access JWT(signature / issuer / audience / expiry / subject / `ACCESS_ALLOWED_EMAILS`)を必須とする。
+- [x] `CLIENT_TOKEN` / `HOST_TOKEN` / federated host token は dashboard 認証の代替にならない。
+- [x] Dashboard v1 は read-only。
+- [x] Existing `/mcp`, `/healthz`, host API, observation ingest の behavior を壊さない。
+- [x] host/session/task live state と Fabric replica の authority が UI/API で区別される。
+- [x] offline/unavailable を empty/success/current に正規化しない。
+- [x] host inventory が server-side configured membership と owner-scoped replica metadata で構成され、`readOnlineHosts` は liveness overlay に限定される。
+- [x] offline host が registry prune / page reload 後も識別できる。
+- [x] availability (`online` / `offline` / `unknown`) は live route の有無のみを表し、判別不能な接続履歴や切断理由を断定しない (ケース A / B に未確認の履歴を付与しない)。
+- [x] host の接続 / 同期履歴は証拠が存在する場合のみ表示され、証拠なしは `unknown`、履歴取得元の失敗は `unavailable`。`configured_only` は情報源属性であり「未接続」の意味を持たない。
+- [x] configured membership 認可が host 一覧と host 配下の直接参照に一貫して適用され、stale D1 row からの復元表示をしない。
+- [x] unknown / offline / unavailable と evidence 属性を混同しない。
+- [x] pending interaction は `runtime_owner` producer または `host_remote_observer` が生成し task metadata に保存された bounded summary を `task_list` が読み取る経路で表示され、欠落 field を「なし」と表示しない。
+- [x] pending summary は `summary_revision` / `observed_at` / `producer_kind` / `producer_epoch` / `expires_at` を持ち、期限切れ・一部 endpoint 失敗・observer 停止を「対話待ちなし」と表示しない。
+- [x] task status / revision 非依存の summary 変更が UI に反映される。
+- [x] `task_list` / dashboard GET だけでは task/runtime の spawn・resume・reconciliation・answer が発生しない。
+- [x] Devin Cloud の summary は D2 の Host-side read-only observer が更新し、dashboard GET / task_list / browser access を契機に起動・取得しない。
+- [x] 観測所有権 (`producer_kind` / `producer_epoch`) と実行所有権を混同せず、旧 owner の遅延結果を拒否する。
+- [x] Cloud observer は binding 済み remote session の status read のみを行い、task status / operation receipt / backend generation / remote session binding を観測の都合で変更しない。
+- [x] 観測所有権は `observer_owner_id` / 永続 `producer_epoch` / 15 秒 lease を同一排他区間で比較更新し、acquire・renew・expire・takeover・publish・release の許可条件と保存内容が一意に決まる。
+- [x] 観測 metadata 更新は task `updated_at` / `created_at` / status / revision / generation / receipts / binding / owner / scope / org_id を変更しない。
+- [x] Host / observer 停止時、summary は期限切れとして扱うが remote task は停止しない。
+- [x] process restart 後、保存済み summary を現在の owner・接続状態・鮮度の確認なしに heartbeat だけで fresh に戻さない。
+- [x] task list の backend-level unavailable が表示可能。
+- [x] context freshness / gap / degradation が表示可能。
+- [x] timeline は sanitized replicated observation の bounded projection のみ。
+- [x] prompt/stdout/stderr/argv/environment/credential/raw evidence を dashboard data に追加しない。
+- [x] dashboard API は no-store + same-origin + strict security headers。
+- [x] dashboard assets は third-party runtime/CDN に依存しない。
+- [x] `npm test --prefix gateway` PASS。
+- [x] `wrangler deploy --dry-run` PASS。
 - [ ] deployed Zero Trust E2E を記録する。
-- [ ] `git diff --check` PASS。
+- [x] `git diff --check` PASS。
 
 ## 15. Non-goals / follow-up
 
@@ -1107,3 +1111,9 @@ Design baseline checked 2026-09-29:
   https://developers.cloudflare.com/workers/static-assets/routing/worker-script/
 
 Platform-specific behavior must be rechecked when implementation starts; repo security/authority invariants remain the source of truth.
+
+## 17. Implementation tracking
+
+D0–D4 implementation and gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. This issue remains open until all acceptance gates are evidenced. Deployed acceptance and independent PR review are separate from local tests.
+
+D0–D3 code and local regression gates pass. Checked §14 items denote local implementation/test evidence, not deployed or independent approval. Same-deployment identity, Access edge acceptance, and deployed Zero Trust E2E remain unchecked pending approved candidate Worker/Host rollout and browser login. The acceptance matrix contains layer-specific results and the operator rerun.

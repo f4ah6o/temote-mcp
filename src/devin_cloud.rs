@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -25,10 +26,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
+use crate::pending_interaction::{
+    self, InteractionType, PendingInteractionSummary, ProducerKind, Summary, SummaryState,
+};
 use crate::{config, evidence};
 
 const MIN_TASK_SCHEMA_VERSION: u64 = 1;
-const TASK_SCHEMA_VERSION: u64 = 2;
+const TASK_SCHEMA_VERSION: u64 = 3;
 const TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_TASK_RECORD_BYTES: usize = 64 * 1024;
 const MAX_TASK_DIRECTORY_ENTRIES: usize = 4096;
@@ -283,6 +287,13 @@ enum CloudApi {
     Fake(Arc<Mutex<FakeApi>>),
 }
 
+#[derive(Debug, Deserialize)]
+struct CloudStatusRead {
+    session_id: Option<String>,
+    status: Option<String>,
+    status_detail: Option<String>,
+}
+
 struct HttpApi {
     client: reqwest::Client,
     base_url: String,
@@ -293,6 +304,7 @@ impl HttpApi {
     fn new(config: &CloudConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("temote-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -346,10 +358,8 @@ impl HttpApi {
             )));
         }
         if !status.is_success() {
-            let detail = String::from_utf8_lossy(&bytes);
-            return Err(ApiError::Rejected(bound_text(
-                &format!("Devin Cloud API returned HTTP {status}: {}", detail.trim()),
-                MAX_ERROR_BYTES,
+            return Err(ApiError::Rejected(format!(
+                "Devin Cloud API returned HTTP {status}"
             )));
         }
         if bytes.is_empty() {
@@ -357,6 +367,69 @@ impl HttpApi {
         }
         serde_json::from_slice(&bytes).map_err(|_| {
             ApiError::Uncertain(format!("Devin Cloud {path} returned a non-JSON response"))
+        })
+    }
+
+    async fn get_session_status(&self, org_id: &str, devin_id: &str) -> ApiResult<CloudStatusRead> {
+        let path = format!("/v3/organizations/{org_id}/sessions/{devin_id}");
+        let response = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                let message = bound_text(
+                    &format!("Devin Cloud request failed: {error}"),
+                    MAX_ERROR_BYTES,
+                );
+                if error.is_connect() || error.is_builder() || error.is_request() {
+                    ApiError::Rejected(message)
+                } else {
+                    ApiError::Uncertain(message)
+                }
+            })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(ApiError::Uncertain(format!(
+                "Devin Cloud response exceeds {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(MAX_RESPONSE_BYTES as u64) as usize,
+        );
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            ApiError::Uncertain(bound_text(
+                &format!("Devin Cloud response read failed: {error}"),
+                MAX_ERROR_BYTES,
+            ))
+        })? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(ApiError::Uncertain(format!(
+                    "Devin Cloud response exceeds {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&bytes);
+            return Err(ApiError::Rejected(bound_text(
+                &format!("Devin Cloud API returned HTTP {status}: {}", detail.trim()),
+                MAX_ERROR_BYTES,
+            )));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ApiError::Uncertain(
+                "Devin Cloud status response did not match the bounded metadata shape".to_owned(),
+            )
         })
     }
 }
@@ -402,6 +475,30 @@ impl CloudApi {
             None,
         )
         .await
+    }
+
+    /// Bounded metadata projection used only by the background observer. It
+    /// retains the remote identity and the two status fields needed to classify
+    /// pending approval state; the remainder of the response is discarded.
+    async fn get_session_status(&self, org_id: &str, devin_id: &str) -> ApiResult<CloudStatusRead> {
+        match self {
+            Self::Http(http) => http.get_session_status(org_id, devin_id).await,
+            #[cfg(test)]
+            Self::Fake(fake) => {
+                let value = fake.lock().unwrap().call(
+                    reqwest::Method::GET,
+                    &format!("/v3/organizations/{org_id}/sessions/{devin_id}"),
+                    &[],
+                    None,
+                )?;
+                serde_json::from_value(value).map_err(|_| {
+                    ApiError::Uncertain(
+                        "Devin Cloud status response did not match the bounded metadata shape"
+                            .to_owned(),
+                    )
+                })
+            }
+        }
     }
 
     async fn list_messages(&self, org_id: &str, devin_id: &str) -> ApiResult<Value> {
@@ -574,6 +671,8 @@ struct OperationTombstone {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct TaskRecord {
     schema_version: u64,
+    #[serde(default)]
+    start_fingerprint_version: u64,
     task_id: Uuid,
     owner: SessionInstance,
     scope_cwd: PathBuf,
@@ -609,6 +708,83 @@ struct TaskRecord {
     operations: Vec<OperationReceipt>,
     #[serde(default)]
     operation_tombstones: Vec<OperationTombstone>,
+    #[serde(default)]
+    pending_interaction_summary: Option<PendingInteractionSummary>,
+    #[serde(default)]
+    observer_owner_id: Option<String>,
+    #[serde(default)]
+    producer_epoch: u64,
+    #[serde(default)]
+    lease_expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloudObservationBinding {
+    task_id: Uuid,
+    owner: SessionInstance,
+    scope_cwd: PathBuf,
+    org_id: String,
+    // This is a remote resource-routing identifier, not the bearer credential
+    // used to authenticate requests. The persisted/public name remains
+    // `devin_session_id` for compatibility.
+    remote_session_resource_id: String,
+    generation: u64,
+}
+
+impl CloudObservationBinding {
+    fn from_record(record: &TaskRecord) -> Option<Self> {
+        Some(Self {
+            task_id: record.task_id,
+            owner: record.owner.clone(),
+            scope_cwd: record.scope_cwd.clone(),
+            org_id: record.org_id.clone(),
+            remote_session_resource_id: record.devin_session_id.clone()?,
+            generation: record.generation,
+        })
+    }
+
+    fn matches(&self, record: &TaskRecord) -> bool {
+        record.task_id == self.task_id
+            && record.owner == self.owner
+            && record.scope_cwd == self.scope_cwd
+            && record.org_id == self.org_id
+            && record.devin_session_id.as_deref() == Some(&self.remote_session_resource_id)
+            && record.generation == self.generation
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloudObservationLease {
+    owner_id: String,
+    producer_epoch: u64,
+    lease_expires_at: u64,
+    binding: CloudObservationBinding,
+}
+
+struct CloudObserverJob {
+    owner: SessionInstance,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CloudPendingObserver {
+    owner_id: String,
+    leases: Arc<AsyncMutex<std::collections::HashMap<Uuid, CloudObservationLease>>>,
+    jobs: Arc<AsyncMutex<std::collections::HashMap<Uuid, CloudObserverJob>>>,
+    session_gates: Arc<AsyncMutex<std::collections::HashMap<String, Arc<AsyncMutex<()>>>>>,
+    retired_sessions: Arc<
+        AsyncMutex<std::collections::HashMap<String, std::collections::HashSet<SessionInstance>>>,
+    >,
+}
+
+#[derive(Clone, Debug)]
+struct CloudPendingObservation {
+    state: SummaryState,
+    count: Option<u8>,
+    types: Vec<InteractionType>,
+    truncated: bool,
+    read_started_at: u64,
+    observed_at: u64,
 }
 
 impl TaskRecord {
@@ -764,6 +940,18 @@ impl TaskStore {
         self.ensure_directory()?;
         validate_record(record)?;
         self.prune_locked(record)?;
+        self.write_record_locked(record)
+    }
+
+    /// Persist observer ownership and summary metadata without changing task
+    /// activity or running retention pruning as a side effect.
+    fn save_metadata_locked(&self, record: &TaskRecord) -> Result<()> {
+        self.ensure_directory()?;
+        validate_record(record)?;
+        self.write_record_locked(record)
+    }
+
+    fn write_record_locked(&self, record: &TaskRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         anyhow::ensure!(
             bytes.len() <= MAX_TASK_RECORD_BYTES,
@@ -870,6 +1058,223 @@ impl TaskStore {
         Ok(ControlAcceptance::Accepted(Box::new(record)))
     }
 
+    fn acquire_cloud_observation_lease(
+        &self,
+        binding: &CloudObservationBinding,
+        owner_id: &str,
+    ) -> Result<Option<CloudObservationLease>> {
+        let _guard = self.lock()?;
+        let now = config::unix_time();
+        self.acquire_cloud_observation_lease_locked(binding, owner_id, now)
+    }
+
+    #[cfg(test)]
+    fn acquire_cloud_observation_lease_at(
+        &self,
+        binding: &CloudObservationBinding,
+        owner_id: &str,
+        now: u64,
+    ) -> Result<Option<CloudObservationLease>> {
+        let _guard = self.lock()?;
+        self.acquire_cloud_observation_lease_locked(binding, owner_id, now)
+    }
+
+    fn acquire_cloud_observation_lease_locked(
+        &self,
+        binding: &CloudObservationBinding,
+        owner_id: &str,
+        now: u64,
+    ) -> Result<Option<CloudObservationLease>> {
+        Uuid::parse_str(owner_id).context("invalid Devin Cloud observer owner ID")?;
+        let mut record = match self.read_record(binding.task_id) {
+            Ok(record) => record,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !binding.matches(&record)
+            || record.status.is_terminal()
+            || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+        {
+            return Ok(None);
+        }
+
+        let current_expiry = record.lease_expires_at.unwrap_or(0);
+        if record.observer_owner_id.is_some() && current_expiry > now {
+            return Ok(None);
+        }
+
+        let producer_epoch = record
+            .producer_epoch
+            .checked_add(1)
+            .context("Devin Cloud observer producer epoch overflow")?;
+        let lease_expires_at = now
+            .checked_add(crate::pending_interaction::CLOUD_OBSERVER_LEASE_SECS)
+            .context("Devin Cloud observer lease expiry overflow")?;
+        record.observer_owner_id = Some(owner_id.to_owned());
+        if record.schema_version < TASK_SCHEMA_VERSION {
+            if record.start_fingerprint_version == 0 {
+                record.start_fingerprint_version = record.schema_version;
+            }
+            record.schema_version = TASK_SCHEMA_VERSION;
+        }
+        record.producer_epoch = producer_epoch;
+        record.lease_expires_at = Some(lease_expires_at);
+        self.save_metadata_locked(&record)?;
+        Ok(Some(CloudObservationLease {
+            owner_id: owner_id.to_owned(),
+            producer_epoch,
+            lease_expires_at,
+            binding: binding.clone(),
+        }))
+    }
+
+    fn renew_cloud_observation_lease(
+        &self,
+        lease: &CloudObservationLease,
+    ) -> Result<Option<CloudObservationLease>> {
+        let _guard = self.lock()?;
+        let now = config::unix_time();
+        self.renew_cloud_observation_lease_locked(lease, now)
+    }
+
+    #[cfg(test)]
+    fn renew_cloud_observation_lease_at(
+        &self,
+        lease: &CloudObservationLease,
+        now: u64,
+    ) -> Result<Option<CloudObservationLease>> {
+        let _guard = self.lock()?;
+        self.renew_cloud_observation_lease_locked(lease, now)
+    }
+
+    fn renew_cloud_observation_lease_locked(
+        &self,
+        lease: &CloudObservationLease,
+        now: u64,
+    ) -> Result<Option<CloudObservationLease>> {
+        let mut record = match self.read_record(lease.binding.task_id) {
+            Ok(record) => record,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !lease.binding.matches(&record)
+            || record.observer_owner_id.as_deref() != Some(lease.owner_id.as_str())
+            || record.producer_epoch != lease.producer_epoch
+            || record.lease_expires_at != Some(lease.lease_expires_at)
+            || now >= lease.lease_expires_at
+            || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+            || record.status.is_terminal()
+        {
+            return Ok(None);
+        }
+        let lease_expires_at = now
+            .checked_add(crate::pending_interaction::CLOUD_OBSERVER_LEASE_SECS)
+            .context("Devin Cloud observer lease expiry overflow")?;
+        record.lease_expires_at = Some(lease_expires_at);
+        self.save_metadata_locked(&record)?;
+        Ok(Some(CloudObservationLease {
+            owner_id: lease.owner_id.clone(),
+            producer_epoch: lease.producer_epoch,
+            lease_expires_at,
+            binding: lease.binding.clone(),
+        }))
+    }
+
+    fn publish_cloud_observation(
+        &self,
+        lease: &CloudObservationLease,
+        observation: Option<&CloudPendingObservation>,
+    ) -> Result<bool> {
+        let _guard = self.lock()?;
+        let now = config::unix_time();
+        self.publish_cloud_observation_locked(lease, observation, now)
+    }
+
+    #[cfg(test)]
+    fn publish_cloud_observation_at(
+        &self,
+        lease: &CloudObservationLease,
+        observation: Option<&CloudPendingObservation>,
+        now: u64,
+    ) -> Result<bool> {
+        let _guard = self.lock()?;
+        self.publish_cloud_observation_locked(lease, observation, now)
+    }
+
+    fn publish_cloud_observation_locked(
+        &self,
+        lease: &CloudObservationLease,
+        observation: Option<&CloudPendingObservation>,
+        now: u64,
+    ) -> Result<bool> {
+        let mut record = match self.read_record(lease.binding.task_id) {
+            Ok(record) => record,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !lease.binding.matches(&record)
+            || record.status.is_terminal()
+            || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+            || record.observer_owner_id.as_deref() != Some(lease.owner_id.as_str())
+            || record.producer_epoch != lease.producer_epoch
+            || record.lease_expires_at != Some(lease.lease_expires_at)
+            || now >= lease.lease_expires_at
+            || observation.is_some_and(|observation| {
+                observation.observed_at < observation.read_started_at
+                    || observation.read_started_at
+                        < lease
+                            .lease_expires_at
+                            .saturating_sub(crate::pending_interaction::CLOUD_OBSERVER_LEASE_SECS)
+                    || observation.observed_at > now
+                    || observation.observed_at >= lease.lease_expires_at
+                    || observation.read_started_at > now
+            })
+        {
+            return Ok(false);
+        }
+
+        let summary = match observation {
+            Some(observation) => Summary::observe(
+                record.pending_interaction_summary.as_ref(),
+                observation.state,
+                observation.count,
+                &observation.types,
+                observation.truncated,
+                ProducerKind::HostRemoteObserver,
+                lease.producer_epoch,
+                observation.observed_at,
+            )?,
+            None => Summary::unavailable(
+                record.pending_interaction_summary.as_ref(),
+                ProducerKind::HostRemoteObserver,
+                lease.producer_epoch,
+            )?,
+        };
+        record.pending_interaction_summary = Some(summary);
+        self.save_metadata_locked(&record)?;
+        Ok(true)
+    }
+
+    fn release_cloud_observation_lease(&self, lease: &CloudObservationLease) -> Result<bool> {
+        let _guard = self.lock()?;
+        let mut record = match self.read_record(lease.binding.task_id) {
+            Ok(record) => record,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !lease.binding.matches(&record)
+            || record.observer_owner_id.as_deref() != Some(lease.owner_id.as_str())
+            || record.producer_epoch != lease.producer_epoch
+            || record.lease_expires_at != Some(lease.lease_expires_at)
+        {
+            return Ok(false);
+        }
+        record.observer_owner_id = None;
+        record.lease_expires_at = None;
+        self.save_metadata_locked(&record)?;
+        Ok(true)
+    }
+
     fn read_record(&self, task_id: Uuid) -> Result<TaskRecord> {
         let path = self.path(task_id);
         let mut options = OpenOptions::new();
@@ -890,8 +1295,28 @@ impl TaskStore {
             bytes.len() <= MAX_TASK_RECORD_BYTES,
             "Devin Cloud task record exceeds {MAX_TASK_RECORD_BYTES} bytes"
         );
-        let record: TaskRecord =
+        let wire: Value =
             serde_json::from_slice(&bytes).context("invalid Devin Cloud task record")?;
+        let schema_version = wire
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .context("Devin Cloud task record is missing its schema version")?;
+        if schema_version >= 3 {
+            for key in [
+                "start_fingerprint_version",
+                "pending_interaction_summary",
+                "observer_owner_id",
+                "producer_epoch",
+                "lease_expires_at",
+            ] {
+                anyhow::ensure!(
+                    wire.get(key).is_some(),
+                    "schema-3 Devin Cloud task record is missing {key}"
+                );
+            }
+        }
+        let record: TaskRecord =
+            serde_json::from_value(wire).context("invalid Devin Cloud task record")?;
         validate_record(&record)?;
         anyhow::ensure!(
             record.task_id == task_id,
@@ -1156,7 +1581,7 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
     if let Some(effective) = &record.effective_devin_mode {
         validate_argument(effective, "effective_devin_mode")?;
     }
-    if record.schema_version >= 2 {
+    if record.schema_version >= 2 && record.start_fingerprint_version != 1 {
         match record.swe_tier.as_deref() {
             Some("priority") => {
                 let requested = record
@@ -1179,6 +1604,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             Some(_) => unreachable!(),
         }
     }
+    if record.schema_version >= 3 {
+        anyhow::ensure!(
+            (1..=TASK_SCHEMA_VERSION).contains(&record.start_fingerprint_version),
+            "Devin Cloud task has an invalid start fingerprint version"
+        );
+    }
     anyhow::ensure!(record.repos.len() <= MAX_REPOS, "too many repos");
     for repo in &record.repos {
         validate_argument(repo, "repos")?;
@@ -1198,6 +1629,34 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             bytes.len() <= MAX_REPORT_BYTES,
             "Devin Cloud task report exceeds {MAX_REPORT_BYTES} bytes"
         );
+    }
+    if let Some(summary) = &record.pending_interaction_summary {
+        summary.validate()?;
+        anyhow::ensure!(
+            summary.producer_kind == ProducerKind::HostRemoteObserver,
+            "Devin Cloud task summary must use the host remote observer producer"
+        );
+        anyhow::ensure!(
+            summary.producer_epoch <= record.producer_epoch,
+            "Devin Cloud task summary producer epoch exceeds its observer epoch"
+        );
+    }
+    match record.observer_owner_id.as_deref() {
+        Some(owner_id) => {
+            Uuid::parse_str(owner_id).context("invalid Devin Cloud observer owner ID")?;
+            anyhow::ensure!(
+                record.producer_epoch > 0,
+                "Devin Cloud observer epoch must be positive"
+            );
+            anyhow::ensure!(
+                record.lease_expires_at.is_some(),
+                "Devin Cloud observer owner is missing a lease expiry"
+            );
+        }
+        None => anyhow::ensure!(
+            record.lease_expires_at.is_none(),
+            "Devin Cloud observer lease expiry is present without an owner"
+        ),
     }
     anyhow::ensure!(
         record.pull_requests.len() <= MAX_PULL_REQUESTS
@@ -1386,6 +1845,415 @@ fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
         "generation": outcome.generation,
         "devin_session_id": outcome.devin_session_id,
         "reconciliation_required": outcome.status == TaskStatus::ReconciliationRequired,
+    })
+}
+
+impl CloudPendingObserver {
+    pub(crate) fn new() -> Self {
+        Self {
+            owner_id: Uuid::new_v4().to_string(),
+            leases: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+            jobs: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+            session_gates: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+            retired_sessions: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn session_gate(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.session_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(session_id.to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
+    async fn is_retired(&self, owner: &SessionInstance) -> bool {
+        self.retired_sessions
+            .lock()
+            .await
+            .get(&owner.id)
+            .is_some_and(|retired| retired.contains(owner))
+    }
+
+    pub(crate) async fn observe_session_tasks(&self, session: &config::Session) -> Result<()> {
+        #[cfg(not(unix))]
+        anyhow::bail!("Devin Cloud pending observer requires Unix cross-process flock");
+
+        #[cfg(unix)]
+        {
+            let owner = SessionInstance::from_session(session);
+            ensure_current_active_instance(&owner, session).await?;
+            let gate = self.session_gate(&session.id).await;
+            let _gate = gate.lock().await;
+            {
+                let mut retired = self.retired_sessions.lock().await;
+                let instances = retired.entry(session.id.clone()).or_default();
+                if instances.contains(&owner) {
+                    return Ok(());
+                }
+                instances.clear();
+            }
+            ensure_current_active_instance(&owner, session).await?;
+            let store = TaskStore::default_store()?;
+            let (records, _) = store.list_owned(session)?;
+            let candidates = records
+                .into_iter()
+                .filter(|record| {
+                    !record.status.is_terminal()
+                        && record.devin_session_id.is_some()
+                        && config::unix_time().saturating_sub(record.updated_at)
+                            < TASK_RETENTION_SECONDS
+                })
+                .collect::<Vec<_>>();
+            let active_ids = candidates
+                .iter()
+                .map(|record| record.task_id)
+                .collect::<std::collections::HashSet<_>>();
+            let stale_jobs = {
+                let mut jobs = self.jobs.lock().await;
+                jobs.retain(|_, job| !job.handle.is_finished());
+                let stale_ids = jobs
+                    .iter()
+                    .filter_map(|(task_id, job)| {
+                        ((job.owner.id == owner.id && job.owner != owner)
+                            || (job.owner == owner && !active_ids.contains(task_id)))
+                        .then_some(*task_id)
+                    })
+                    .collect::<Vec<_>>();
+                stale_ids
+                    .into_iter()
+                    .filter_map(|task_id| jobs.remove(&task_id))
+                    .collect::<Vec<_>>()
+            };
+            for job in stale_jobs {
+                job.handle.abort();
+                let _ = job.handle.await;
+            }
+            let stale = {
+                let mut leases = self.leases.lock().await;
+                let stale_ids = leases
+                    .iter()
+                    .filter_map(|(task_id, lease)| {
+                        (lease.binding.owner == owner && !active_ids.contains(task_id))
+                            .then_some(*task_id)
+                    })
+                    .collect::<Vec<_>>();
+                stale_ids
+                    .into_iter()
+                    .filter_map(|task_id| leases.remove(&task_id))
+                    .collect::<Vec<_>>()
+            };
+            let mut failed_releases = Vec::new();
+            let mut first_release_error = None;
+            for lease in stale {
+                if let Err(error) = store.release_cloud_observation_lease(&lease) {
+                    if first_release_error.is_none() {
+                        first_release_error = Some(error);
+                    }
+                    failed_releases.push(lease);
+                }
+            }
+            if !failed_releases.is_empty() {
+                self.leases.lock().await.extend(
+                    failed_releases
+                        .into_iter()
+                        .map(|lease| (lease.binding.task_id, lease)),
+                );
+            }
+            if let Some(error) = first_release_error {
+                return Err(error).context("failed to retire stale Devin Cloud observer leases");
+            }
+            if candidates.is_empty() {
+                return Ok(());
+            }
+
+            // Config errors are handled per task after acquiring its observer
+            // lease. Only a generic unavailable state is persisted.
+            let api = connect().ok().map(|(_, api)| api);
+            for record in candidates {
+                let task_id = record.task_id;
+                let mut jobs = self.jobs.lock().await;
+                if jobs.contains_key(&task_id) {
+                    continue;
+                }
+                let observer = self.clone();
+                let store = store.clone();
+                let session = session.clone();
+                let api = api.clone();
+                let owner = SessionInstance::from_session(&session);
+                let job_observer = observer.clone();
+                let handle = tokio::spawn(async move {
+                    let _ = observe_one_cloud_task(observer, session, store, record, api).await;
+                    job_observer.finish_task(task_id).await;
+                });
+                jobs.insert(task_id, CloudObserverJob { owner, handle });
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn release_session(&self, session: &config::Session) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let owner = SessionInstance::from_session(session);
+            let gate = self.session_gate(&session.id).await;
+            let gate_guard = gate.lock().await;
+            self.retired_sessions
+                .lock()
+                .await
+                .entry(session.id.clone())
+                .or_default()
+                .insert(owner.clone());
+            let store = TaskStore::default_store()?;
+            let cancelled = {
+                let mut jobs = self.jobs.lock().await;
+                let ids = jobs
+                    .iter()
+                    .filter_map(|(task_id, job)| (job.owner == owner).then_some(*task_id))
+                    .collect::<Vec<_>>();
+                ids.into_iter()
+                    .filter_map(|task_id| jobs.remove(&task_id))
+                    .collect::<Vec<_>>()
+            };
+            for job in cancelled {
+                job.handle.abort();
+                let _ = job.handle.await;
+            }
+            let cached = {
+                let mut leases = self.leases.lock().await;
+                let stale_ids = leases
+                    .iter()
+                    .filter_map(|(task_id, lease)| {
+                        (lease.binding.owner == owner).then_some(*task_id)
+                    })
+                    .collect::<Vec<_>>();
+                stale_ids
+                    .into_iter()
+                    .filter_map(|task_id| leases.remove(&task_id))
+                    .collect::<Vec<_>>()
+            };
+            let mut failures = Vec::new();
+            let mut first_error = None;
+            for lease in cached {
+                match store.release_cloud_observation_lease(&lease) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        failures.push(lease);
+                    }
+                }
+            }
+            if !failures.is_empty() {
+                self.leases.lock().await.extend(
+                    failures
+                        .into_iter()
+                        .map(|lease| (lease.binding.task_id, lease)),
+                );
+            }
+            drop(gate_guard);
+            if let Some(error) = first_error {
+                return Err(error).context("failed to release Devin Cloud observer leases");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = session;
+        }
+        Ok(())
+    }
+
+    async fn finish_task(&self, task_id: Uuid) {
+        self.jobs.lock().await.remove(&task_id);
+    }
+}
+
+async fn observe_one_cloud_task(
+    observer: CloudPendingObserver,
+    session: config::Session,
+    store: TaskStore,
+    record: TaskRecord,
+    api: Option<CloudApi>,
+) -> Result<()> {
+    let Some(binding) = CloudObservationBinding::from_record(&record) else {
+        return Ok(());
+    };
+
+    // Wait for the shared host slot before taking a durable lease. Queued
+    // workers hold neither a TaskStore lock nor a lease, so contention cannot
+    // consume the 15-second lease lifetime or delay the supervisor refresh.
+    let permit = if api.is_some() {
+        match tokio::time::timeout(
+            Duration::from_secs(pending_interaction::REFRESH_INTERVAL_SECS),
+            pending_interaction::acquire_host_semaphore_permit(),
+        )
+        .await
+        {
+            Ok(permit) => Some(permit?),
+            Err(_) => return Ok(()),
+        }
+    } else {
+        None
+    };
+
+    let lease = {
+        let gate = observer.session_gate(&session.id).await;
+        let _gate = gate.lock().await;
+        if observer.is_retired(&binding.owner).await {
+            return Ok(());
+        }
+        ensure_current_active_instance(&binding.owner, &session).await?;
+        let previous = observer.leases.lock().await.get(&record.task_id).cloned();
+        let mut lease = match previous {
+            Some(previous) if previous.binding == binding => {
+                match store.renew_cloud_observation_lease(&previous) {
+                    Ok(Some(renewed)) => Some(renewed),
+                    Ok(None) => {
+                        let mut leases = observer.leases.lock().await;
+                        if leases.get(&record.task_id) == Some(&previous) {
+                            leases.remove(&record.task_id);
+                        }
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Some(previous) => {
+                store.release_cloud_observation_lease(&previous)?;
+                let mut leases = observer.leases.lock().await;
+                if leases.get(&record.task_id) == Some(&previous) {
+                    leases.remove(&record.task_id);
+                }
+                None
+            }
+            None => None,
+        };
+        if lease.is_none() {
+            lease = store.acquire_cloud_observation_lease(&binding, &observer.owner_id)?;
+        }
+        let Some(lease) = lease else {
+            return Ok(());
+        };
+        observer
+            .leases
+            .lock()
+            .await
+            .insert(record.task_id, lease.clone());
+        lease
+    };
+
+    let observation = match (api, permit) {
+        (Some(api), Some(permit)) => match read_cloud_status(&api, &lease.binding, permit).await {
+            Ok((status, read_started_at, observed_at)) => {
+                classify_cloud_pending_status(&status, &lease.binding)
+                    .ok()
+                    .map(|state| CloudPendingObservation {
+                        state,
+                        count: (state == SummaryState::None).then_some(0),
+                        types: if state == SummaryState::Pending {
+                            vec![InteractionType::Approval]
+                        } else {
+                            Vec::new()
+                        },
+                        truncated: false,
+                        read_started_at,
+                        observed_at,
+                    })
+            }
+            Err(_) => None,
+        },
+        _ => None,
+    };
+
+    // Fence responses that return after this exact session instance stopped or
+    // changed. TaskStore then rechecks the binding, epoch and lease atomically.
+    let gate = observer.session_gate(&session.id).await;
+    let _gate = gate.lock().await;
+    if observer.is_retired(&lease.binding.owner).await {
+        return Ok(());
+    }
+    if ensure_current_active_instance(&lease.binding.owner, &session)
+        .await
+        .is_err()
+    {
+        let _ = store.release_cloud_observation_lease(&lease);
+        observer.leases.lock().await.remove(&record.task_id);
+        return Ok(());
+    }
+    let _ = store.publish_cloud_observation(&lease, observation.as_ref())?;
+    Ok(())
+}
+
+async fn read_cloud_status(
+    api: &CloudApi,
+    binding: &CloudObservationBinding,
+    permit: pending_interaction::HostObservationPermit,
+) -> Result<(CloudStatusRead, u64, u64)> {
+    let read_started_at = config::unix_time();
+    let result = tokio::time::timeout(
+        Duration::from_secs(pending_interaction::SCOPED_READ_TIMEOUT_SECS),
+        api.get_session_status(&binding.org_id, &binding.remote_session_resource_id),
+    )
+    .await
+    .context("Devin Cloud status read timed out")?
+    .map_err(anyhow::Error::from);
+    drop(permit);
+    let observed_at = config::unix_time();
+    let response = result?;
+    Ok((response, read_started_at, observed_at))
+}
+
+fn classify_cloud_pending_status(
+    response: &CloudStatusRead,
+    binding: &CloudObservationBinding,
+) -> Result<SummaryState> {
+    let session_id = response
+        .session_id
+        .as_deref()
+        .context("Devin Cloud status response omitted its session identity")?;
+    anyhow::ensure!(
+        session_id == binding.remote_session_resource_id,
+        "Devin Cloud status response session identity changed"
+    );
+    if response
+        .status_detail
+        .as_deref()
+        .is_some_and(|detail| detail.len() > 64)
+    {
+        anyhow::bail!("Devin Cloud status detail exceeded its bound");
+    }
+    let Some(status) = response.status.as_deref() else {
+        return Ok(SummaryState::Unknown);
+    };
+    let detail = response.status_detail.as_deref();
+    if status == "running" && detail == Some("waiting_for_approval") {
+        return Ok(SummaryState::Pending);
+    }
+    let known_detail = detail.is_none_or(|detail| {
+        matches!(
+            detail,
+            "waiting_for_user"
+                | "finished"
+                | "working"
+                | "user_request"
+                | "inactivity"
+                | "billing_limit"
+        )
+    });
+    let recognized = match status {
+        "new" | "claimed" | "resuming" => detail.is_none(),
+        "running" => known_detail,
+        "exit" | "error" => detail.is_none_or(|detail| detail == "finished"),
+        "suspended" => detail
+            .is_none_or(|detail| matches!(detail, "user_request" | "inactivity" | "billing_limit")),
+        _ => false,
+    };
+    Ok(if recognized {
+        SummaryState::None
+    } else {
+        SummaryState::Unknown
     })
 }
 
@@ -2154,17 +3022,22 @@ async fn task_start_with_store(
         // A schema-v1 receipt predates swe_tier. Treating a new tier as an
         // exact replay would silently ignore the caller's requested service
         // lane, because the legacy fingerprint cannot contain that field.
+        let fingerprint_version = if existing.start_fingerprint_version > 0 {
+            existing.start_fingerprint_version
+        } else {
+            existing.schema_version
+        };
         anyhow::ensure!(
-            existing.schema_version >= 2 || swe_tier.is_none(),
+            fingerprint_version >= 2 || swe_tier.is_none(),
             "OPERATION_CONFLICT: operation_id was already accepted with a different request"
         );
-        let effective = if existing.schema_version >= 2 {
+        let effective = if fingerprint_version >= 2 {
             existing.effective_devin_mode.as_deref()
         } else {
             None
         };
         let request_fingerprint = start_request_fingerprint(
-            existing.schema_version,
+            fingerprint_version,
             task_id,
             task,
             title,
@@ -2200,6 +3073,7 @@ async fn task_start_with_store(
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
+        start_fingerprint_version: TASK_SCHEMA_VERSION,
         task_id,
         owner: owner.clone(),
         scope_cwd: config::canonical_directory(&session.cwd)?,
@@ -2224,6 +3098,10 @@ async fn task_start_with_store(
         updated_at: now,
         operations: Vec::new(),
         operation_tombstones: Vec::new(),
+        pending_interaction_summary: None,
+        observer_owner_id: None,
+        producer_epoch: 0,
+        lease_expires_at: None,
     };
     record.operations.push(OperationReceipt {
         operation_id,
@@ -2409,7 +3287,30 @@ fn task_list_item(record: &TaskRecord) -> Value {
     let mut item = task_view(record, None);
     item["backend"] = json!("devin_cloud");
     item["last_updated_at"] = json!(record.updated_at);
+    item["pending_interaction"] = cloud_pending_projection(record, config::unix_time());
     item
+}
+
+fn cloud_pending_projection(record: &TaskRecord, now: u64) -> Value {
+    let Some(summary) = record.pending_interaction_summary.as_ref() else {
+        return Summary::projection(None, now);
+    };
+    let observer_is_live = summary.producer_kind != ProducerKind::HostRemoteObserver
+        || (record.observer_owner_id.is_some()
+            && record.lease_expires_at.is_some_and(|expires| now < expires)
+            && summary.producer_epoch == record.producer_epoch);
+    if !observer_is_live {
+        if summary.validate().is_err() {
+            return json!({"state": "unavailable"});
+        }
+        let mut stale = summary.clone();
+        stale.state = SummaryState::Unavailable;
+        stale.count = None;
+        stale.types.clear();
+        stale.truncated = false;
+        return serde_json::to_value(stale).unwrap_or_else(|_| json!({"state": "unavailable"}));
+    }
+    Summary::projection(Some(summary), now)
 }
 
 fn task_list_limit(args: &Value) -> Result<usize> {
@@ -2718,6 +3619,8 @@ impl FakeApi {
 mod tests {
     use super::*;
     use crate::approvals;
+    use crate::named_roots::NamedRoots;
+    use crate::supervisor::SessionSupervisor;
 
     async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2789,6 +3692,30 @@ mod tests {
             .unwrap();
         let session = config::read_session_metadata(id).await.unwrap();
         (handle, session)
+    }
+
+    async fn wait_for_cloud_summary_state(
+        store: &TaskStore,
+        task_id: Uuid,
+        state: SummaryState,
+        prior_revision: u64,
+    ) -> u64 {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(pending_interaction::REFRESH_INTERVAL_SECS.saturating_add(3));
+        loop {
+            if let Ok(current) = store.read_record(task_id)
+                && let Some(summary) = current.pending_interaction_summary
+                && summary.state == state
+                && summary.summary_revision > prior_revision
+            {
+                return summary.summary_revision;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "supervisor did not refresh retained Devin Cloud task"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn test_id() -> String {
@@ -3459,6 +4386,34 @@ mod tests {
         assert!(validate_base_url("").is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_transport_rejects_internally_constructed_http_config_before_sending_key() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let secret = "devin-secret-must-not-cross-http";
+        let config = CloudConfig {
+            api_key: secret.to_owned(),
+            api_key_source: API_KEY_ENV,
+            org_id: Some("org-test".to_owned()),
+            base_url: format!("http://{address}"),
+            create_as_user_id: None,
+        };
+        // Construct HttpApi directly to cover internal callers that bypass
+        // resolve_config's https-only validation.
+        let api = HttpApi::new(&config).unwrap();
+        let error = api
+            .get_session_status("org-test", "session-test")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Rejected(_)));
+        assert!(!error.message().contains(secret));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn report_extraction_requires_shape() {
         assert!(extract_report("no json here").is_none());
@@ -3488,6 +4443,7 @@ mod tests {
         let now = config::unix_time();
         TaskRecord {
             schema_version: TASK_SCHEMA_VERSION,
+            start_fingerprint_version: TASK_SCHEMA_VERSION,
             task_id,
             owner: SessionInstance::from_session(session),
             scope_cwd: config::canonical_directory(&session.cwd).unwrap(),
@@ -3512,7 +4468,915 @@ mod tests {
             updated_at: now,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
+            pending_interaction_summary: None,
+            observer_owner_id: None,
+            producer_epoch: 0,
+            lease_expires_at: None,
         }
+    }
+
+    fn cloud_observer_record(
+        session: &config::Session,
+        task_id: Uuid,
+        status: TaskStatus,
+    ) -> TaskRecord {
+        let mut record = record_for(session, task_id, status);
+        record.generation = 7;
+        record.devin_session_id = Some(format!("remote-{}", task_id.simple()));
+        record
+    }
+
+    fn cloud_observation(read_started_at: u64, observed_at: u64) -> CloudPendingObservation {
+        CloudPendingObservation {
+            state: SummaryState::Pending,
+            count: None,
+            types: vec![InteractionType::Approval],
+            truncated: false,
+            read_started_at,
+            observed_at,
+        }
+    }
+
+    fn summary_of_wire_record(record: &TaskRecord) -> Value {
+        serde_json::to_value(record).unwrap()
+    }
+
+    fn run_cloud_lease_probe_child(
+        store_path: &Path,
+        task_id: Uuid,
+        now: u64,
+        owner_id: &str,
+        expect_acquire: bool,
+    ) {
+        let store = TaskStore::new(store_path.to_path_buf());
+        let record = store.read_record(task_id).unwrap();
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        let lease = store
+            .acquire_cloud_observation_lease_at(&binding, owner_id, now)
+            .unwrap();
+        assert_eq!(lease.is_some(), expect_acquire);
+    }
+
+    #[test]
+    fn cloud_observer_lease_subprocess_probe() {
+        let Ok(path) = std::env::var("TEMOTE_CLOUD_LEASE_PROBE_STORE") else {
+            return;
+        };
+        let task_id =
+            Uuid::parse_str(&std::env::var("TEMOTE_CLOUD_LEASE_PROBE_TASK").unwrap()).unwrap();
+        let now = std::env::var("TEMOTE_CLOUD_LEASE_PROBE_NOW")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let owner_id = std::env::var("TEMOTE_CLOUD_LEASE_PROBE_OWNER").unwrap();
+        let expect_acquire =
+            std::env::var("TEMOTE_CLOUD_LEASE_PROBE_MODE").is_ok_and(|mode| mode == "acquire");
+        if let Ok(marker) = std::env::var("TEMOTE_CLOUD_LEASE_PROBE_MARKER") {
+            std::fs::write(marker, b"attempting").unwrap();
+        }
+        run_cloud_lease_probe_child(Path::new(&path), task_id, now, &owner_id, expect_acquire);
+    }
+
+    #[cfg(unix)]
+    fn assert_other_process_cannot_acquire_live_lease(
+        store: &TaskStore,
+        task_id: Uuid,
+        now: u64,
+        owner_id: &str,
+    ) {
+        let executable = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("devin_cloud::tests::cloud_observer_lease_subprocess_probe")
+            .arg("--nocapture")
+            .env("TEMOTE_CLOUD_LEASE_PROBE_STORE", &store.directory)
+            .env("TEMOTE_CLOUD_LEASE_PROBE_TASK", task_id.to_string())
+            .env("TEMOTE_CLOUD_LEASE_PROBE_NOW", now.to_string())
+            .env("TEMOTE_CLOUD_LEASE_PROBE_OWNER", owner_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "subprocess lease probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_cloud_store_flock_blocks_competing_process(
+        store: &TaskStore,
+        task_id: Uuid,
+        now: u64,
+        owner_id: &str,
+        marker: &Path,
+    ) {
+        let lock = store.lock().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("devin_cloud::tests::cloud_observer_lease_subprocess_probe")
+            .arg("--nocapture")
+            .env("TEMOTE_CLOUD_LEASE_PROBE_STORE", &store.directory)
+            .env("TEMOTE_CLOUD_LEASE_PROBE_TASK", task_id.to_string())
+            .env("TEMOTE_CLOUD_LEASE_PROBE_NOW", now.to_string())
+            .env("TEMOTE_CLOUD_LEASE_PROBE_OWNER", owner_id)
+            .env("TEMOTE_CLOUD_LEASE_PROBE_MODE", "acquire")
+            .env("TEMOTE_CLOUD_LEASE_PROBE_MARKER", marker)
+            .spawn()
+            .unwrap();
+
+        let marker_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < marker_deadline,
+                "competing process did not reach the store transaction"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "competing process acquired a lease while another process held the TaskStore lock"
+        );
+        drop(lock);
+
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "competing process failed after lock release: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let record = store.read_record(task_id).unwrap();
+        assert_eq!(record.observer_owner_id.as_deref(), Some(owner_id));
+        assert_eq!(record.producer_epoch, 1);
+    }
+
+    #[test]
+    fn cloud_observer_lease_cas_preserves_task_metadata_and_fences_old_epochs() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-cas");
+        let store = test_store(&workspace);
+        let task_id = Uuid::new_v4();
+        let mut record = cloud_observer_record(&owner, task_id, TaskStatus::Running);
+        record.revision = 19;
+        record.updated_at = config::unix_time();
+        record.created_at = record.updated_at.saturating_sub(123);
+        record.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "start".to_owned(),
+            phase: OperationPhase::Applied,
+            outcome: record.outcome(),
+        });
+        let task_metadata = (
+            record.status,
+            record.revision,
+            record.generation,
+            record.created_at,
+            record.updated_at,
+            record.operations.clone(),
+            record.operation_tombstones.clone(),
+        );
+        store.save(&record).unwrap();
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        let owner_id = Uuid::new_v4().to_string();
+        let now = record.updated_at.saturating_add(1);
+
+        let first = store
+            .acquire_cloud_observation_lease_at(&binding, &owner_id, now)
+            .unwrap()
+            .unwrap();
+        let after_acquire = store.read_record(task_id).unwrap();
+        assert_eq!(
+            (
+                after_acquire.status,
+                after_acquire.revision,
+                after_acquire.generation,
+                after_acquire.created_at,
+                after_acquire.updated_at,
+                after_acquire.operations.clone(),
+                after_acquire.operation_tombstones.clone(),
+            ),
+            task_metadata,
+            "observer metadata writes must not touch task state, receipts, or retention clocks"
+        );
+        assert!(
+            store
+                .acquire_cloud_observation_lease_at(&binding, &owner_id, now + 1)
+                .unwrap()
+                .is_none()
+        );
+
+        let renewed = store
+            .renew_cloud_observation_lease_at(&first, now + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.producer_epoch, first.producer_epoch);
+        assert!(
+            !store
+                .renew_cloud_observation_lease_at(&first, now + 2)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !store
+                .publish_cloud_observation_at(
+                    &first,
+                    Some(&cloud_observation(now, now + 2)),
+                    now + 2,
+                )
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .publish_cloud_observation_at(
+                    &renewed,
+                    Some(&cloud_observation(now + 1, now + 2)),
+                    now + 2,
+                )
+                .unwrap()
+        );
+        assert!(!store.release_cloud_observation_lease(&first).unwrap());
+        let after_publish = store.read_record(task_id).unwrap();
+        assert_eq!(
+            (
+                after_publish.status,
+                after_publish.revision,
+                after_publish.generation,
+                after_publish.created_at,
+                after_publish.updated_at,
+                after_publish.operations.clone(),
+                after_publish.operation_tombstones.clone(),
+            ),
+            task_metadata
+        );
+        assert_eq!(
+            after_publish
+                .pending_interaction_summary
+                .as_ref()
+                .unwrap()
+                .producer_epoch,
+            renewed.producer_epoch
+        );
+        let previous_summary = after_publish.pending_interaction_summary.unwrap();
+        assert!(
+            store
+                .publish_cloud_observation_at(&renewed, None, now + 3)
+                .unwrap()
+        );
+        let unavailable = store.read_record(task_id).unwrap();
+        let unavailable_summary = unavailable.pending_interaction_summary.unwrap();
+        assert_eq!(unavailable_summary.state, SummaryState::Unavailable);
+        assert_eq!(
+            unavailable_summary.observed_at,
+            previous_summary.observed_at
+        );
+        assert_eq!(unavailable_summary.expires_at, previous_summary.expires_at);
+        assert_eq!(
+            unavailable_summary.summary_revision,
+            previous_summary.summary_revision + 1
+        );
+
+        assert!(store.release_cloud_observation_lease(&renewed).unwrap());
+        let next = store
+            .acquire_cloud_observation_lease_at(&binding, &owner_id, now + 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.producer_epoch, renewed.producer_epoch + 1);
+        assert!(
+            !store
+                .publish_cloud_observation_at(
+                    &renewed,
+                    Some(&cloud_observation(now + 1, now + 2)),
+                    now + 3,
+                )
+                .unwrap()
+        );
+        assert!(!store.release_cloud_observation_lease(&renewed).unwrap());
+
+        #[cfg(unix)]
+        assert_other_process_cannot_acquire_live_lease(&store, task_id, now + 4, &owner_id);
+
+        #[cfg(unix)]
+        {
+            let competing_task_id = Uuid::new_v4();
+            let competing = cloud_observer_record(&owner, competing_task_id, TaskStatus::Running);
+            let competing_now = competing.updated_at.saturating_add(1);
+            store.save(&competing).unwrap();
+            assert_cloud_store_flock_blocks_competing_process(
+                &store,
+                competing_task_id,
+                competing_now,
+                &Uuid::new_v4().to_string(),
+                &workspace.join("child-ready"),
+            );
+        }
+
+        let expired_at = next.lease_expires_at;
+        assert!(
+            store
+                .renew_cloud_observation_lease_at(&next, expired_at)
+                .unwrap()
+                .is_none()
+        );
+        let takeover = store
+            .acquire_cloud_observation_lease_at(&binding, &owner_id, expired_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(takeover.producer_epoch, next.producer_epoch + 1);
+    }
+
+    #[test]
+    fn cloud_observer_rejects_binding_retention_and_overflow_boundaries() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-boundaries");
+        let store = test_store(&workspace);
+        let now = config::unix_time();
+        let owner_id = Uuid::new_v4().to_string();
+
+        let task_id = Uuid::new_v4();
+        let mut record = cloud_observer_record(&owner, task_id, TaskStatus::Running);
+        record.updated_at = now;
+        store.save(&record).unwrap();
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        let lease = store
+            .acquire_cloud_observation_lease_at(&binding, &owner_id, now + 1)
+            .unwrap()
+            .unwrap();
+        let mut rebound = store.read_record(task_id).unwrap();
+        rebound.devin_session_id = Some("replacement-session".to_owned());
+        rebound.generation += 1;
+        store.save(&rebound).unwrap();
+        assert!(
+            store
+                .renew_cloud_observation_lease_at(&lease, now + 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .publish_cloud_observation_at(
+                    &lease,
+                    Some(&cloud_observation(now + 1, now + 2)),
+                    now + 2,
+                )
+                .unwrap()
+        );
+        assert!(!store.release_cloud_observation_lease(&lease).unwrap());
+
+        let retained_task = Uuid::new_v4();
+        let mut retained = cloud_observer_record(&owner, retained_task, TaskStatus::Running);
+        retained.updated_at = now.saturating_sub(TASK_RETENTION_SECONDS);
+        store.save(&retained).unwrap();
+        let retained_binding = CloudObservationBinding::from_record(&retained).unwrap();
+        assert!(
+            store
+                .acquire_cloud_observation_lease_at(&retained_binding, &owner_id, now)
+                .unwrap()
+                .is_none()
+        );
+
+        let overflow_task = Uuid::new_v4();
+        let mut overflow = cloud_observer_record(&owner, overflow_task, TaskStatus::Running);
+        overflow.producer_epoch = u64::MAX;
+        overflow.updated_at = now;
+        store.save(&overflow).unwrap();
+        let overflow_binding = CloudObservationBinding::from_record(&overflow).unwrap();
+        assert!(
+            store
+                .acquire_cloud_observation_lease_at(&overflow_binding, &owner_id, now + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("epoch overflow")
+        );
+
+        let expiry_task = Uuid::new_v4();
+        let mut expiry_overflow = cloud_observer_record(&owner, expiry_task, TaskStatus::Running);
+        expiry_overflow.created_at = u64::MAX - 20;
+        expiry_overflow.updated_at = u64::MAX - 20;
+        store.save(&expiry_overflow).unwrap();
+        let expiry_binding = CloudObservationBinding::from_record(&expiry_overflow).unwrap();
+        assert!(
+            store
+                .acquire_cloud_observation_lease_at(&expiry_binding, &owner_id, u64::MAX - 3,)
+                .unwrap_err()
+                .to_string()
+                .contains("expiry overflow")
+        );
+
+        let deleted_task = Uuid::new_v4();
+        let mut deleted = cloud_observer_record(&owner, deleted_task, TaskStatus::Running);
+        deleted.updated_at = now;
+        store.save(&deleted).unwrap();
+        let deleted_binding = CloudObservationBinding::from_record(&deleted).unwrap();
+        let deleted_lease = store
+            .acquire_cloud_observation_lease_at(&deleted_binding, &owner_id, now + 1)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(store.path(deleted_task)).unwrap();
+        assert!(
+            store
+                .renew_cloud_observation_lease_at(&deleted_lease, now + 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .publish_cloud_observation_at(
+                    &deleted_lease,
+                    Some(&cloud_observation(now + 1, now + 2)),
+                    now + 2,
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cloud_binding_names_remote_resource_id_without_changing_record_wire_name() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-resource-binding");
+        let task_id = Uuid::new_v4();
+        let record = cloud_observer_record(&owner, task_id, TaskStatus::Running);
+
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["devin_session_id"],
+            record.devin_session_id.as_deref().unwrap()
+        );
+        assert!(wire.get("remote_session_resource_id").is_none());
+
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        assert_eq!(
+            binding.remote_session_resource_id,
+            record.devin_session_id.as_deref().unwrap()
+        );
+        assert!(binding.matches(&record));
+
+        let mut rebound = record.clone();
+        rebound.devin_session_id = Some("different-remote-resource".to_owned());
+        assert!(!binding.matches(&rebound));
+    }
+
+    #[test]
+    fn cloud_pending_classifier_requires_a_consistent_running_approval_status() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-classifier");
+        let record = cloud_observer_record(&owner, Uuid::new_v4(), TaskStatus::Running);
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+
+        let remote = |session_id: &str, status: &str, detail: &str| CloudStatusRead {
+            session_id: Some(session_id.to_owned()),
+            status: Some(status.to_owned()),
+            status_detail: Some(detail.to_owned()),
+        };
+        assert_eq!(
+            classify_cloud_pending_status(
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "running",
+                    "waiting_for_approval"
+                ),
+                &binding,
+            )
+            .unwrap(),
+            SummaryState::Pending
+        );
+        assert_eq!(
+            classify_cloud_pending_status(
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "running",
+                    "waiting_for_user"
+                ),
+                &binding,
+            )
+            .unwrap(),
+            SummaryState::None,
+            "waiting_for_user belongs to task status, not the pending summary"
+        );
+        assert_eq!(
+            classify_cloud_pending_status(
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "future_status",
+                    "waiting_for_approval"
+                ),
+                &binding,
+            )
+            .unwrap(),
+            SummaryState::Unknown
+        );
+        assert_eq!(
+            classify_cloud_pending_status(
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "exit",
+                    "waiting_for_approval"
+                ),
+                &binding,
+            )
+            .unwrap(),
+            SummaryState::Unknown
+        );
+        assert!(
+            classify_cloud_pending_status(
+                &remote("some-other-session", "running", "waiting_for_approval"),
+                &binding,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn observer_migration_promotes_legacy_record_and_preserves_start_replay_marker() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-v1-migration");
+        let store = test_store(&workspace);
+        let task_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let mut legacy = cloud_observer_record(&owner, task_id, TaskStatus::Running);
+        legacy.schema_version = 1;
+        legacy.start_fingerprint_version = 0;
+        legacy.title = Some("legacy title".to_owned());
+        legacy.devin_mode = Some("fast".to_owned());
+        legacy.repos = vec!["f4ah6o/temote-mcp".to_owned()];
+        legacy.operations.push(OperationReceipt {
+            operation_id,
+            request_fingerprint: start_request_fingerprint(
+                1,
+                task_id,
+                "legacy start",
+                legacy.title.as_deref(),
+                legacy.devin_mode.as_deref(),
+                None,
+                None,
+                &legacy.repos,
+                None,
+            )
+            .unwrap(),
+            action: "start".to_owned(),
+            phase: OperationPhase::Applied,
+            outcome: legacy.outcome(),
+        });
+        store.save(&legacy).unwrap();
+
+        // Simulate a schema-1 writer: the old format has none of the observer
+        // keys, and its defaulted fields must migrate only under the store CAS.
+        let mut wire = serde_json::to_value(&legacy).unwrap();
+        for key in [
+            "start_fingerprint_version",
+            "pending_interaction_summary",
+            "observer_owner_id",
+            "producer_epoch",
+            "lease_expires_at",
+        ] {
+            wire.as_object_mut().unwrap().remove(key);
+        }
+        std::fs::write(store.path(task_id), serde_json::to_vec(&wire).unwrap()).unwrap();
+        let loaded = store.read_record(task_id).unwrap();
+        let binding = CloudObservationBinding::from_record(&loaded).unwrap();
+        let lease = store
+            .acquire_cloud_observation_lease_at(
+                &binding,
+                &Uuid::new_v4().to_string(),
+                config::unix_time(),
+            )
+            .unwrap()
+            .unwrap();
+        let promoted = store.read_record(task_id).unwrap();
+        assert_eq!(promoted.schema_version, 3);
+        assert_eq!(promoted.start_fingerprint_version, 1);
+        assert_eq!(promoted.producer_epoch, 1);
+        let replay_fingerprint = start_request_fingerprint(
+            promoted.start_fingerprint_version,
+            task_id,
+            "legacy start",
+            promoted.title.as_deref(),
+            promoted.devin_mode.as_deref(),
+            None,
+            None,
+            &promoted.repos,
+            None,
+        )
+        .unwrap();
+        let replay = replay_operation(&promoted, operation_id, replay_fingerprint).unwrap();
+        assert_eq!(replay["task_id"], json!(task_id));
+        assert_eq!(
+            promoted.operations[0].request_fingerprint,
+            replay_fingerprint
+        );
+        assert_eq!(promoted.status, legacy.status);
+        assert_eq!(promoted.revision, legacy.revision);
+        assert_eq!(promoted.generation, legacy.generation);
+        assert_eq!(promoted.created_at, legacy.created_at);
+        assert_eq!(promoted.updated_at, legacy.updated_at);
+        assert_eq!(promoted.operations, legacy.operations);
+        assert!(store.release_cloud_observation_lease(&lease).unwrap());
+    }
+
+    #[test]
+    fn schema_three_rejects_observer_metadata_stripped_by_legacy_writer() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-schema-three");
+        let store = test_store(&workspace);
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(&owner, task_id, TaskStatus::Running))
+            .unwrap();
+        let mut wire = summary_of_wire_record(&store.read_record(task_id).unwrap());
+        wire.as_object_mut().unwrap().remove("producer_epoch");
+        std::fs::write(store.path(task_id), serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(
+            store
+                .read_record(task_id)
+                .unwrap_err()
+                .to_string()
+                .contains("missing producer_epoch")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cloud_observer_discovers_more_than_four_tasks_without_task_get() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let session_id = test_id();
+        let (handle, session) = active_test_session(&root, &session_id).await;
+        let store = TaskStore::default_store().unwrap();
+        let fake = install_fake();
+        let mut task_ids = Vec::new();
+        {
+            let mut fake = fake.lock().unwrap();
+            for _ in 0..6 {
+                let task_id = Uuid::new_v4();
+                let mut record = cloud_observer_record(&session, task_id, TaskStatus::Running);
+                let remote_id = record.devin_session_id.clone().unwrap();
+                record.updated_at = config::unix_time();
+                store.save(&record).unwrap();
+                fake.sessions.insert(
+                    remote_id.clone(),
+                    json!({
+                        "session_id": remote_id,
+                        "status": "running",
+                        "status_detail": "waiting_for_approval",
+                        "structured_output": {"should_not_be_read": "raw payload"},
+                    }),
+                );
+                task_ids.push(task_id);
+            }
+        }
+
+        let observer = CloudPendingObserver::new();
+        observer.observe_session_tasks(&session).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let all_observed = task_ids.iter().all(|task_id| {
+                store
+                    .read_record(*task_id)
+                    .ok()
+                    .and_then(|record| record.pending_interaction_summary)
+                    .is_some_and(|summary| summary.state == SummaryState::Pending)
+            });
+            if all_observed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not all retained tasks were observed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let calls = fake.lock().unwrap().calls.clone();
+        assert_eq!(calls.len(), 6);
+        assert!(calls.iter().all(|(method, path)| {
+            method == "GET"
+                && path.starts_with("/v3/organizations/org-test/sessions/")
+                && !path.ends_with("/messages")
+        }));
+        let tasks = task_list_with_store(&json!({}), &session, &store).unwrap();
+        assert_eq!(tasks["total"], 6);
+        assert!(tasks["tasks"].as_array().unwrap().iter().all(|task| {
+            task["pending_interaction"]["state"] == "pending"
+                && task.get("structured_output").is_none()
+        }));
+
+        observer.release_session(&session).await.unwrap();
+        let after_stop = task_list_with_store(&json!({}), &session, &store).unwrap();
+        assert!(
+            after_stop["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|task| { task["pending_interaction"]["state"] == "unavailable" })
+        );
+        for task_id in task_ids {
+            let _ = std::fs::remove_file(store.path(task_id));
+        }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_session_release_preserves_replacement_jobs_and_leases() {
+        let root = tempdir();
+        let session_id = test_id();
+        let (handle, old_session) = active_test_session(&root, &session_id).await;
+        let new_session = config::Session {
+            started_at: old_session.started_at.saturating_add(1),
+            process_id: old_session.process_id.saturating_add(1),
+            ..old_session.clone()
+        };
+        let store = TaskStore::default_store().unwrap();
+        let task_id = Uuid::new_v4();
+        let record = cloud_observer_record(&new_session, task_id, TaskStatus::Running);
+        store.save(&record).unwrap();
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        let observer = CloudPendingObserver::new();
+        let lease = store
+            .acquire_cloud_observation_lease_at(&binding, &observer.owner_id, config::unix_time())
+            .unwrap()
+            .unwrap();
+        observer.leases.lock().await.insert(task_id, lease.clone());
+        let job = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        observer.jobs.lock().await.insert(
+            task_id,
+            CloudObserverJob {
+                owner: SessionInstance::from_session(&new_session),
+                handle: job,
+            },
+        );
+        let original_gate = observer.session_gate(&session_id).await;
+
+        observer.release_session(&old_session).await.unwrap();
+
+        assert!(
+            observer
+                .is_retired(&SessionInstance::from_session(&old_session))
+                .await
+        );
+        assert!(
+            !observer
+                .is_retired(&SessionInstance::from_session(&new_session))
+                .await
+        );
+        let replacement_job = observer.jobs.lock().await;
+        assert!(replacement_job.contains_key(&task_id));
+        assert!(!replacement_job.get(&task_id).unwrap().handle.is_finished());
+        drop(replacement_job);
+        assert_eq!(observer.leases.lock().await.get(&task_id), Some(&lease));
+        assert_eq!(
+            store
+                .read_record(task_id)
+                .unwrap()
+                .observer_owner_id
+                .as_deref(),
+            Some(observer.owner_id.as_str())
+        );
+        assert!(Arc::ptr_eq(
+            &original_gate,
+            &observer.session_gate(&session_id).await
+        ));
+
+        let removed_job = observer.jobs.lock().await.remove(&task_id).unwrap();
+        removed_job.handle.abort();
+        let _ = removed_job.handle.await;
+        observer.leases.lock().await.remove(&task_id);
+        assert!(store.release_cloud_observation_lease(&lease).unwrap());
+        let _ = std::fs::remove_file(store.path(task_id));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_retains_cached_lease_when_store_io_fails() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir();
+        let (handle, session) = active_test_session(&root, &test_id()).await;
+        let store = test_store(&root);
+        let task_id = Uuid::new_v4();
+        let record = cloud_observer_record(&session, task_id, TaskStatus::Running);
+        store.save(&record).unwrap();
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        let observer = CloudPendingObserver::new();
+        let lease = store
+            .acquire_cloud_observation_lease_at(&binding, &observer.owner_id, config::unix_time())
+            .unwrap()
+            .unwrap();
+        observer.leases.lock().await.insert(task_id, lease.clone());
+        let lock_path = store.directory.join(".store.lock");
+        std::fs::remove_file(&lock_path).unwrap();
+        symlink("/dev/null", &lock_path).unwrap();
+        let fake = Arc::new(Mutex::new(FakeApi::default()));
+
+        assert!(
+            observe_one_cloud_task(
+                observer.clone(),
+                session.clone(),
+                store.clone(),
+                record.clone(),
+                Some(CloudApi::Fake(fake.clone())),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(observer.leases.lock().await.get(&task_id), Some(&lease));
+
+        let mut rebound = record;
+        rebound.generation += 1;
+        assert!(
+            observe_one_cloud_task(
+                observer.clone(),
+                session,
+                store.clone(),
+                rebound,
+                Some(CloudApi::Fake(fake)),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(observer.leases.lock().await.get(&task_id), Some(&lease));
+
+        std::fs::remove_file(lock_path).unwrap();
+        assert!(store.release_cloud_observation_lease(&lease).unwrap());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_reobserves_retained_cloud_tasks_on_its_interval() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let repo = root.join("volume").join("repo-a");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical_root = config::canonical_directory(root.join("volume").as_path()).unwrap();
+        let roots = NamedRoots::from_canonical_roots(std::collections::BTreeMap::from([(
+            "src".to_owned(),
+            canonical_root,
+        )]))
+        .unwrap();
+        let fake = install_fake();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = test_id();
+        let managed = supervisor
+            .start(
+                &format!("src/{}", repo.file_name().unwrap().to_string_lossy()),
+                Some(&session_id),
+            )
+            .await
+            .unwrap();
+        let session = config::read_session_metadata(&managed.session_id)
+            .await
+            .unwrap();
+        let store = TaskStore::default_store().unwrap();
+        let task_id = Uuid::new_v4();
+        let mut record = cloud_observer_record(&session, task_id, TaskStatus::Running);
+        record.updated_at = config::unix_time();
+        let original_task_metadata = (record.status, record.revision, record.updated_at);
+        let remote_id = record.devin_session_id.clone().unwrap();
+        fake.lock().unwrap().sessions.insert(
+            remote_id.clone(),
+            json!({
+                "session_id": remote_id,
+                "status": "running",
+                "status_detail": "working",
+            }),
+        );
+        store.save(&record).unwrap();
+
+        let first_revision =
+            wait_for_cloud_summary_state(&store, task_id, SummaryState::None, 0).await;
+        assert_eq!(first_revision, 1);
+        fake.lock().unwrap().sessions.get_mut(&remote_id).unwrap()["status_detail"] =
+            json!("waiting_for_approval");
+        let pending_revision =
+            wait_for_cloud_summary_state(&store, task_id, SummaryState::Pending, first_revision)
+                .await;
+        assert_eq!(pending_revision, first_revision + 1);
+        fake.lock().unwrap().sessions.get_mut(&remote_id).unwrap()["status_detail"] =
+            json!("working");
+        let none_revision =
+            wait_for_cloud_summary_state(&store, task_id, SummaryState::None, pending_revision)
+                .await;
+        assert_eq!(none_revision, pending_revision + 1);
+
+        let current = store.read_record(task_id).unwrap();
+        assert_eq!(
+            (current.status, current.revision, current.updated_at),
+            original_task_metadata,
+            "periodic metadata observation must not reconcile or revise the task"
+        );
+        let calls = fake.lock().unwrap().calls.clone();
+        assert!(calls.len() >= 3);
+        assert!(calls.iter().all(|(method, path)| {
+            method == "GET"
+                && path.starts_with("/v3/organizations/org-test/sessions/")
+                && !path.ends_with("/messages")
+        }));
+
+        supervisor.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(store.path(task_id));
     }
 
     #[test]

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Temote Fabric dashboard</title>
+    <link rel="stylesheet" href="/dash/styles.css">
+    <script type="module" src="/dash/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/dash/" aria-label="Temote Fabric dashboard home">
+          <span class="brand-mark" aria-hidden="true">T</span>
+          <span class="brand-copy">
+            <strong>Temote Fabric</strong>
+            <span>Operations dashboard</span>
+          </span>
+        </a>
+        <div class="deployment" aria-label="Deployment identity">
+          <div><span class="meta-label">DEPLOYMENT</span><strong id="deployment-value">Loading</strong></div>
+          <div><span class="meta-label">VERSION</span><strong id="version-value">Loading</strong></div>
+          <div><span class="meta-label">CONTRACT</span><strong id="fingerprint-value" class="mono">Loading</strong></div>
+        </div>
+        <div class="top-actions">
+          <div class="refresh-state" aria-live="polite">
+            <span class="status-dot status-dot--quiet" id="refresh-dot" aria-hidden="true"></span>
+            <span id="refresh-label">Connecting</span>
+          </div>
+          <button id="refresh-button" class="button button--refresh" type="button" disabled>
+            <span aria-hidden="true">↻</span> Refresh
+          </button>
+        </div>
+        <div id="degraded-banner" class="degraded-banner" hidden role="status"></div>
+      </header>
+
+      <main class="dashboard-grid">
+        <aside class="panel inventory-panel" aria-labelledby="inventory-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">FABRIC INVENTORY</p>
+              <h1 id="inventory-title">Hosts &amp; sessions</h1>
+            </div>
+            <span id="host-count" class="count-pill">—</span>
+          </div>
+          <div id="inventory-status" class="component-state" role="status">Loading host inventory…</div>
+          <div id="host-list" class="host-list" aria-label="Hosts"></div>
+          <div class="inventory-note">
+            <span class="note-icon" aria-hidden="true">◌</span>
+            <span>Availability shows the current live route. Sync history is shown separately.</span>
+          </div>
+        </aside>
+
+        <section class="panel session-panel" aria-labelledby="session-title">
+          <div class="panel-heading panel-heading--session">
+            <div>
+              <p class="eyebrow" id="selected-host-label">SELECT A HOST</p>
+              <h2 id="session-title">Session overview</h2>
+            </div>
+            <span id="session-lifecycle" class="state-badge state-badge--muted">No session selected</span>
+          </div>
+          <div id="session-status" class="component-state" role="status">Choose a host to inspect its sessions.</div>
+          <div id="session-detail" class="session-detail" hidden>
+            <div id="session-facts" class="facts-grid"></div>
+            <section class="subsection" aria-labelledby="workspace-title">
+              <div class="subsection-heading">
+                <div>
+                  <p class="eyebrow">CURRENT SCOPE</p>
+                  <h3 id="workspace-title">Workspace</h3>
+                </div>
+              </div>
+              <div id="workspace-facts" class="workspace-card"></div>
+            </section>
+            <section class="subsection tasks-section" aria-labelledby="tasks-title">
+              <div class="subsection-heading">
+                <div>
+                  <p class="eyebrow">DELEGATED WORK</p>
+                  <h3 id="tasks-title">Tasks</h3>
+                </div>
+                <span id="task-count" class="count-pill count-pill--small">—</span>
+              </div>
+              <div id="task-status" class="component-state">Select a session to load tasks.</div>
+              <div id="task-list" class="task-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <aside class="right-column" aria-label="Context and activity">
+          <section class="panel context-panel" aria-labelledby="context-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">REPLICATED CONTEXT</p>
+                <h2 id="context-title">Context &amp; freshness</h2>
+              </div>
+              <span id="context-authority" class="authority-pill">—</span>
+            </div>
+            <div id="context-status" class="component-state">Select a session to inspect context.</div>
+            <div id="context-detail" hidden>
+              <div id="freshness-card" class="freshness-card"></div>
+              <div class="context-block">
+                <div class="context-block-heading">
+                  <h3>Unresolved items</h3>
+                  <span id="unresolved-count" class="count-pill count-pill--small">—</span>
+                </div>
+                <div id="unresolved-list" class="compact-list"></div>
+              </div>
+              <div class="context-block">
+                <h3>Recent rollup</h3>
+                <div id="rollup-list" class="compact-list"></div>
+              </div>
+              <div id="provenance-block" class="context-block" hidden></div>
+            </div>
+          </section>
+
+          <section class="panel timeline-panel" aria-labelledby="timeline-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">SANITIZED OBSERVATIONS</p>
+                <h2 id="timeline-title">Recent timeline</h2>
+              </div>
+              <span id="timeline-authority" class="authority-pill">Replica</span>
+            </div>
+            <div id="timeline-status" class="component-state">Select a session to load recent observations.</div>
+            <ol id="timeline-list" class="timeline-list"></ol>
+          </section>
+        </aside>
+      </main>
+      <footer class="page-footer">
+        <span>Read-only view</span>
+        <span id="last-updated">Waiting for first update</span>
+      </footer>
+    </div>
+  </body>
+</html>

@@ -35,16 +35,35 @@ export function authorizeFederatedHost(request, env, hostId) {
 }
 
 export async function authorizeClient(request, env) {
+  return authorizeClientWithMode(request, env, "client_or_access");
+}
+
+// Dashboard requests require Cloudflare Access identity even when the shared
+// Worker still accepts CLIENT_TOKEN for existing MCP clients. Keep the mode
+// explicit at the call site so a future endpoint cannot accidentally inherit
+// token compatibility by using the general client authorizer.
+export async function authorizeDashboard(request, env) {
+  return authorizeClientWithMode(request, env, "access_only");
+}
+
+async function authorizeClientWithMode(request, env, mode) {
+  if (mode !== "client_or_access" && mode !== "access_only") return null;
   const authorization = request.headers.get("authorization") || "";
-  if (env.CLIENT_TOKEN && authorization === `Bearer ${env.CLIENT_TOKEN}`) {
+  if (
+    mode === "client_or_access"
+    && env.CLIENT_TOKEN
+    && authorization === `Bearer ${env.CLIENT_TOKEN}`
+  ) {
     return { subject: "client-token", email: "-" };
   }
   const assertion = request.headers.get("cf-access-jwt-assertion");
   if (!assertion) return null;
   try {
     return await verifyAccessJwt(assertion, env);
-  } catch (error) {
-    console.error("Access JWT rejected", error);
+  } catch {
+    // JWT parsing and key lookup errors can contain attacker-controlled input.
+    // Do not copy them into logs; the endpoint response is intentionally generic.
+    console.error("Access JWT rejected");
     return null;
   }
 }
