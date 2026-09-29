@@ -565,16 +565,118 @@ lifecycle:
 観測所有権と遅延書込みの排除:
 
 - Cloud には runtime generation が存在しないため、task `generation` や
-  PID を観測所有権の代用にしない。observer は観測専用の
-  owner identity + `producer_epoch` を持つ。
-- 同一 task に複数の Host process / observer が競合しても、
-  現在の owner だけが summary を更新できる契約とし、
-  所有権の取得・更新・失効条件、epoch 更新、
-  旧 owner の遅延応答拒否を定義する。
-- remote read 前に取得した task owner・canonical scope・
-  remote session binding (`devin_session_id`)・task generation を
-  保存前に再検証する。network 待機中に保持する global lock ではなく、
-  短い排他区間または比較更新で現在の binding と観測所有権を確認する。
+  PID を観測所有権の代用にしない。観測所有権は
+  永続 epoch + 期限付き観測 lease を同一の短い排他区間で
+  比較更新する方式で確定する(D2 で新規追加する設計であり、
+  別の coordination service / execution authority は追加しない)。
+
+所有権 metadata (既存 Cloud task の ownership / retention に従う
+record 上の新規 field;既存実装済みではない):
+
+```text
+observer_owner_id   observer instance を区別する一意な識別子
+                    (task owner、PID、task generation とは別物)
+producer_epoch      同じ retained task に対する観測所有権の
+                    単調増加カウンタ。release しても保持し、
+                    再取得時に増加する
+lease_expires_at    観測所有権の期限
+                    (summary.expires_at とは別物)
+```
+
+所有権と結果の適用対象は task_id だけでなく次の binding に固定する
+(既存 Cloud task record が保持する識別情報):
+`task_id` + session instance (`owner`) + canonical scope (`scope_cwd`) +
+`org_id` + `devin_session_id` + task `generation`。
+この識別情報を省略して別 session・別 organization・
+再開後の task に結果を適用しない。
+
+観測 lease は 15 秒、更新周期は 5 秒とする。lease の更新は
+observer の所有権維持であり、remote state の鮮度確認ではない。
+summary TTL 30 秒とは役割を分離する。
+
+原子的に確定する操作 (以下、すべて同一の短い排他区間で
+比較 + 更新する):
+
+| 操作 | 許可条件 | 同一排他区間内で行う変更 |
+|---|---|---|
+| 初回取得・引継ぎ | 対象 binding が有効で、owner 未設定または `now >= lease_expires_at` | `producer_epoch` を checked increment し、新 owner と lease 期限を保存 |
+| 更新 (renew) | owner ID・epoch が一致し、`now < lease_expires_at`、対象 binding も一致 | `lease_expires_at` だけを延長 |
+| summary 保存 | remote read 開始時の owner ID・epoch・binding が現在値と一致し、`now < lease_expires_at` | 最新 record の summary 部分だけを更新 |
+| 明示的 release | owner ID・epoch が現在値と一致 | owner と lease を無効化。`producer_epoch` は保持 |
+| 再取得 | 前の lease が失効済み、または正常に release 済み | 同じ observer でも新 epoch を取得。旧 read 結果は再利用しない |
+
+- 期限切れ後の renew は拒否する。新 owner がいなくても古い epoch を
+  復活させず、再取得後に新しい remote read を行う。
+- 古い cleanup は新 owner を解除しない。release も owner ID・epoch の
+  一致条件付きとする。
+- epoch は巻き戻し・再利用しない。不正値・overflow・所有権 metadata の
+  破損を初期値に戻して続行せず、当該観測を fail-closed にする。
+- 削除された task を復活させない。remote response が戻った時点で
+  record が削除済み、保持期限終了、session instance 不一致などであれば
+  その結果を破棄する。
+
+排他境界と保存順序:
+
+既存 `TaskStore::lock()` は process mutex と、Unix では
+`.store.lock` への `flock(LOCK_EX)` を提供し、`save_locked()` は
+一時ファイルへの書込みと rename で保存する。
+取得判定と永続更新はこの境界で process 間直列化し、
+process-local mutex だけでは十分としない。
+flock 等の process 間排他を保証できない platform では、
+その保証を platform 固有の実装 prerequisite として明記し、
+保証済みとは扱わない。
+
+```text
+短い排他区間:
+  current task / ownership を再読込み
+  acquire または renew の条件を検証
+  ownership metadata を永続化
+  read 用の binding / owner / epoch snapshot を取得
+排他解除
+
+remote status read
+
+短い排他区間:
+  current task / ownership を再読込み
+  snapshot と現在値、lease 有効性を比較
+  一致した場合だけ、最新 record の許可された metadata を更新
+排他解除
+```
+
+network await 中に store lock を保持しない。
+network read 前の task record 全体を response 到着後にそのまま
+保存してはいけない。並行した既存 task 操作の更新を消さないよう、
+最新 record に許可された metadata のみを適用する。
+
+観測で task の保持期限を延長しない:
+
+既存 `TaskStore::update()` は `record.updated_at` を更新し、
+retention 判定は `updated_at` を参照する。observer の定期 metadata 更新に
+無条件の `update()` を流用すると最終更新時刻と保持期間まで変わるため、
+観測 metadata 専用の保存経路で次を保持する:
+
+```text
+変更可能:  observation ownership metadata / pending summary metadata
+変更不可:  task.updated_at / created_at、task status / revision /
+           generation、operation receipts、remote session binding、
+           task owner / canonical scope / org_id
+```
+
+summary の `observed_at` は remote fetch 成功と状態検証時だけ更新し、
+lease renew や observer の生存確認で更新しない。
+
+検証例 (時間単位は秒、失効条件は `now >= lease_expires_at`):
+
+```text
+初期: epoch = 40, owner = none
+t=0   A が acquire → owner=A, epoch=41, lease_expires_at=15
+t=1   B が acquire → 拒否。A/41 を維持
+t=16  A は未更新で期限切れ。B が acquire
+      → owner=B, epoch=42, lease_expires_at=31
+t=17  A/41 の古い remote result が到着
+      → 保存拒否。B/42 の metadata は変わらない
+t=18  A/41 の遅延 renew / release → 拒否。B/42 を維持
+```
 
 許可する取得と保存:
 
@@ -585,9 +687,10 @@ lifecycle:
 - observer が変更できるのは新しい summary metadata と
   観測所有権 metadata のみ。task status、operation receipt、
   backend generation、remote session binding を観測の都合で変更しない。
-- credential は既存 `CloudConfig::resolve_config` の解決経路を使い、
-  API key は呼び出し中だけメモリに保持し、新規 metadata、log、
-  serialize 出力に認証値を保存しない。
+- credential は既存 `resolve_config()` (src/devin_cloud.rs の
+  module-level 関数) の解決経路を使い、API key は呼び出し中だけ
+  メモリに保持し、新規 metadata、log、serialize 出力に
+  認証値を保存しない。
 
 state / freshness:
 
@@ -893,6 +996,11 @@ D2 の将来検証ケース:
   remote task は停止しない
 - Cloud observer の timeout / rate limit / credential failure は
   `none` に変換せず `observed_at` も更新しない
+- 同時 acquire が競合しても owner と epoch が一意に決まる
+- 期限切れ後に旧 owner を復活させない (遅延 renew / release / result を拒否)
+- remote read 中に binding が変わった応答、task 削除・保持期限終了・
+  session instance 不一致の応答を採用しない
+- 観測 metadata の更新が `task.updated_at` と保持期限を変えない
 - 質問本文・選択肢本文・permission detail・raw result は
   summary 保存先、Worker response、browser、ログへ流れない
 - field を返さない旧 Host は `unsupported`
@@ -949,6 +1057,8 @@ real deployed Fabric hostname で:
 - [ ] Devin Cloud の summary は D2 の Host-side read-only observer が更新し、dashboard GET / task_list / browser access を契機に起動・取得しない。
 - [ ] 観測所有権 (`producer_kind` / `producer_epoch`) と実行所有権を混同せず、旧 owner の遅延結果を拒否する。
 - [ ] Cloud observer は binding 済み remote session の status read のみを行い、task status / operation receipt / backend generation / remote session binding を観測の都合で変更しない。
+- [ ] 観測所有権は `observer_owner_id` / 永続 `producer_epoch` / 15 秒 lease を同一排他区間で比較更新し、acquire・renew・expire・takeover・publish・release の許可条件と保存内容が一意に決まる。
+- [ ] 観測 metadata 更新は task `updated_at` / `created_at` / status / revision / generation / receipts / binding / owner / scope / org_id を変更しない。
 - [ ] Host / observer 停止時、summary は期限切れとして扱うが remote task は停止しない。
 - [ ] process restart 後、保存済み summary を現在の owner・接続状態・鮮度の確認なしに heartbeat だけで fresh に戻さない。
 - [ ] task list の backend-level unavailable が表示可能。
