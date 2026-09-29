@@ -302,33 +302,62 @@ offline inventory の唯一の source にしない。
 削除条件、D1 より先に必要な実装 dependency を個別に設計する。
 この issue では新しい durable catalog を追加しない。
 
-host ごとの表示状態を次で区別する:
+`availability` は「Fabric に現在利用可能な live route があるか」だけを
+表し、過去に接続した事実や backend process の生存まで意味に含めない。
+host ごとの availability を次で区別する:
 
 ```text
-online             現在接続を確認できた host
-                   (registry entry + status probe 成功)
-offline            既知だが lease expiry / disconnect を確認した host
-unknown            registry / probe 失敗で現在状態を判断できない host
-configured_only    configured だが接続履歴も observation もない host
-                   (offline の一種として扱い、history なしと区別して表示)
+online    完全な registry 読み取りと status probe が成功し、
+          対象 host の live route を確認できた
+offline   registry 読み取りが正常・完全だが、対象 host に
+          有効な live route がない
+          (「実機が停止している」「切断時刻を確認した」という意味には
+          しない。「接続履歴なし」「切断理由」も推定しない)
+unknown   registry 読み取り失敗、対象 probe 失敗、または結果の
+          完全性を確認できない (component failure を明示する)
 ```
 
 - unknown を offline と断定しない。offline を一覧から消して済ませない。
 - observation がないことを「host が存在しない」と同一視しない。
-- `last seen` は復元できる場合のみ表示する。registry entry は
-  `last_seen` / `connected_at` / `expires_at` を保持するが、
-  lease expiry では entry 全体が削除されるため、prune 後は
-  `observation_sources.last_synced_at` を "last synchronized" として表示し、
-  復元できない場合は `unknown` とする。時刻を捏造しない。
-- 認可対象から外れた host は inventory に含めない。
-- D1 が失敗しても live read が成功する host は `online` のまま、
+- D1 が失敗しても live route の確認に成功した host は `online` のまま、
   replica metadata component を `unavailable` として表示する (§12)。
+- 認可対象から外れた host は inventory に含めない。
+
+`configured_only` は availability state ではなく、host entry の
+**情報源属性** (`evidence`)として表示する:
+「現在参照できる根拠が configured membership だけ」であることを意味し、
+「過去に接続したことがない」という意味は持たせない。
+
+接続履歴と同期履歴は availability と分離し、観測できた入力だけを表示する:
+
+- 証拠が存在する
+  → 観測できた履歴を表示する (registry entry が存在する間の
+    `last_seen` / `connected_at`、および
+    `observation_sources.last_synced_at` の "last synchronized")。
+- 証拠が存在しない
+  → 過去の接続有無は `unknown` とし、「接続したことがない」と断定しない
+    (registry entry は lease expiry で entry 全体が削除されるため、
+    prune 後は接続履歴を復元できない)。
+- 履歴取得元が失敗した
+  → `unavailable` とする。
+- `last_synced_at` は最後に observation を同期した時刻であり、
+  切断時刻や last_seen ではない。時刻を捏造しない。
+
+欠落・破損した membership 設定や不完全な registry 結果を、
+正常な空集合として扱わない。membership の parse/validate 失敗は
+component-level `unavailable`、registry 結果の完全性が確認できない
+場合は `unknown` とする。
+configured membership による認可対象の制限は host 一覧だけでなく
+`/dash/api/v1/hosts/:host_id/...` の直接参照にも一貫して適用し、
+membership に含まれない `host_id` への直接アクセスを拒否する。
 
 表示:
 
 - host_id
-- availability (上記 state)
-- last synchronized / lease freshness if available
+- availability (上記 live-route state)
+- evidence 属性 (`configured_only` 等)
+- 観測できた接続 / 同期履歴 (connected_at / last_seen / last synchronized) —
+  証拠がなければ `unknown`
 - protocol/capability summary if already present in bounded host projection
 - session count if confirmed
 - observation sync freshness
@@ -356,43 +385,119 @@ raw credential、environment、prompt、command output を追加取得しない�
 ### 8.4 Tasks
 
 source は `task_list` projection と、D2 で追加する
-Host-side bounded `pending_interaction` summary の合成とする。
+Host-side `pending_interaction` summary の合成とする。
 
 現行の `compact_task_list_view` は各 task を
-backend / task_id / status / revision / last_updated_at に縮約するため、
-existing projection だけでは pending interaction の有無を取得する経路がない。
-欠落 field を `count=0` / `pending=false` に変換しない。
+backend / task_id / status / revision / last_updated_at に縮約し、
+`task_list` (`orchestration.rs` → 各 backend の `task_list_with_store`) は
+retained record の read で、runtime に触れず record も変更しない。
+一方 `task_get` (`task_get_with_store_and_binary`) は runtime の
+確保・再確立と reconciliation を行い得て、その後に pending interactions を
+取得する。
+つまり現行 list に summary field を足すだけでは値の更新元がなく、
+full `task_get` の流用は read-only list に runtime 確保・reconciliation を
+持ち込む。欠落 field を `count=0` / `pending=false` に変換しない。
 
-D2 prerequisite として、既存 `task_list` に additive な
-safe summary 拡張を Host 側に追加する(完成した API ではなく前提契約):
+D2 prerequisite として、summary の **生成・更新経路** と **読み取り経路** を
+分離した契約を定義する(完成した API ではなく前提契約であり、
+observer も保存 field も現状は存在しないものとして設計する):
 
-- 各 task item に allow-listed metadata のみを持つ
-  bounded `pending_interaction` summary を付加する。
-- 追加 MCP tool や任意 tool-name を受ける dashboard proxy は作らない。
-- 新しい execution authority / task control 経路を作らない。
-- task owner / session / workspace の既存検証を迂回しない。
+```text
+既存の、所有権を確認できた runtime owner
+  → Host-side pending metadata observer
+  → scope・generation・鮮度付きの bounded summary
+  → 既存 task_list の additive projection
+  → dashboard
+```
+
+境界:
+
+- **更新主体**は対象 task の runtime を現在所有している
+  既存 runtime owner のみとする。
+- dashboard の GET、`task_list`、page load を契機に task/runtime の
+  新規起動・再開・再接続を行わない。`ensure_runtime*`、full `task_get`、
+  task control を metadata 取得の代用にしない。
+- **取得元**は backend ごとの safe な scoped read / event path のみ(下表)。
+  raw detail を取得してから隠す方式にせず、summary だけを生成する。
+- **保存先**は既存 task ownership / retention / GC に従う
+  Host-side metadata とする。owner 検証を省いた別ストアや
+  新しい execution authority を作らない。
+- **reader**は `task_list` の additive projection のみとし、
+  list は保存済み summary の読み取りに留め、取得を合成しない。
+- 追加 MCP tool、任意 tool-name を受ける dashboard proxy、
+  新しい task control 経路は作らない。
 - 既存 field と入力契約を維持し、
   public MCP contract fingerprint を不必要に変更しない。
+- task owner / session / workspace の既存検証を迂回しない。
 
 summary が表現する内容:
 
 ```text
-state        = none | pending | unknown | unsupported | unavailable
-count?       bounded integer
-types?       allow-listed interaction type のみ (bounded)
-revision / observed_at   freshness
-truncated?   上限に達したことを示す marker
+state              = none | pending | unknown | unsupported | unavailable
+count?             bounded integer (source が件数を確定できる場合のみ)
+types?             allow-listed 種別の bounded 配列
+summary_revision   observer 書込みごとに増加する独立 revision
+observed_at        backend を実際に観測した時刻
+runtime_generation summary を生成した runtime owner の generation
+expires_at         observed_at + TTL
+truncated?         上限に達したことを示す marker
 ```
 
-件数・配列・文字列は固定上限を持ち、超過は `truncated` で表現する。
-
-- `none` は取得元が正当に pending なしを確認できた場合のみとする。
+- `none` は permission と question の対象範囲を正常に読み切れた場合のみ。
+- 一部 endpoint の取得失敗、上限超過、owner 不明、runtime 再接続中は
+  `unavailable` / `unknown` とし、`none` にしない。
+- `expires_at` を過ぎた summary と observer 停止後の値は `unavailable`
+  とし、現在の「対話待ちなし」と表示しない。
 - field を返さない旧 Host は `unsupported` とし、
   「対話待ちなし」と表示しない。
-- backend / Host / store の取得失敗は `unavailable` とし、
-  該当 backend の他 task には影響させない。
-- 全 backend を恒久的に `unknown` にするだけで
+- 該当 backend の取得失敗は他 task / 他 backend に影響させない。
+- 全 backend を恒久的に `unknown` / `unsupported` にするだけで
   pending interaction 機能が完成した扱いにはしない。
+
+freshness / generation:
+
+- `summary_revision` は task `revision` / task status とは独立に増加し、
+  summary だけが変化した場合にも UI が更新を検出できる。
+- `observed_at` は backend 観測時刻であり、HTTP response 生成時刻や
+  host 接続確認時刻で古い summary を fresh にしない。
+- summary は `runtime_generation` を持ち、runtime generation 変更後に
+  古い owner の遅延結果による上書きを受理しない。
+
+本 issue で確定する bounds:
+
+- observer interval: 5 秒 (runtime を所有している間のみ;
+  dashboard foreground polling と同周期)
+- backend scoped read timeout: 2 秒 / endpoint
+- 同時実行: runtime あたり 1、host 全体で 4 並行まで
+- summary TTL (`expires_at`): `observed_at` + 30 秒
+- pending 件数 / `count` 上限: 64
+  (OpenCode の既存 `MAX_PENDING_INTERACTIONS` に一致;他 backend も同じ上限)
+- `types` 配列: allow-list は `permission` / `question` / `approval`、
+  最大 4 種類
+- serialized summary 上限: 4 KiB
+
+backend ごとの support 判定と取得元(実ファイル確認済み):
+
+| backend | v1 support | safe metadata の実際の取得元 | 更新主体・保存先 | freshness / generation | 取得不能・未対応時 | 追加する prerequisite |
+|---|---|---|---|---|---|---|
+| OpenCode | supported | 既存 `pending_interactions()` の scoped read: `session_list` + `permission_list` + `question_list` を対象 OpenCode session と descendant session に絞り込む (`MAX_PENDING_INTERACTIONS` = 64) | 所有中 runtime に対する runtime owner の定期 scoped read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_list` read から分離された observer と summary 保存 field |
+| Codex (app-server) | supported | runtime JSON-RPC channel の approval request event(現行 `mark_waiting_approval` が `waiting_approval` を record に記録する経路) | 既存 approval event path が bounded summary を task metadata に永続化 | `observed_at` + `runtime_generation` | `unavailable` | status 記録と同じ owner が summary を永続化する field |
+| Devin ACP | supported | `session/request_permission` event と task binding に永続される `pending_permissions` (`mark_task_waiting_approval` 経路) | 既存 permission event path が bounded summary を task metadata に永続化 | `observed_at` + `runtime_generation` | `unavailable` | binding 永続化と同じ owner が summary を永続化する field |
+| Devin Cloud | supported | remote session の `status_detail` の bounded read(既存 reconcile が `waiting_for_approval` → `WaitingApproval` に導出する値) | runtime owner の定期 remote status read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_get` 外で status のみを読む observer と summary 保存 field |
+
+- `types` は `permission` / `question` (OpenCode) と `approval`
+  (Codex / Devin ACP / Devin Cloud) を v1 で正しく表示する。
+- Devin Cloud の `waiting_for_user` は retained `WaitingInput` status として
+  task status に表示し、回答必須の対話と混同しないため
+  v1 の pending summary には含めない。
+- OpenCode の `interaction_detail` (question 本文・choices、
+  permission action/resources)、Codex / Devin ACP の approval detail、
+  raw request / result は summary、保存先、Worker response、browser、
+  log に出さない。summary は kind / count / freshness のみ。
+- OpenCode observer は runtime を所有していない状態で scoped read を
+  実行しない(ensure / spawn しない)。所有喪失後は取得を止め、
+  summary は期限切れで `unavailable` になる。
+- host 側に summary field を持たない旧 Host は `unsupported` とする。
 
 安全性:
 
@@ -482,7 +587,11 @@ replica -> separate "last synchronized" section
 
 切断 / lease expiry で registry から消えた host も、
 §8.2 の inventory contract により page reload 後も
-`offline` として再構成できるようにする。
+configured membership に基づく entry として再構成される。
+availability は再評価結果に従う(live route なし → `offline`、
+registry 読み取り失敗 → `unknown`)。
+接続 / 同期履歴は証拠が存在する場合のみ表示し、
+証拠がなければ `unknown`、履歴取得元の失敗は `unavailable` とする。
 offline host の retained task を current running と表示しない。
 
 ## 10. UI v1
@@ -553,7 +662,8 @@ Dashboard は partial failure を first-class にする。
 - live session read succeeds / observation replica has gap
 - D1 unavailable / live host read succeeds
 - host registry liveness unavailable / configured membership と replica metadata は読める
-  (inventory は `unknown` state のまま表示し、消えない)
+  (inventory は membership entry として表示を継続し、
+  availability は `unknown`、消えない)
 - context resolver unavailable / session list succeeds
 
 一部失敗を page 全体の empty state に変換しない。
@@ -599,40 +709,69 @@ D0 の将来検証ケース:
 ### D1 — host/session dashboard
 
 - bootstrap
-- host inventory(§8.2: configured membership + owner-scoped replica metadata)
-  と `readOnlineHosts` liveness overlay の合成
+- host inventory(§8.2: configured membership + owner-scoped replica metadata
+  の情報源属性付き合成)
+- `readOnlineHosts` liveness overlay → availability
+  (`online` / `offline` / `unknown` = live route の有無のみ)
+- connection / sync history 表示契約(証拠なし → `unknown`、
+  履歴取得元失敗 → `unavailable`、
+  `last_synced_at` は同期時刻であり切断時刻ではない)
 - session list/info
 - master/detail UI
-- online / offline / unknown / configured-only semantics
 - replica freshness metadata(`last_synced_at` / gap / degraded)
+- membership 認可を host 配下の直接 API 参照へも一貫して適用
 
 D1 の将来検証ケース:
 
+- ケース A(未接続 host)とケース B(一度も同期せず切断し
+  registry entry も prune 済みの host)が同じ取得結果になるとき、
+  どちらにも未確認の接続履歴を付与しない
+- observation を一度も同期せず切断した host を
+  「以前接続していた」と断定しない
 - 接続 → 切断 / lease expiry → registry prune → page reload 後も、
-  inventory に残る対象 host を offline として識別できる
-- observation 未同期の既知 host を混同しない
-- registry failure と D1 failure が独立した partial failure になる
+  inventory に残る対象 host を識別できる
+- D1 単独障害: live route 確認済み host は `online`、
+  replica metadata component のみ `unavailable`
+- registry 単独障害: availability は `unknown`、
+  inventory は membership entry として表示を継続する
+- 設定から削除 / 認可対象外となった host の直接参照を拒否し、
+  stale D1 row から復元表示しない
+- 破損した membership 設定や不完全な registry 結果を
+  正常な空集合として扱わない
 - 設定から削除された host / 別 owner / 同名 session を混同しない
 - offline host の retained task を current running と表示しない
 
 ### D2 — task projection
 
-- `task_list` projection の利用
-- Host prerequisite: per-task bounded `pending_interaction` summary
-  (§8.4、additive で safe metadata のみ)
+- `task_list` projection の利用 (retained state の read のみ)
+- Host prerequisite A: runtime owner による pending metadata observer
+  (§8.4: backend 別 safe source、interval 5s / timeout 2s /
+  concurrency 4 / TTL 30s / count ≤ 64 / types ≤ 4 / summary ≤ 4KiB)
+- Host prerequisite B: task metadata への bounded summary 保存と
+  `task_list` の additive projection
 - per-backend unavailable semantics
-- pending interaction display(`none | pending | unknown | unsupported | unavailable`)
+- pending interaction display
+  (`none | pending | unknown | unsupported | unavailable`)
+- `summary_revision` による task status / revision 非依存の更新検出
 - bounded refresh
-- summary 拡張の Host prerequisite が揃うまで、
+- 上記 Host prerequisite が揃うまで、
   pending interaction 表示機能は未完了とする
 
 D2 の将来検証ケース:
 
-- pending あり
-- 確認済み pending なし
-- field を返さない旧 Host
+- 通常の `task_get` を一度も呼ばなくても、対応 backend の
+  pending なし → あり → 解消を summary で観測できる
+- task status / task revision が変わらなくても、
+  pending summary の変更が UI に反映される
+- observer 停止・期限切れ・一部 endpoint 失敗時、
+  古い `none` を現在の「対話待ちなし」として表示しない
+- runtime generation 変更後、古い owner の遅延結果を採用しない
+- `task_list` / dashboard GET だけでは
+  spawn・resume・reconciliation・answer が発生しない
+- 質問本文・選択肢本文・permission detail・raw result は
+  summary 保存先、Worker response、browser、ログへ流れない
+- field を返さない旧 Host は `unsupported`
 - 一部 backend 取得不能
-- pending summary 未対応 backend
 - summary 上限超過の truncation
 - raw task body を含む upstream fixture でも
   dashboard 向け response には allow-listed metadata のみ出る
@@ -674,8 +813,14 @@ real deployed Fabric hostname で:
 - [ ] offline/unavailable を empty/success/current に正規化しない。
 - [ ] host inventory が server-side configured membership と owner-scoped replica metadata で構成され、`readOnlineHosts` は liveness overlay に限定される。
 - [ ] offline host が registry prune / page reload 後も識別できる。
-- [ ] unknown / offline / configured-only / unavailable を混同しない。
-- [ ] pending interaction は Host 側 bounded summary 経由で表示され、欠落 field を「なし」と表示しない。
+- [ ] availability (`online` / `offline` / `unknown`) は live route の有無のみを表し、判別不能な接続履歴や切断理由を断定しない (ケース A / B に未確認の履歴を付与しない)。
+- [ ] host の接続 / 同期履歴は証拠が存在する場合のみ表示され、証拠なしは `unknown`、履歴取得元の失敗は `unavailable`。`configured_only` は情報源属性であり「未接続」の意味を持たない。
+- [ ] configured membership 認可が host 一覧と host 配下の直接参照に一貫して適用され、stale D1 row からの復元表示をしない。
+- [ ] unknown / offline / unavailable と evidence 属性を混同しない。
+- [ ] pending interaction は runtime owner の observer が生成し task metadata に保存された bounded summary を `task_list` が読み取る経路で表示され、欠落 field を「なし」と表示しない。
+- [ ] pending summary は `summary_revision` / `observed_at` / `runtime_generation` / `expires_at` を持ち、期限切れ・一部 endpoint 失敗・observer 停止を「対話待ちなし」と表示しない。
+- [ ] task status / revision 非依存の summary 変更が UI に反映される。
+- [ ] `task_list` / dashboard GET だけでは task/runtime の spawn・resume・reconciliation・answer が発生しない。
 - [ ] task list の backend-level unavailable が表示可能。
 - [ ] context freshness / gap / degradation が表示可能。
 - [ ] timeline は sanitized replicated observation の bounded projection のみ。
