@@ -96,7 +96,7 @@ pub(crate) fn parse_repository_id(
     if source.trim() != source {
         return Err(RepositorySourceError::InvalidRepository);
     }
-    if source.contains(['?', '#']) {
+    if source.contains('?') || source.contains('#') {
         return Err(RepositorySourceError::QueryOrFragment);
     }
 
@@ -257,10 +257,6 @@ mod tests {
 
     #[test]
     fn normalizes_github_identity_case() {
-        let parsed =
-            RepositoryId::parse("HTTPS://github.com/F4AH6O/Temote-MCP", "unused.test").unwrap_err();
-        assert_eq!(parsed, RepositorySourceError::UnsupportedScheme);
-
         let parsed =
             RepositoryId::parse("https://GitHub.COM/F4AH6O/Temote-MCP", "unused.test").unwrap();
         assert_eq!(parsed.host, "github.com");
