@@ -489,6 +489,7 @@ test("context live projections and replica metadata stay session-scoped and omit
         output: RAW_MARKER,
       },
       raw: RAW_MARKER,
+      refs: [{ observation_id: "obs-b", revision: 1, kind: "instruction", body: RAW_MARKER }],
     }],
     refs: [{ observation_id: "obs-a", revision: 2, kind: "execution_state", body: RAW_MARKER }],
     freshness: { resolved_revision: 7, at_least_revision: null, stale: false, detail: RAW_MARKER },

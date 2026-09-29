@@ -23,6 +23,7 @@ import {
   responseIsDegraded,
   setText,
   taskBackendPresentation,
+  unresolvedPresentation,
 } from "../assets/dash/app.js";
 import { handle as handleDashboardFixture, state as dashboardFixtureState } from "./dashboard-fixtures/server.mjs";
 
@@ -400,6 +401,24 @@ test("partial backend rows remain visible but cannot claim a current task snapsh
   assert.equal(complete.available, true);
   assert.equal(complete.current, true);
   assert.equal(complete.partial, false);
+});
+
+test("unresolved items never claim an empty confirmed projection when unavailable", () => {
+  for (const bad of [undefined, null, "broken", {}, 0]) {
+    const presentation = unresolvedPresentation("confirmed", bad);
+    assert.equal(presentation.state, "unavailable");
+    assert.equal(presentation.message, "Current unresolved items are not confirmed.");
+    assert.equal(presentation.message.includes("No unresolved items"), false);
+  }
+  const unavailable = unresolvedPresentation("unavailable", undefined);
+  assert.equal(unavailable.state, "unavailable");
+  assert.equal(unavailable.message, "Unresolved items unavailable.");
+  const empty = unresolvedPresentation("confirmed", []);
+  assert.equal(empty.state, "empty");
+  assert.equal(empty.message, "No unresolved items in the confirmed projection.");
+  const list = unresolvedPresentation("confirmed", [{ task_id: "task-1" }]);
+  assert.equal(list.state, "list");
+  assert.equal(list.count, "1");
 });
 
 test("malformed and out-of-range timestamps render as unknown", () => {

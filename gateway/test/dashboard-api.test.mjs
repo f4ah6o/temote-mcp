@@ -380,6 +380,9 @@ test("context envelope is stale when resolver freshness is stale or a projection
     contextResolve: {
       session_id: "project-a",
       current_summary: {},
+      unresolved: [],
+      recent_related_tasks: [],
+      refs: [],
       freshness: { stale: true, resolved_revision: 4, at_least_revision: 5 },
       partial: { journal_degraded: false },
     },
@@ -506,6 +509,189 @@ test("malformed membership, registry, and direct nonmember host requests fail ex
   ));
   assert.equal(directResponse.status, 404);
   assert.equal((await directResponse.json()).error_code, "host_not_found");
+});
+
+test("context resolve treats missing containers and malformed items as unavailable, never confirmed-empty", async () => {
+  const fixture = await makeAccessFixture();
+  const contextStatus = {
+    session_id: "project-a",
+    journal: { exists: true, degraded: false, revision: 4 },
+    memory: { worker: "not_implemented", stale: true },
+  };
+  const base = {
+    session_id: "project-a",
+    context_schema_version: 1,
+    workspace: { repository: "temote-mcp" },
+    current_summary: { observations: 2, journal_revision: 4, tasks_total: 1, tasks_active: 1, tasks_attention: 1, backends: ["codex"], last_observed_at: null },
+    unresolved: [{
+      task_id: "task-one",
+      status: "running",
+      reason: "latest observed state needs attention",
+      refs: [{ observation_id: "obs-1", revision: 1, kind: "instruction" }],
+    }],
+    recent_related_tasks: [{
+      task_id: "task-one",
+      backend: "codex",
+      refs: [{ observation_id: "obs-1", revision: 1, kind: "instruction" }],
+    }],
+    refs: [{ observation_id: "obs-1", revision: 1, kind: "instruction" }],
+    freshness: { resolved_revision: 4, at_least_revision: null, stale: false },
+    partial: { journal_exists: true, journal_degraded: false, corrupt_lines: 0, write_failures: 0 },
+    memory: { worker: "not_implemented", stale: true },
+    generated_at: 1_790_000_200,
+  };
+  await withJwks(fixture, async () => {
+    const { env: okEnv } = makeEnv(fixture, { contextResolve: base, contextStatus, d1Rows: [] });
+    const okResponse = await worker.fetch(
+      request("/dash/api/v1/hosts/mac-main/sessions/project-a/context", fixture),
+      okEnv,
+    );
+    const ok = await okResponse.json();
+    assert.equal(ok.data.context_resolve.status, "confirmed");
+    assert.equal(ok.data.context_resolve.data.unresolved.length, 1);
+    assert.equal(ok.data.context_resolve.data.unresolved[0].task_id, "task-one");
+
+    const malformed = [
+      { unresolved: undefined },
+      { unresolved: "not-an-array" },
+      { unresolved: [null] },
+      { unresolved: [{ status: "running", reason: "latest observed state needs attention" }] },
+      { unresolved: [{ task_id: "task-one", refs: "broken" }] },
+      { unresolved: [{ task_id: "task-one", refs: [{ observation_id: "obs-1", revision: 1, kind: "instruction" }, null] }] },
+      { current_summary: undefined },
+      { current_summary: [] },
+      { freshness: undefined },
+      { freshness: "stale" },
+      { freshness: { resolved_revision: 4 } },
+      { partial: undefined },
+      { partial: [] },
+      { partial: { journal_exists: true } },
+      { recent_related_tasks: undefined },
+      { recent_related_tasks: {} },
+      { recent_related_tasks: [{ backend: "codex", refs: [] }] },
+      { recent_related_tasks: [{ task_id: "task-one", refs: [{ observation_id: "obs-1", kind: "instruction" }] }] },
+      { refs: undefined },
+      { refs: "broken" },
+      { refs: [{ observation_id: "obs-1", revision: 1, kind: "instruction" }, { observation_id: "obs-bad" }] },
+      { refs: [{ observation_id: "obs-1", revision: 1, kind: "not-a-kind" }] },
+    ];
+    for (const broken of malformed) {
+      const { env } = makeEnv(fixture, {
+        contextResolve: { ...base, ...broken },
+        contextStatus,
+        d1Rows: [],
+      });
+      const response = await worker.fetch(
+        request("/dash/api/v1/hosts/mac-main/sessions/project-a/context", fixture),
+        env,
+      );
+      const body = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(broken));
+      assert.equal(body.data.context_resolve.status, "unavailable", JSON.stringify(broken));
+      assert.equal(body.data.context_resolve.error_code, "host_projection_unavailable", JSON.stringify(broken));
+      assert.equal(body.data.context_resolve.data, undefined, JSON.stringify(broken));
+      assert.equal(body.status, "stale", JSON.stringify(broken));
+      assert.equal(JSON.stringify(body).includes('"unresolved":[]'), false, JSON.stringify(broken));
+    }
+  });
+});
+
+test("task list fails closed on malformed rows instead of reporting a backend as empty", async () => {
+  const fixture = await makeAccessFixture();
+  const baseTaskList = () => ({
+    tasks: [{
+      backend: "codex",
+      task_id: "task-one",
+      status: "completed",
+      revision: 4,
+      last_updated_at: 1_790_000_100,
+      pending_interaction: { state: "unsupported" },
+      report: { output: "must not leave host" },
+    }],
+    backends: {
+      codex: { status: "ok", total: 1, skipped: 0 },
+      devin_acp: { status: "ok", total: 0, skipped: 0 },
+    },
+    total: 1,
+    limit: 64,
+    truncated: false,
+  });
+
+  const backendUnavailableCases = [
+    { tasks: [{ backend: "codex", status: "completed" }] },
+    { tasks: [{ backend: "codex", task_id: "x".repeat(300) }] },
+    { tasks: [{ backend: "codex", task_id: 42 }] },
+    { tasks: [{ backend: "codex", task_id: "task-one" }], backends: { codex: { status: "ok", skipped: 0 }, devin_acp: { status: "ok", total: 0, skipped: 0 } }, total: 0 },
+    { tasks: [{ backend: "codex", task_id: "task-one" }], backends: { codex: { status: "ok", total: 0, skipped: 0 }, devin_acp: { status: "ok", total: 0, skipped: 0 } }, total: 0 },
+    { backends: { codex: { status: "ok", total: 1 }, devin_acp: { status: "ok", total: 0, skipped: 0 } } },
+  ];
+  await withJwks(fixture, async () => {
+    for (const broken of backendUnavailableCases) {
+      const taskList = { ...baseTaskList(), ...broken };
+      const { env } = makeEnv(fixture, { taskList });
+      const response = await worker.fetch(
+        request("/dash/api/v1/hosts/mac-main/sessions/project-a/tasks", fixture),
+        env,
+      );
+      const body = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(broken));
+      assert.equal(body.status, "stale", JSON.stringify(broken));
+      const codex = body.data.backends.find((backend) => backend.backend === "codex");
+      assert.equal(codex.status, "unavailable", JSON.stringify(broken));
+      assert.equal(codex.tasks, undefined, JSON.stringify(broken));
+      const devinAcp = body.data.backends.find((backend) => backend.backend === "devin_acp");
+      assert.equal(devinAcp.status, "confirmed", JSON.stringify(broken));
+      assert.deepEqual(devinAcp.tasks, [], JSON.stringify(broken));
+      assert.equal(JSON.stringify(body).includes("must not leave host"), false);
+    }
+
+    const mixed = baseTaskList();
+    mixed.tasks = [
+      { backend: "codex", task_id: 42 },
+      { backend: "devin_acp", task_id: "task-two", status: "running", pending_interaction: { state: "unsupported" } },
+    ];
+    mixed.backends.devin_acp = { status: "ok", total: 1, skipped: 0 };
+    mixed.total = 2;
+    const { env: mixedEnv } = makeEnv(fixture, { taskList: mixed });
+    const mixedResponse = await worker.fetch(
+      request("/dash/api/v1/hosts/mac-main/sessions/project-a/tasks", fixture),
+      mixedEnv,
+    );
+    const mixedBody = await mixedResponse.json();
+    assert.equal(mixedResponse.status, 200);
+    assert.equal(mixedBody.status, "stale");
+    const mixedCodex = mixedBody.data.backends.find((backend) => backend.backend === "codex");
+    assert.equal(mixedCodex.status, "unavailable");
+    const mixedDevin = mixedBody.data.backends.find((backend) => backend.backend === "devin_acp");
+    assert.equal(mixedDevin.status, "confirmed");
+    assert.equal(mixedDevin.tasks.length, 1);
+    assert.equal(mixedDevin.tasks[0].task_id, "task-two");
+
+    const structuralCases = [
+      { tasks: [{ backend: "unknown-backend", task_id: "task-one" }] },
+      { tasks: [{ task_id: "task-one" }] },
+      { tasks: [null] },
+      { tasks: ["broken"] },
+      { tasks: undefined },
+      { backends: "broken" },
+      { backends: undefined },
+      { total: 7 },
+      { total: undefined },
+      { backends: { codex: { status: "ok", total: "1", skipped: 0 }, devin_acp: { status: "ok", total: 0, skipped: 0 } } },
+      { limit: undefined },
+      { truncated: undefined },
+      { truncated: true },
+    ];
+    for (const broken of structuralCases) {
+      const { env } = makeEnv(fixture, { taskList: { ...baseTaskList(), ...broken } });
+      const response = await worker.fetch(
+        request("/dash/api/v1/hosts/mac-main/sessions/project-a/tasks", fixture),
+        env,
+      );
+      assert.equal(response.status, 503, JSON.stringify(broken));
+      assert.equal((await response.json()).error_code, "host_projection_unavailable", JSON.stringify(broken));
+    }
+  });
 });
 
 test("pending summaries require a coherent fresh producer-owned projection", () => {

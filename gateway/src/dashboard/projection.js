@@ -260,18 +260,39 @@ export function projectWorkspace(value) {
 }
 
 export function projectTaskList(value, nowSeconds = Math.floor(Date.now() / 1000)) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.tasks) || value.tasks.length > 256) {
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || !Array.isArray(value.tasks)
+    || value.tasks.length > 256
+    || !plainObject(value.backends)
+    || !nonNegativeInt(value.total)
+    || !nonNegativeInt(value.limit)
+    || typeof value.truncated !== "boolean"
+    // The host derives `truncated` from `total > limit` and truncates the
+    // merged list at `limit`; an envelope that contradicts that arithmetic
+    // cannot be a confirmed projection.
+    || value.truncated !== (value.total > value.limit)
+    || value.tasks.length > value.limit
+  ) {
     return null;
   }
-  const sourceBackends = value.backends && typeof value.backends === "object" && !Array.isArray(value.backends)
-    ? value.backends
-    : {};
+  const sourceBackends = value.backends;
   const tasksByBackend = new Map(BACKENDS.map((backend) => [backend, []]));
+  const corruptBackends = new Set();
   for (const task of value.tasks) {
-    const backend = BACKENDS.includes(task?.backend) ? task.backend : null;
-    if (!backend || typeof task.task_id !== "string" || !boundedString(task.task_id, 256)) continue;
-    tasksByBackend.get(backend).push({
-      backend,
+    // A row that cannot be attributed to a known backend fails the whole
+    // projection; dropping it could empty a store that still holds work.
+    if (!task || typeof task !== "object" || Array.isArray(task) || !BACKENDS.includes(task.backend)) {
+      return null;
+    }
+    if (!boundedString(task.task_id, 256)) {
+      corruptBackends.add(task.backend);
+      continue;
+    }
+    tasksByBackend.get(task.backend).push({
+      backend: task.backend,
       task_id: task.task_id,
       status: safeLabel(task.status) ?? "unknown",
       ...(nonNegativeInt(task.revision) ? { revision: task.revision } : {}),
@@ -281,26 +302,34 @@ export function projectTaskList(value, nowSeconds = Math.floor(Date.now() / 1000
   }
   const backends = BACKENDS.map((backend) => {
     const result = sourceBackends[backend];
-    if (result?.status === "ok") {
-      const total = nonNegativeInt(result.total) ? result.total : tasksByBackend.get(backend).length;
-      const skipped = nonNegativeInt(result.skipped) ? result.skipped : 0;
-      const truncated = skipped > 0 || total > tasksByBackend.get(backend).length || value.truncated === true;
+    const tasks = tasksByBackend.get(backend);
+    if (
+      result?.status === "ok"
+      && !corruptBackends.has(backend)
+      && nonNegativeInt(result.total)
+      && nonNegativeInt(result.skipped)
+      && tasks.length <= result.total
+    ) {
       return {
         backend,
         status: "confirmed",
-        tasks: tasksByBackend.get(backend),
-        total,
-        skipped,
-        truncated,
+        tasks,
+        total: result.total,
+        skipped: result.skipped,
+        truncated: result.skipped > 0 || result.total > tasks.length || value.truncated === true,
       };
     }
     return { backend, status: "unavailable", error_code: "backend_unavailable" };
   });
-  const projectedTotal = [...tasksByBackend.values()].reduce((total, tasks) => total + tasks.length, 0);
+  const declaredTotal = BACKENDS.reduce((total, backend) => {
+    const result = sourceBackends[backend];
+    return total + (result?.status === "ok" && nonNegativeInt(result.total) ? result.total : 0);
+  }, 0);
+  if (value.total !== declaredTotal) return null;
   return {
     backends,
-    total: nonNegativeInt(value.total) ? value.total : projectedTotal,
-    limit: nonNegativeInt(value.limit) ? value.limit : 64,
+    total: value.total,
+    limit: value.limit,
     truncated: value.truncated === true || backends.some((backend) => backend.truncated === true),
   };
 }
@@ -410,13 +439,29 @@ export async function readDashboardReplicaSource(env, ownerId, hostId, sessionId
 }
 
 export function projectContextResolve(value, sessionId) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || value.session_id !== sessionId) return null;
-  const summary = value.current_summary && typeof value.current_summary === "object"
-    && !Array.isArray(value.current_summary) ? value.current_summary : {};
-  const freshness = value.freshness && typeof value.freshness === "object"
-    && !Array.isArray(value.freshness) ? value.freshness : {};
-  const partial = value.partial && typeof value.partial === "object"
-    && !Array.isArray(value.partial) ? value.partial : {};
+  if (!plainObject(value) || value.session_id !== sessionId) return null;
+  const summary = value.current_summary;
+  const freshness = value.freshness;
+  const partial = value.partial;
+  // The host resolver always emits these containers and the staleness booleans
+  // the envelope consumes; a missing or mistyped one means the response is
+  // unreadable, not a confirmed empty projection.
+  if (
+    !plainObject(summary)
+    || !plainObject(freshness)
+    || !plainObject(partial)
+    || typeof freshness.stale !== "boolean"
+    || typeof partial.journal_degraded !== "boolean"
+    || !Array.isArray(value.unresolved)
+    || !Array.isArray(value.recent_related_tasks)
+    || !Array.isArray(value.refs)
+  ) {
+    return null;
+  }
+  const unresolved = value.unresolved.map(projectUnresolvedItem);
+  const relatedTasks = value.recent_related_tasks.map(projectRelatedTask);
+  const refs = projectObservationRefs(value.refs);
+  if (unresolved.includes(null) || relatedTasks.includes(null) || refs === null) return null;
   const workspace = projectWorkspace(value.workspace);
   const output = {
     session_id: sessionId,
@@ -432,23 +477,19 @@ export function projectContextResolve(value, sessionId) {
         : {}),
       ...(isoTimestamp(summary.last_observed_at) ? { last_observed_at: isoTimestamp(summary.last_observed_at) } : {}),
     },
-    unresolved: Array.isArray(value.unresolved)
-      ? value.unresolved.slice(0, 64).map(projectUnresolvedItem).filter(Boolean)
-      : [],
-    recent_related_tasks: Array.isArray(value.recent_related_tasks)
-      ? value.recent_related_tasks.slice(0, 32).map(projectRelatedTask).filter(Boolean)
-      : [],
-    refs: projectObservationRefs(value.refs),
+    unresolved: unresolved.slice(0, 64),
+    recent_related_tasks: relatedTasks.slice(0, 32),
+    refs,
     freshness: {
       ...(nonNegativeInt(freshness.resolved_revision) ? { resolved_revision: freshness.resolved_revision } : {}),
       ...(freshness.at_least_revision === null || nonNegativeInt(freshness.at_least_revision)
         ? { at_least_revision: freshness.at_least_revision }
         : {}),
-      ...(typeof freshness.stale === "boolean" ? { stale: freshness.stale } : {}),
+      stale: freshness.stale,
     },
     partial: {
       ...(typeof partial.journal_exists === "boolean" ? { journal_exists: partial.journal_exists } : {}),
-      ...(typeof partial.journal_degraded === "boolean" ? { journal_degraded: partial.journal_degraded } : {}),
+      journal_degraded: partial.journal_degraded,
       ...copyNonNegativeInts(partial, ["corrupt_lines", "write_failures"]),
     },
     ...(safeLabel(value.memory?.worker) ? { memory: {
@@ -573,18 +614,19 @@ export async function decodeDashboardTimelineCursor(cursor, ownerId, hostId, ses
 }
 
 function projectUnresolvedItem(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !boundedString(value.task_id, 256)) return null;
-  const output = {
+  if (!plainObject(value) || !boundedString(value.task_id, 256)) return null;
+  const refs = projectObservationRefs(value.refs);
+  if (refs === null) return null;
+  return {
     task_id: value.task_id,
     ...(safeLabel(value.status) ? { status: value.status } : {}),
     ...(CONTEXT_REASONS.has(value.reason) ? { reason: value.reason } : {}),
-    refs: projectObservationRefs(value.refs),
+    refs,
   };
-  return output;
 }
 
 function projectRelatedTask(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !boundedString(value.task_id, 256)) return null;
+  if (!plainObject(value) || !boundedString(value.task_id, 256)) return null;
   const result = { task_id: value.task_id };
   if (CONTEXT_BACKENDS.has(value.backend)) result.backend = value.backend;
   const instruction = value.instruction && typeof value.instruction === "object" && !Array.isArray(value.instruction)
@@ -613,23 +655,25 @@ function projectRelatedTask(value) {
     };
   }
   if (isoTimestamp(value.last_observed_at)) result.last_observed_at = isoTimestamp(value.last_observed_at);
-  result.refs = projectObservationRefs(value.refs);
+  const refs = projectObservationRefs(value.refs);
+  if (refs === null) return null;
+  result.refs = refs;
   return result;
 }
 
+// A malformed ref or a missing refs list makes the whole resolver projection
+// unavailable; filtering it out would report a confirmed-but-incomplete view.
 function projectObservationRefs(value) {
-  if (!Array.isArray(value)) return [];
-  return value.slice(0, 64).map((item) => {
-    if (
-      !item
-      || typeof item !== "object"
-      || Array.isArray(item)
+  if (!Array.isArray(value)) return null;
+  const refs = value.map((item) => (
+    !plainObject(item)
       || !boundedString(item.observation_id, 64)
       || !nonNegativeInt(item.revision)
       || !OBSERVATION_KINDS.has(item.kind)
-    ) return null;
-    return { observation_id: item.observation_id, revision: item.revision, kind: item.kind };
-  }).filter(Boolean);
+      ? null
+      : { observation_id: item.observation_id, revision: item.revision, kind: item.kind }
+  ));
+  return refs.includes(null) ? null : refs.slice(0, 64);
 }
 
 function projectTimelineEvent(row) {
@@ -724,6 +768,10 @@ function boundedString(value, maxBytes) {
 
 function nonNegativeInt(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+function plainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function numberOrNull(value) {

@@ -282,6 +282,22 @@ function responseIsDegraded(envelope) {
     || hasPartialList(envelope?.data);
 }
 
+function unresolvedPresentation(resolveStatus, unresolved) {
+  if (!Array.isArray(unresolved)) {
+    return {
+      state: "unavailable",
+      count: "?",
+      message: resolveStatus === "unavailable"
+        ? "Unresolved items unavailable."
+        : "Current unresolved items are not confirmed.",
+    };
+  }
+  if (unresolved.length === 0) {
+    return { state: "empty", count: "0", message: "No unresolved items in the confirmed projection." };
+  }
+  return { state: "list", count: String(unresolved.length), items: unresolved };
+}
+
 function taskBackendPresentation(envelopeStatus, backend, hostAvailability) {
   const backendStatus = String(backend?.status ?? "unavailable");
   const tasks = Array.isArray(backend?.tasks) ? backend.tasks : null;
@@ -1264,16 +1280,12 @@ function startDashboard(documentRef = document, windowRef = window) {
 
     const unresolvedRoot = byId("unresolved-list");
     unresolvedRoot.replaceChildren();
-    const unresolved = contextResolveData?.unresolved;
-    if (!Array.isArray(unresolved)) {
-      appendText(documentRef, unresolvedRoot, "div", "compact-item", resolve?.status === "unavailable" ? "Unresolved items unavailable." : "Current unresolved items are not confirmed.");
-      setText(byId("unresolved-count"), "?");
-    } else if (unresolved.length === 0) {
-      appendText(documentRef, unresolvedRoot, "div", "compact-item", "No unresolved items in the confirmed projection.");
-      setText(byId("unresolved-count"), "0");
+    const unresolvedView = unresolvedPresentation(resolve?.status, contextResolveData?.unresolved);
+    setText(byId("unresolved-count"), unresolvedView.count);
+    if (unresolvedView.state !== "list") {
+      appendText(documentRef, unresolvedRoot, "div", "compact-item", unresolvedView.message);
     } else {
-      setText(byId("unresolved-count"), String(unresolved.length));
-      for (const item of unresolved.slice(0, 16)) {
+      for (const item of unresolvedView.items.slice(0, 16)) {
         const row = createElement(documentRef, "div", "compact-item");
         const statusName = boundedText(String(item?.status ?? "unknown"), 32);
         const taskName = shortIdentifier(item?.task_id, 96);
@@ -1500,4 +1512,5 @@ export {
   setText,
   taskBackendPresentation,
   shortIdentifier,
+  unresolvedPresentation,
 };
