@@ -15,6 +15,7 @@ This record separates implementation, local checks, deployed acceptance, CI, and
 - Available model inventory: `gpt-6-sol` medium and `gpt-6-luna` max. Implementation agents use Luna max.
 - Baseline build completed before Rust edits; binaries/helper preserved under ignored `dogfood/runs/fabric-dashboard-baseline/`.
 - Baseline binary SHA-256: `3693a9bb142df5f198e45d7b55eab48cea1ffa28d8f67fbd343f68636f4b6221`; helper `e457aaff08947e78f8da3fdb44d7e27eaa67f21fe0d9ef35e14eae13b272f95a`.
+- Temote app-server 0.147.0 advertises `gpt-5.6-luna / max`, unlike the desktop GPT-6 inventory. Initial requested-model live run `b5bd802e-7c0c-4e38-84bc-8ef7e03c7f83` failed terminally; assertions for bounded result/no duplicate are NOT RUN. No passing comparison is claimed for that run.
 - Baseline fixture delegation lifecycle passed (run `8e05dffa-632c-439a-ae7e-24b8fcacafb5`, five calls). This is not live-provider or dashboard acceptance evidence.
 
 ## Platform references
@@ -69,6 +70,7 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 | Gate | Result | Evidence / limitation |
 | --- | --- | --- |
 | Baseline build | PASS | `cargo build --bins --locked`; retained identities above |
+| Baseline live dogfood | PASS | Run `d6912c1e-a46f-4831-98f0-c0b89281d6c8`, `codex / gpt-5.6-luna / max`, all assertions pass, 34 calls, 31 polls; baseline binary identity above. |
 | Baseline fixture dogfood | PASS | Immutable owner-local run above; not live |
 | Local Rust / gateway baseline | PASS | `cargo test`: 151 library + 838 binary + integration suites pass; 9 ignored gates not run. Gateway 102/102 pass. |
 | Candidate local tests | NOT RUN | Pending implementation |
@@ -80,3 +82,7 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 ## D4 operator rerun
 
 Existing operational reference: `docs/evaluations/fabric-dogfood-20260928.md` and `docs/gateway.md`. Confirm same deployment target `temote.obr-grp.com`, Access policy and current bindings read-only before approved deployment. Use candidate assets configuration with the existing remote configuration; checked-in placeholders cannot be deployed. Obtain approval for candidate Worker deployment and necessary Host binary update/restart without stopping active tasks. Authorized human browser must log in through Access. Test edge unauthenticated rejection separately from direct Worker JWT rejection, then all dashboard components, offline semantics, MCP/health fingerprint and observation sync. Record exact Worker version, Host binary identity, candidate HEAD and each layer. No bypass/public origin or account change.
+
+## Regression baseline
+
+A source-isolated Worker handler probe at starting HEAD returned 404 with `Access-Control-Allow-Origin: *` and no cache policy for `/dash`, `/dash/`, `/dash/app.js`, and `/dash/api/v1/bootstrap` with a fixture client token. Dashboard regressions require authenticated 401 and private security headers instead. Existing public `https://temote.obr-grp.com/dash/` returned unauthenticated HTTP 401; this is pre-candidate edge evidence only and does not validate the new Worker or D4.

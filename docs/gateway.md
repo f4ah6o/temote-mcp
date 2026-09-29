@@ -199,6 +199,10 @@ Host mode requires the current supervisor control protocol. This change advances
 
 During migration, legacy sessions and host-level agents may coexist. Unqualified session routing checks both populations and fails closed on collisions.
 
+## Dashboard
+
+The same Worker serves the Access-protected read-only dashboard at `/dash/`. See [dashboard operation and verification](fabric-dashboard.md) for authority, freshness, Host prerequisites, and deployment acceptance.
+
 ## Development
 
 For local Worker development, copy `gateway/.dev.vars.example` to `gateway/.dev.vars`. Never commit `.dev.vars`, Worker secrets, Access service-token secrets, host bearer tokens, or endpoint environment files.

@@ -214,6 +214,10 @@ host mode は現行 supervisor control protocol を必要とします。この�
 
 migration 中は legacy session agent と host-level agent を同時に利用できます。unqualified session routing は両方を確認し、collision があれば fail closed します。
 
+## Dashboard
+
+同じ Worker の `/dash/` に Access で保護された read-only dashboard を配置します。authority、freshness、Host 側の前提、deploy 後の検証は [dashboard の運用文書](fabric-dashboard.md) を参照してください。
+
 ## Development
 
 local Worker 開発では `gateway/.dev.vars.example` を `gateway/.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、host bearer token、endpoint environment file は commit しないでください。
