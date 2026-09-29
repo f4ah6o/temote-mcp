@@ -8,6 +8,7 @@ import {
   extractKnowledge,
   extractionInputBudget,
   MemoryError,
+  toExtractorObservation,
 } from "../src/memory/extractor.js";
 import {
   explicitRepositoryPredecessors,
@@ -321,10 +322,12 @@ test("canonical item and support caps fail the whole batch instead of dropping r
         "For this repository, the repository-level policy is:",
         clause,
       ]).join("\n");
-      const bounded = boundedInput([observation({ contentPreview: content })],
-        extractionInputBudget(config));
+      const raw = [observation({ contentPreview: content })];
+      const bounded = boundedInput(raw, extractionInputBudget(config));
+      assert.equal(bounded.observations.length, 0,
+        "a single observation past the canonical item bound defers whole");
       await assert.rejects(
-        extractKnowledge(bounded.observations, config, "canonical-item-cap"),
+        extractKnowledge(raw.map(toExtractorObservation), config, "canonical-item-cap"),
         (error) => error instanceof MemoryError && error.code === "projection_too_large",
       );
     });
@@ -338,9 +341,10 @@ test("canonical item and support caps fail the whole batch instead of dropping r
         contentPreview: policyInstruction({ question: null }),
       }));
       const bounded = boundedInput(raw, extractionInputBudget(largeConfig));
-      assert.equal(bounded.observations.length, 17);
+      assert.equal(bounded.observations.length, 12,
+        "admission defers the tail a single batch cannot process completely");
       await assert.rejects(
-        extractKnowledge(bounded.observations, largeConfig, "canonical-support-cap"),
+        extractKnowledge(raw.map(toExtractorObservation), largeConfig, "canonical-support-cap"),
         (error) => error instanceof MemoryError && error.code === "projection_too_large",
       );
     });

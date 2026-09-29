@@ -775,6 +775,7 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
   const unique = new Map();
   const overlays = new Map();
   const supersededKnowledgeIds = new Set();
+  const replacedStaged = new Set();
   const sorted = [...extractedItems].sort((left, right) =>
     Number(left.support[0]?.cloud_seq ?? 0) - Number(right.support[0]?.cloud_seq ?? 0));
   for (let index = 0; index < sorted.length; index += 1) {
@@ -793,10 +794,20 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       extracted.text,
     ].join("\u0000");
     const prior = unique.get(semanticIdentity);
+    const policySemanticKey = (support) => extracted.kind === "summary"
+      ? semanticKeyFor("constraint", support.quote)
+      : extracted.semanticKey;
+    const changeSources = extracted.support.filter((support) =>
+      support.source.kind === "instruction"
+      && isExplicitChangeDirective(support.source, support.quote, policySemanticKey(support))
+    );
     // Support merges only into a live staged item. A staged item that an
     // in-batch change already superseded must not absorb the re-occurrence:
-    // that re-occurrence is a new state transition, not extra evidence.
-    if (prior && prior.status !== "superseded") {
+    // that re-occurrence is a new state transition, not extra evidence. The
+    // same applies when the re-occurrence itself carries an explicit change
+    // directive: it must reach the authorization path instead of collapsing
+    // into corroborating support for the still-live same-text item.
+    if (prior && prior.status !== "superseded" && changeSources.length === 0) {
       const additions = extracted.support.map(supportToStored).filter((support) =>
         !prior.support.some((existing) => existing.cloudSeq === support.cloudSeq
           && existing.role === support.role));
@@ -815,6 +826,17 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       prior.persistedSupport.push(...persistedAccepted);
       continue;
     }
+    let carriedSupersedes = [];
+    if (prior && prior.status !== "superseded") {
+      // Re-evaluate the staged item as a new transition: it stays staged for
+      // the same-text match below (reusing its knowledge id and accumulated
+      // support) but leaves the output list so only the re-evaluated item
+      // commits. Supersession edges the staged item already earned carry over.
+      items.splice(items.indexOf(prior), 1);
+      replacedStaged.add(prior);
+      carriedSupersedes = prior.supersedes;
+    }
+    const splicedPrior = replacedStaged.has(prior) ? prior : null;
 
     const keyValues = [
       ownerId,
@@ -849,15 +871,8 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       && existing.text === extracted.text);
     const stagedConflicts = overlay.filter((existing) => existing.status !== "superseded"
       && existing.text !== extracted.text);
-    const policySemanticKey = (support) => extracted.kind === "summary"
-      ? semanticKeyFor("constraint", support.quote)
-      : extracted.semanticKey;
-    const changeSources = extracted.support.filter((support) =>
-      support.source.kind === "instruction"
-      && isExplicitChangeDirective(support.source, support.quote, policySemanticKey(support))
-    );
     let status = promotedStatus(extracted);
-    let supersedes = [];
+    let supersedes = [...carriedSupersedes];
     const conflicts = [...dbConflicts, ...stagedConflicts];
     let authorizedConflicts = [];
     if (changeSources.length > 0 && conflicts.length > 0
@@ -878,13 +893,18 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       if (authorizedConflicts.length === conflicts.length) {
         // A staged reuse aliases its committed row's id; each row gets at
         // most one supersession edge while every conflict still authorizes.
-        supersedes = [...new Set(authorizedConflicts.map((existing) =>
-          existing.knowledge_id ?? existing.knowledgeId))];
+        supersedes = [...new Set([...carriedSupersedes, ...authorizedConflicts.map((existing) =>
+          existing.knowledge_id ?? existing.knowledgeId)])];
         status = promotedStatus(extracted);
         for (const supersededId of supersedes) supersededKnowledgeIds.add(supersededId);
         for (const oldItem of stagedConflicts) oldItem.status = "superseded";
       } else {
-        status = "supported";
+        // A directive that fails authorization cannot demote an item that
+        // already earned `current`; the committed-row UPDATE applies the
+        // same sticky-current rule to persisted rows. The staged decision
+        // is fresher than the committed-row snapshot, so it wins first.
+        status = (stagedMatching ?? splicedPrior ?? matching)?.status === "current"
+          ? "current" : "supported";
       }
     } else if (matching || stagedMatching) {
       const existing = matching ?? stagedMatching;
@@ -904,8 +924,20 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       sourceRevision: row.source_revision == null ? null : Number(row.source_revision),
       sourceKind: row.kind,
     }));
-    const stagedSupports = matching ? [] : stagedMatching?.support ?? [];
-    const priorSupports = matching ? existingSupports : stagedSupports;
+    // The merged support basis is the union of the committed row's stored
+    // support and the spliced staged item's accumulated support: a staged
+    // item spliced for re-evaluation keeps pending rows that the database
+    // snapshot does not know about yet.
+    const supportSeen = new Set();
+    const priorSupports = [
+      ...(matching ? existingSupports : []),
+      ...((stagedMatching ?? splicedPrior)?.support ?? []),
+    ].filter((support) => {
+      const key = `${support.cloudSeq}\u0000${support.role}`;
+      if (supportSeen.has(key)) return false;
+      supportSeen.add(key);
+      return true;
+    });
     const priorSupportKeys = new Set(priorSupports.map((support) => `${support.cloudSeq}\u0000${support.role}`));
     const incomingSupports = extracted.support.map(supportToStored);
     const incomingUnique = incomingSupports.filter((support, supportIndex) => {
@@ -914,14 +946,32 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
         && incomingSupports.findIndex((candidate) => candidate.cloudSeq === support.cloudSeq
           && candidate.role === support.role) === supportIndex;
     });
+    // A staged item spliced for re-evaluation carries uncommitted support
+    // rows; they must stay pending on the re-evaluated item or the staged
+    // item's evidence is lost. Only committed support counts against the
+    // persist capacity, so pending rows are subtracted back out.
+    const pendingSeen = new Set();
+    const stagedPending = [
+      ...((stagedMatching ?? splicedPrior)?.persistSupport ?? []),
+      ...((splicedPrior && splicedPrior !== stagedMatching ? splicedPrior.persistSupport : []) ?? []),
+    ].filter((support) => {
+      const key = `${support.cloudSeq}\u0000${support.role}`;
+      if (pendingSeen.has(key)) return false;
+      pendingSeen.add(key);
+      return true;
+    });
+    const committedSupportCount = matching ? existingSupportRows.length
+      : priorSupports.length - stagedPending.length;
     const existingSupportCount = matching ? existingSupportRows.length : priorSupports.length;
     const supportCapacity = Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - Math.min(MAX_SUPPORTS_PER_KNOWLEDGE, existingSupportCount));
-    const persistSupport = incomingUnique.slice(0, supportCapacity);
+    const pendingRoom = Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - Math.min(
+      MAX_SUPPORTS_PER_KNOWLEDGE, committedSupportCount));
+    const persistSupport = [...stagedPending, ...incomingUnique].slice(0, pendingRoom);
     const support = [...priorSupports, ...incomingUnique].slice(0, MAX_SUPPORTS_PER_KNOWLEDGE);
     const supportIncomplete = Boolean(matching?.support_incomplete ?? stagedMatching?.supportIncomplete)
       || existingSupportRows.length > MAX_SUPPORTS_PER_KNOWLEDGE
       || priorSupports.length + incomingUnique.length > MAX_SUPPORTS_PER_KNOWLEDGE
-      || persistSupport.length < incomingUnique.length;
+      || persistSupport.length < stagedPending.length + incomingUnique.length;
     const knowledgeId = existingMatchingId ?? await deterministicId([
       ownerId,
       repositoryKey,
@@ -935,14 +985,17 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
     ]);
     const item = {
       knowledgeId,
-      reuseKnowledgeId: Boolean(matching || stagedMatching),
+      // Only a committed row is updated in place; a staged same-text item was
+      // never inserted, so its re-evaluation must write a fresh row.
+      reuseKnowledgeId: Boolean(matching),
       scopeType: extracted.scopeType,
       scopeId: extracted.scopeId,
       kind: extracted.kind,
       semanticKey: extracted.semanticKey,
       text: extracted.text,
       status,
-      validFrom: extracted.support[0].source.observed_at,
+      validFrom: (stagedMatching ?? splicedPrior)?.validFrom
+        ?? extracted.support[0].source.observed_at,
       support,
       persistedSupport: [...priorSupports, ...persistSupport],
       persistSupport,
@@ -955,7 +1008,8 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
     if (status !== "superseded") {
       const nextOverlay = authorizedConflicts.length > 0
         ? [item]
-        : [...overlay.filter((existing) => existing.status !== "superseded"), item];
+        : [...overlay.filter((existing) => existing.status !== "superseded"
+          && !replacedStaged.has(existing)), item];
       overlays.set(overlayKey, nextOverlay);
     }
     if (extracted.kind === "constraint" && extracted.scopeType === "repository"

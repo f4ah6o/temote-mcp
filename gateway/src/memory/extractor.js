@@ -83,6 +83,8 @@ export function boundedInput(observations, budgetBytes) {
   }
   const selected = [];
   const encoder = new TextEncoder();
+  const canonical = createCanonicalTracker();
+  let fixtureItems = 0;
   for (const observation of observations) {
     const item = toExtractorObservation(observation);
     // An observation enters the batch only with its complete sanitized
@@ -91,12 +93,22 @@ export function boundedInput(observations, budgetBytes) {
     // failure contract when it never fits) sees the same full content the
     // observation retains in storage.
     if (encodedSize({ observations: [...selected, item] }, encoder) > budgetBytes) break;
+    // The byte budget is not the only deterministic bound: every extractor
+    // path must be able to process the whole selection. Canonical items,
+    // per-item supports, and the fixture item count are simulated as they
+    // grow, so the admitted observations remain a contiguous prefix that is
+    // consumed completely — never one whose tail is dropped after being
+    // claimed.
+    if (!canonical.tryAdd(item)) break;
+    const quoteCount = fixtureItemQuotes(item).length;
+    if (fixtureItems + quoteCount > MAX_EXTRACTED_ITEMS) break;
+    fixtureItems += quoteCount;
     selected.push(item);
   }
   return { observations: selected };
 }
 
-function toExtractorObservation(observation) {
+export function toExtractorObservation(observation) {
   const sanitized = {
     ...observation,
     content_preview: typeof observation.content_preview === "string"
@@ -158,22 +170,38 @@ function encodedSize(value, encoder) {
   return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
+// The exact quote list fixture extraction emits for one input record,
+// shared with boundedInput so the admitted selection always stays inside the
+// item bound the fixture path can actually process.
+function fixtureItemQuotes(observation) {
+  const text = observation.content_preview;
+  const quotes = observation.kind === "instruction" && typeof text === "string"
+    ? permittedRepositoryClauses(observation)
+    : observation.state_status
+      ? [{ kind: "observation", quote: observation.state_status }]
+      : [];
+  return quotes.filter((clause) => {
+    const { kind, quote } = clause;
+    if (!quote || quote.includes(SECRET_MARKER)) return false;
+    const scope = kind === "constraint" || kind === "unresolved"
+      ? { type: "repository", id: observation.repository_key }
+      : deriveScope(observation, quote);
+    return Boolean(scope);
+  });
+}
+
 function fixtureExtract(observations) {
   const items = [];
   for (const observation of observations) {
-    const text = observation.content_preview;
-    const quotes = observation.kind === "instruction" && typeof text === "string"
-      ? permittedRepositoryClauses(observation)
-      : observation.state_status
-        ? [{ kind: "observation", quote: observation.state_status }]
-        : [];
-    for (const clause of quotes) {
+    for (const clause of fixtureItemQuotes(observation)) {
       const { kind, quote } = clause;
-      if (!quote || quote.includes(SECRET_MARKER)) continue;
-      const scope = clause.kind === "constraint" || clause.kind === "unresolved"
+      const scope = kind === "constraint" || kind === "unresolved"
         ? { type: "repository", id: observation.repository_key }
         : deriveScope(observation, quote);
-      if (!scope) continue;
+      // Selection is bounded upstream; exceeding the cap here means the input
+      // was not admitted through boundedInput — fail loudly rather than
+      // silently consume the tail observations.
+      if (items.length >= MAX_EXTRACTED_ITEMS) throw new MemoryError("projection_too_large");
       items.push({
         kind,
         semantic_key: semanticKeyFor(kind, quote),
@@ -187,10 +215,64 @@ function fixtureExtract(observations) {
         }],
         verification_path: null,
       });
-      if (items.length >= MAX_EXTRACTED_ITEMS) return { items };
     }
   }
   return { items };
+}
+
+// Clauses the deterministic canonical union considers, shared by the union
+// itself and by boundedInput's item-bound simulation.
+function canonicalClauses(observation) {
+  return permittedRepositoryClauses(observation)
+    .filter((clause) => ["constraint", "unresolved"].includes(clause.kind)
+      && !clause.quote.includes(SECRET_MARKER));
+}
+
+// Simulates canonicalFirstUnion's group building incrementally so admission
+// can stop before the selection would exceed the canonical item or support
+// bounds. A changed clause opens a new canonical item; an unchanged clause
+// corroborates the latest same-identity item; one observation cites an item
+// at most once.
+function createCanonicalTracker() {
+  const latestGroups = new Map();
+  const groups = [];
+  return {
+    tryAdd(observation) {
+      const latest = new Map(latestGroups);
+      const pendingGroups = [];
+      const pendingSupports = new Map();
+      for (const clause of canonicalClauses(observation)) {
+        const identity = JSON.stringify([
+          clause.kind,
+          clause.quote,
+          "repository",
+          observation.repository_key,
+        ]);
+        let group = clause.changed ? null : latest.get(identity);
+        if (!group) {
+          group = { seen: new Set(), supports: 0 };
+          pendingGroups.push({ identity, group });
+        }
+        latest.set(identity, group);
+        const referenceKey = key(Number(observation.cloud_seq), observation.observation_id);
+        if (group.seen.has(referenceKey)) continue;
+        const pending = pendingSupports.get(group) ?? new Set();
+        if (group.supports + pending.size + 1 > MAX_SUPPORTS) return false;
+        pending.add(referenceKey);
+        pendingSupports.set(group, pending);
+      }
+      if (groups.length + pendingGroups.length > MAX_EXTRACTED_ITEMS) return false;
+      for (const { identity, group } of pendingGroups) {
+        groups.push(group);
+        latestGroups.set(identity, group);
+      }
+      for (const [group, references] of pendingSupports) {
+        for (const reference of references) group.seen.add(reference);
+        group.supports += references.size;
+      }
+      return true;
+    },
+  };
 }
 
 function canonicalFirstUnion(validatedModelItems, observations) {
@@ -199,9 +281,7 @@ function canonicalFirstUnion(validatedModelItems, observations) {
   const repositoryKey = observations[0]?.repository_key;
   if (typeof repositoryKey !== "string" || !repositoryKey) return validatedModelItems;
   for (const observation of observations) {
-    const clauses = permittedRepositoryClauses(observation)
-      .filter((clause) => ["constraint", "unresolved"].includes(clause.kind)
-        && !clause.quote.includes(SECRET_MARKER));
+    const clauses = canonicalClauses(observation);
     if (clauses.length === 0) continue;
 
     for (const clause of clauses) {

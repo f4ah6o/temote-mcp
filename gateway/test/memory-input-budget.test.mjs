@@ -8,6 +8,7 @@ import {
 import {
   boundedInput,
   extractKnowledge,
+  toExtractorObservation,
 } from "../src/memory/extractor.js";
 import {
   MEMORY_TEST_CLIENT_TOKEN,
@@ -512,6 +513,394 @@ test("an observation that never stored a preview still processes normally", {
     );
     assert.deepEqual(runs.map((run) => run.status), ["completed"],
       "a natively preview-less observation completes as before");
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+const POLICY_TOML = "Report output format must be TOML.";
+const POLICY_STAGING = "Deployment target must be staging.";
+// MEMORY_INPUT_BUDGET_BYTES=16384 yields extraction input window
+// 16384 - PROMPT_OVERHEAD_BYTES(4096) = 12288; MEMORY_BATCH_SIZE=32 admits
+// the whole corpus by bytes and count.
+const ITEM_BOUND_WINDOW = 12288;
+const ITEM_BOUND_BINDINGS = {
+  MEMORY_INPUT_BUDGET_BYTES: "16384",
+  MEMORY_BATCH_SIZE: "32",
+};
+
+function changedPolicyText(quote) {
+  return [
+    "For this repository, the repository-level policy has changed:",
+    quote,
+  ].join("\n");
+}
+
+// Same shape as instructionObservation but with short ids so the serialized
+// extraction payload byte-fits the window — the item bound, not the byte
+// bound, must be what splits the corpus.
+function compactInstructionObservation(sessionId, revision, preview) {
+  const now = Math.floor(Date.now() / 1000) - 120;
+  return {
+    id: randomUUID(),
+    schema_version: 1,
+    observed_at: now,
+    session_id: sessionId,
+    session_instance: { started_at: now, process_id: 1 },
+    actor: { transport: "mcp-stdio" },
+    target: { backend: "codex" },
+    action: "task_start",
+    kind: "instruction",
+    task_id: `t-${sessionId}`,
+    operation_id: `op-${sessionId}`,
+    content: {
+      kind: "text",
+      preview,
+      total_bytes: Buffer.byteLength(preview),
+      sha256: createHash("sha256").update(preview).digest("hex"),
+      truncated: false,
+    },
+    evidence_refs: [],
+    provenance: { tool: "codex_task_start", source: "orchestration" },
+    revision,
+    dedupe_key: `${sessionId}:${revision}`,
+  };
+}
+
+function changedPolicySession(sessionId, count, extraClauses = new Map()) {
+  return Array.from({ length: count }, (_, index) => {
+    const parts = [changedPolicyText(index + 1 === count ? POLICY_JSON : POLICY_TOML)];
+    if (extraClauses.has(index + 1)) parts.push(...extraClauses.get(index + 1));
+    return compactInstructionObservation(sessionId, index + 1, parts.join("\n"));
+  });
+}
+
+test("a byte-fitting backlog is still bounded by the extraction item limit", () => {
+  const observations = Array.from({ length: 13 }, (_, index) => observation({
+    cloud_seq: index + 1,
+    source_revision: index + 1,
+    content_preview: changedPolicyText(index + 1 === 13 ? POLICY_JSON : POLICY_TOML),
+  }));
+  const payloadBytes = Buffer.byteLength(JSON.stringify({
+    observations: observations.map(toExtractorObservation),
+  }));
+  assert.ok(payloadBytes <= ITEM_BOUND_WINDOW,
+    `all 13 observations byte-fit the extraction window (measured ${payloadBytes} bytes)`);
+  const bounded = boundedInput(observations, ITEM_BOUND_WINDOW);
+  assert.equal(bounded.observations.length, 12,
+    "the deterministic item bound splits what the byte budget admits");
+  assert.equal(bounded.observations.at(-1).cloud_seq, 12);
+});
+
+test("the extraction item bound is exact at twelve items", () => {
+  for (const count of [11, 12]) {
+    const observations = Array.from({ length: count }, (_, index) => observation({
+      cloud_seq: index + 1,
+      source_revision: index + 1,
+      content_preview: changedPolicyText(index + 1 === count ? POLICY_JSON : POLICY_TOML),
+    }));
+    const bounded = boundedInput(observations, ITEM_BOUND_WINDOW);
+    assert.equal(bounded.observations.length, count,
+      `${count} changed clauses stay inside the item bound`);
+  }
+});
+
+test("a multi-clause observation defers whole at the item bound", () => {
+  const observations = Array.from({ length: 11 }, (_, index) => observation({
+    cloud_seq: index + 1,
+    source_revision: index + 1,
+    content_preview: changedPolicyText(POLICY_TOML),
+  }));
+  observations.push(observation({
+    cloud_seq: 12,
+    source_revision: 12,
+    content_preview: [changedPolicyText(POLICY_TOML), changedPolicyText(POLICY_STAGING)].join("\n"),
+  }));
+  observations.push(observation({
+    cloud_seq: 13,
+    source_revision: 13,
+    content_preview: changedPolicyText(POLICY_JSON),
+  }));
+  const bounded = boundedInput(observations, ITEM_BOUND_WINDOW);
+  assert.equal(bounded.observations.length, 11,
+    "an observation whose clauses would cross the bound defers whole, never partially");
+});
+
+async function memoryRuns(runtime) {
+  return runtime.querySql(
+    `SELECT from_seq, to_seq, input_count, outcome, status, error_code
+     FROM memory_runs WHERE owner_id = ? AND repository_key = ? ORDER BY to_seq, rowid`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+  );
+}
+
+async function assertConvergedBacklog(runtime, tomSupportSeqs) {
+  const constraints = await runtime.querySql(
+    `SELECT knowledge_id, text, status FROM knowledge_items
+     WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' AND scope_type = 'repository'`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+  );
+  const json = constraints.find((item) => item.text === POLICY_JSON);
+  const tom = constraints.find((item) => item.text === POLICY_TOML);
+  assert.ok(json, "the final changed policy is projected");
+  assert.equal(json.status, "current");
+  assert.ok(tom, "the superseded TOML policy remains as history");
+  assert.equal(tom.status, "superseded");
+  const supportSeqs = async (knowledgeId) => (await runtime.querySql(
+    `SELECT observation_cloud_seq FROM knowledge_support
+     WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ? ORDER BY observation_cloud_seq`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, knowledgeId],
+  )).map((row) => Number(row.observation_cloud_seq));
+  assert.deepEqual(await supportSeqs(tom.knowledge_id), tomSupportSeqs,
+    "every earlier TOML revision remains attached as support");
+  assert.deepEqual(await supportSeqs(json.knowledge_id), [tomSupportSeqs.length + 1],
+    "the last observation supports the promoted JSON policy");
+  const edges = await runtime.querySql(
+    `SELECT new_knowledge_id, old_knowledge_id FROM knowledge_supersession
+     WHERE owner_id = ? AND repository_key = ?`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+  );
+  const promotionEdges = edges.filter((edge) => edge.new_knowledge_id === json.knowledge_id);
+  assert.equal(promotionEdges.length, 1,
+    "one explicit change supersedes the TOML policy");
+  assert.equal(promotionEdges[0].old_knowledge_id, tom.knowledge_id);
+  assert.ok(edges.every((edge) => edge.new_knowledge_id !== edge.old_knowledge_id),
+    "supersession must never be self-referential");
+  const context = await repositoryContext(runtime);
+  assert.ok(context.constraints.some((item) => item.text === POLICY_JSON && item.status === "current"),
+    "context_resolve surfaces the promoted policy");
+  assert.equal(context.current_summary.knowledge_summary, POLICY_JSON);
+}
+
+test("the extraction-item bound splits a byte-fitting backlog across runs (fixture)", {
+  timeout: 60_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "fixture",
+    memoryEnabled: true,
+    maxQueueRetries: 0,
+    bindings: ITEM_BOUND_BINDINGS,
+  });
+  try {
+    const sessionId = "ibf";
+    const synced = await sync(runtime, sessionId, changedPolicySession(sessionId, 13));
+    assert.equal(Number(synced.cloud_head_seq), 13);
+    const stored = await runtime.querySql(
+      "SELECT * FROM observations WHERE owner_id = ? AND repository_key = ? ORDER BY cloud_seq",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY]);
+    const payloadBytes = Buffer.byteLength(JSON.stringify({
+      observations: stored.map(toExtractorObservation),
+    }));
+    assert.ok(payloadBytes <= ITEM_BOUND_WINDOW,
+      `the whole corpus must byte-fit the input window (got ${payloadBytes})`);
+    await waitForCheckpoint(runtime, synced.cloud_head_seq);
+
+    const runs = await memoryRuns(runtime);
+    assert.equal(runs.length, 2, "the backlog completes over two runs, not one silent claim");
+    assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
+    assert.equal(runs[0].from_seq, 0);
+    assert.equal(runs[0].to_seq, 12);
+    assert.equal(runs[0].input_count, 12,
+      "the first run claims only the processable prefix");
+    assert.equal(runs[1].to_seq, 13);
+    assert.equal(runs[1].input_count, 1);
+    assert.ok(runs.every((run) => run.error_code == null),
+      "normal backlog splitting is not a bounded failure");
+    await assertConvergedBacklog(runtime, Array.from({ length: 12 }, (_, index) => index + 1));
+
+    const queueBefore = await runtime.queueDispatchCount();
+    await runtime.enqueue({
+      owner_id: MEMORY_TEST_OWNER,
+      repository_key: MEMORY_TEST_REPOSITORY,
+      through_cloud_seq: 13,
+    });
+    await runtime.waitFor(async () => {
+      const dispatches = await runtime.queueDispatches();
+      return dispatches.length > queueBefore && dispatches.at(-1).state === "completed";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+    assert.equal((await memoryRuns(runtime)).length, 2,
+      "replaying the committed range starts no new runs");
+    await assertConvergedBacklog(runtime, Array.from({ length: 12 }, (_, index) => index + 1));
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("the provider adapter path splits canonical items across runs", {
+  timeout: 60_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "openai_compatible",
+    memoryEnabled: true,
+    memoryEndpoint: "https://memory-provider.invalid/v1/chat/completions",
+    memoryModel: "item-bound-provider-test",
+    memoryApiKey: "test-only-provider-key",
+    memoryTestProviderMode: "echo_allowed_repository_clauses",
+    maxQueueRetries: 0,
+    bindings: ITEM_BOUND_BINDINGS,
+  });
+  try {
+    const sessionId = "ibp";
+    const synced = await sync(runtime, sessionId, changedPolicySession(sessionId, 13));
+    await waitForCheckpoint(runtime, synced.cloud_head_seq);
+
+    const runs = await memoryRuns(runtime);
+    assert.equal(runs.length, 2,
+      "the deterministic bound splits before projection_too_large can wedge the run");
+    assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
+    assert.equal(runs[0].to_seq, 12);
+    assert.equal(runs[0].input_count, 12);
+    assert.equal(runs[1].to_seq, 13);
+    assert.equal(runs[1].input_count, 1);
+    await assertConvergedBacklog(runtime, Array.from({ length: 12 }, (_, index) => index + 1));
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("split item-bound backlogs converge on the same final policy", {
+  timeout: 90_000,
+}, async () => {
+  const splits = [
+    { name: "tail", chunks: [12, 1], expectToSeqs: [12, 13] },
+    { name: "middle", chunks: [6, 7], expectToSeqs: [6, 13] },
+    { name: "each", chunks: Array.from({ length: 13 }, () => 1), expectToSeqs: Array.from({ length: 13 }, (_, i) => i + 1) },
+  ];
+  for (const split of splits) {
+    const runtime = await startMemoryRuntime({
+      memoryExtractor: "fixture",
+      memoryEnabled: true,
+      maxQueueRetries: 0,
+      bindings: ITEM_BOUND_BINDINGS,
+    });
+    try {
+      const sessionId = `ibs-${split.name}`;
+      let head = 0;
+      let offset = 0;
+      for (const chunk of split.chunks) {
+        const observations = changedPolicySession(sessionId, 13)
+          .slice(offset, offset + chunk)
+          .map((observation, index) => ({
+            ...observation,
+            revision: offset + index + 1,
+          }));
+        const synced = await sync(runtime, sessionId, observations);
+        head = synced.cloud_head_seq;
+        await waitForCheckpoint(runtime, head);
+        offset += chunk;
+      }
+      assert.equal(Number(head), 13);
+      const runs = await memoryRuns(runtime);
+      assert.deepEqual(runs.map((run) => Number(run.to_seq)), split.expectToSeqs,
+        `${split.name} split consumes the whole backlog`);
+      assert.ok(runs.every((run) => run.status === "completed" && run.error_code == null));
+      await assertConvergedBacklog(runtime, Array.from({ length: 12 }, (_, index) => index + 1));
+    } finally {
+      await runtime.dispose();
+    }
+  }
+});
+
+test("the extraction item bound is exact at the 11/12/13 boundary in D1", {
+  timeout: 90_000,
+}, async () => {
+  const expectations = [
+    { count: 11, toSeqs: [11] },
+    { count: 12, toSeqs: [12] },
+    { count: 13, toSeqs: [12, 13] },
+  ];
+  for (const expectation of expectations) {
+    const runtime = await startMemoryRuntime({
+      memoryExtractor: "fixture",
+      memoryEnabled: true,
+      maxQueueRetries: 0,
+      bindings: ITEM_BOUND_BINDINGS,
+    });
+    try {
+      const sessionId = `ibb-${expectation.count}`;
+      const synced = await sync(
+        runtime,
+        sessionId,
+        changedPolicySession(sessionId, expectation.count),
+      );
+      await waitForCheckpoint(runtime, synced.cloud_head_seq);
+      const runs = await memoryRuns(runtime);
+      assert.deepEqual(runs.map((run) => Number(run.to_seq)), expectation.toSeqs,
+        `${expectation.count} items split at the exact extraction bound`);
+      await assertConvergedBacklog(
+        runtime,
+        Array.from({ length: expectation.count - 1 }, (_, index) => index + 1),
+      );
+    } finally {
+      await runtime.dispose();
+    }
+  }
+});
+
+test("a multi-clause observation defers whole and re-extracts on the next run", {
+  timeout: 60_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "fixture",
+    memoryEnabled: true,
+    maxQueueRetries: 0,
+    bindings: ITEM_BOUND_BINDINGS,
+  });
+  try {
+    const sessionId = "ibm";
+    const extras = new Map([[12, [changedPolicyText(POLICY_STAGING)]]]);
+    const synced = await sync(runtime, sessionId, changedPolicySession(sessionId, 13, extras));
+    await waitForCheckpoint(runtime, synced.cloud_head_seq);
+
+    const runs = await memoryRuns(runtime);
+    assert.equal(runs.length, 2);
+    assert.equal(runs[0].to_seq, 11,
+      "the two-clause observation defers whole instead of being consumed halfway");
+    assert.equal(runs[1].to_seq, 13);
+    const staging = await runtime.querySql(
+      `SELECT knowledge_id, status FROM knowledge_items
+       WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' AND text = ?`,
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, POLICY_STAGING],
+    );
+    assert.equal(staging.length, 1);
+    const stagingSupport = await runtime.querySql(
+      `SELECT observation_cloud_seq FROM knowledge_support
+       WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?`,
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, staging[0].knowledge_id],
+    );
+    assert.deepEqual(stagingSupport.map((row) => Number(row.observation_cloud_seq)), [12],
+      "the deferred observation's second clause is extracted in full, not partially");
+    const edges = await runtime.querySql(
+      `SELECT COUNT(*) AS count FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?`,
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.equal(Number(edges[0].count), 2,
+      "TOML -> staging -> JSON supersedes in source order, exactly once each");
+    const context = await repositoryContext(runtime);
+    assert.ok(context.constraints.some((item) => item.text === POLICY_JSON && item.status === "current"));
+    assert.equal(context.current_summary.knowledge_summary, POLICY_JSON);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("batch-size splitting of the same backlog reaches the same final policy", {
+  timeout: 60_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "fixture",
+    memoryEnabled: true,
+    maxQueueRetries: 0,
+    bindings: { ...ITEM_BOUND_BINDINGS, MEMORY_BATCH_SIZE: "6" },
+  });
+  try {
+    const sessionId = "ibsb";
+    const synced = await sync(runtime, sessionId, changedPolicySession(sessionId, 13));
+    await waitForCheckpoint(runtime, synced.cloud_head_seq);
+    const runs = await memoryRuns(runtime);
+    assert.deepEqual(runs.map((run) => Number(run.to_seq)), [6, 12, 13],
+      "a smaller batch size processes contiguous complete prefixes");
+    await assertConvergedBacklog(runtime, Array.from({ length: 12 }, (_, index) => index + 1));
   } finally {
     await runtime.dispose();
   }
