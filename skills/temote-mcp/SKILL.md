@@ -45,6 +45,8 @@ Use `*_task_get` to reconcile remote truth, `reconciliation_required`, `unknown`
 
 If a task ID is lost after reconnect, call `task_list({session_id, limit?})` on the selected host. It lists retained tasks owned by that full session instance, with `backend` and `task_id` for the matching `*_task_get`. Inspect `backends` for `unavailable`; an empty `tasks` array with an unavailable backend is not proof that no task exists. `job_list` covers sandbox jobs, not delegated-agent tasks. Listing does not reconcile or restart work.
 
+`task_list` also reads persisted, bounded `pending_interaction` metadata. Its `summary_revision` is independent of task revision. Check `producer_kind`, `producer_epoch`, `observed_at`, and the 30-second `expires_at` before treating a summary as current. Missing fields on older Hosts mean `unsupported`; expired or failed observations mean `unavailable`, never proof that no approval or question is pending. Runtime owners and the supervisor's read-only Devin Cloud observer update these summaries independently of listing or dashboard access. A retained task status does not establish a freshly reconciled backend state. Use the existing task reconciliation and approval workflow when explicitly acting on a task; the dashboard itself provides no answer or control action.
+
 Temote yolo does not authorize delegated child mutations: command/file-change approval requests still use the explicit user-approval path and fail closed if it is unavailable. Control is limited to typed actions; do not attempt to tunnel arbitrary backend JSON-RPC or a remote shell through these tools.
 
 ## Prepare a bare repository under a named root
