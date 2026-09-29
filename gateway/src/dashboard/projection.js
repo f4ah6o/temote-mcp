@@ -23,6 +23,13 @@ const OBSERVATION_KINDS = new Set([
   "delivery",
   "reconciliation",
 ]);
+const CONTENT_KINDS = new Set(["text", "view", "view_digest", "error", "none"]);
+const CONTEXT_BACKENDS = new Set(["codex", "opencode", "devin_acp", "devin_cloud"]);
+const CONTEXT_REASONS = new Set([
+  "instruction or acceptance recorded without a state view",
+  "latest observed state needs attention",
+  "a dispatch returned an error; prefer the authoritative backend record before retrying",
+]);
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const OWNER_ID = /^[A-Za-z0-9._:@/-]{1,256}$/;
 
@@ -183,8 +190,12 @@ export async function callDashboardHostTool(env, hostId, toolName, args) {
   }
 }
 
-export function projectSessionList(value, hostId, { includeWorkspace = false } = {}) {
+export function projectSessionList(value, hostId, {
+  includeWorkspace = false,
+  projectionLimit = DASHBOARD_MAX_SESSION_PROJECTION,
+} = {}) {
   if (!Array.isArray(value) || value.length > DASHBOARD_MAX_SESSIONS) return null;
+  if (!Number.isSafeInteger(projectionLimit) || projectionLimit < 0 || projectionLimit > DASHBOARD_MAX_SESSIONS) return null;
   const sessions = [];
   const seen = new Set();
   for (const session of value) {
@@ -196,7 +207,7 @@ export function projectSessionList(value, hostId, { includeWorkspace = false } =
       || seen.has(sessionId)
     ) return null;
     seen.add(sessionId);
-    if (sessions.length >= DASHBOARD_MAX_SESSION_PROJECTION) continue;
+    if (sessions.length >= projectionLimit) continue;
     const projected = {
       host_id: hostId,
       session_id: sessionId,
@@ -212,7 +223,7 @@ export function projectSessionList(value, hostId, { includeWorkspace = false } =
     }
     sessions.push(projected);
   }
-  return { sessions, truncated: value.length > DASHBOARD_MAX_SESSION_PROJECTION };
+  return { sessions, truncated: value.length > projectionLimit };
 }
 
 export function projectSessionInfo(value, hostId, sessionId) {
@@ -315,7 +326,9 @@ export function projectPendingInteraction(value, nowSeconds = Math.floor(Date.no
       && nonNegativeInt(value.expires_at)
       && value.expires_at === value.observed_at + 30
       && ["runtime_owner", "host_remote_observer"].includes(value.producer_kind);
-    const countValid = value.count === null || (nonNegativeInt(value.count) && value.count <= 64);
+    const countValid = value.count === undefined
+      || value.count === null
+      || (nonNegativeInt(value.count) && value.count <= 64);
     const typesValid = Array.isArray(value.types)
       && value.types.length <= 4
       && value.types.every((type) => INTERACTION_TYPES.has(type))
@@ -325,7 +338,8 @@ export function projectPendingInteraction(value, nowSeconds = Math.floor(Date.no
       return { state: "unavailable" };
     }
     if (state === "none" && !expiredProjection
-      && ((value.count !== null && value.count !== 0) || value.types.length !== 0 || value.truncated)) {
+      && ((value.count !== undefined && value.count !== null && value.count !== 0)
+        || value.types.length !== 0 || value.truncated)) {
       return { state: "unavailable" };
     }
     if (expiredProjection || value.expires_at <= nowSeconds) state = "unavailable";
@@ -359,7 +373,9 @@ export async function readDashboardHostReplicas(env, ownerId, hostIds) {
   ].join(" ");
   try {
     const result = await env.OBSERVATION_DB.prepare(sql).bind(ownerId, ...hostIds).all();
-    if (!Array.isArray(result?.results)) return { ok: false, error_code: "replica_unavailable" };
+    if (result?.success === false || !Array.isArray(result?.results)) {
+      return { ok: false, error_code: "replica_unavailable" };
+    }
     const memberIds = new Set(hostIds);
     const byHost = new Map();
     for (const row of result.results) {
@@ -391,6 +407,260 @@ export async function readDashboardReplicaSource(env, ownerId, hostId, sessionId
   } catch {
     return { ok: false, error_code: "replica_unavailable" };
   }
+}
+
+export function projectContextResolve(value, sessionId) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.session_id !== sessionId) return null;
+  const summary = value.current_summary && typeof value.current_summary === "object"
+    && !Array.isArray(value.current_summary) ? value.current_summary : {};
+  const freshness = value.freshness && typeof value.freshness === "object"
+    && !Array.isArray(value.freshness) ? value.freshness : {};
+  const partial = value.partial && typeof value.partial === "object"
+    && !Array.isArray(value.partial) ? value.partial : {};
+  const workspace = projectWorkspace(value.workspace);
+  const output = {
+    session_id: sessionId,
+    ...(nonNegativeInt(value.context_schema_version) ? { context_schema_version: value.context_schema_version } : {}),
+    ...(workspace?.repository ? { workspace: { repository: workspace.repository } } : {}),
+    current_summary: {
+      ...copyNonNegativeInts(summary, [
+        "observations", "journal_revision", "instructions", "tasks_total",
+        "tasks_active", "tasks_terminal", "tasks_attention",
+      ]),
+      ...(Array.isArray(summary.backends)
+        ? { backends: [...new Set(summary.backends.filter((backend) => CONTEXT_BACKENDS.has(backend)))].slice(0, 16) }
+        : {}),
+      ...(isoTimestamp(summary.last_observed_at) ? { last_observed_at: isoTimestamp(summary.last_observed_at) } : {}),
+    },
+    unresolved: Array.isArray(value.unresolved)
+      ? value.unresolved.slice(0, 64).map(projectUnresolvedItem).filter(Boolean)
+      : [],
+    recent_related_tasks: Array.isArray(value.recent_related_tasks)
+      ? value.recent_related_tasks.slice(0, 32).map(projectRelatedTask).filter(Boolean)
+      : [],
+    refs: projectObservationRefs(value.refs),
+    freshness: {
+      ...(nonNegativeInt(freshness.resolved_revision) ? { resolved_revision: freshness.resolved_revision } : {}),
+      ...(freshness.at_least_revision === null || nonNegativeInt(freshness.at_least_revision)
+        ? { at_least_revision: freshness.at_least_revision }
+        : {}),
+      ...(typeof freshness.stale === "boolean" ? { stale: freshness.stale } : {}),
+    },
+    partial: {
+      ...(typeof partial.journal_exists === "boolean" ? { journal_exists: partial.journal_exists } : {}),
+      ...(typeof partial.journal_degraded === "boolean" ? { journal_degraded: partial.journal_degraded } : {}),
+      ...copyNonNegativeInts(partial, ["corrupt_lines", "write_failures"]),
+    },
+    ...(safeLabel(value.memory?.worker) ? { memory: {
+      worker: value.memory.worker,
+      ...(typeof value.memory.stale === "boolean" ? { stale: value.memory.stale } : {}),
+    } } : {}),
+  };
+  if (Number.isSafeInteger(value.generated_at) && value.generated_at >= 0) {
+    output.generated_at = isoTimestamp(value.generated_at);
+  }
+  return output;
+}
+
+export function projectContextStatus(value, sessionId) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.session_id !== sessionId) return null;
+  const sourceJournal = value.journal && typeof value.journal === "object" && !Array.isArray(value.journal)
+    ? value.journal
+    : null;
+  if (!sourceJournal) return null;
+  const journal = {
+    ...(nonNegativeInt(sourceJournal.schema_version) ? { schema_version: sourceJournal.schema_version } : {}),
+    ...(typeof sourceJournal.exists === "boolean" ? { exists: sourceJournal.exists } : {}),
+    ...copyNonNegativeInts(sourceJournal, [
+      "revision", "base_revision", "observations", "bytes", "max_bytes", "compactions",
+      "write_failures", "corrupt_lines",
+    ]),
+    ...(typeof sourceJournal.degraded === "boolean" ? { degraded: sourceJournal.degraded } : {}),
+  };
+  const memory = value.memory && typeof value.memory === "object" && !Array.isArray(value.memory)
+    ? {
+      ...(safeLabel(value.memory.worker) ? { worker: value.memory.worker } : {}),
+      ...(typeof value.memory.stale === "boolean" ? { stale: value.memory.stale } : {}),
+    }
+    : {};
+  return { session_id: sessionId, journal, memory };
+}
+
+export async function readDashboardTimeline(env, ownerId, hostId, sessionId, cursor, limit) {
+  if (!isD1(env?.OBSERVATION_DB) || !ownerId) return { ok: false, error_code: "replica_unavailable" };
+  const sourceResult = await readDashboardReplicaSource(env, ownerId, hostId, sessionId);
+  if (!sourceResult.ok) return sourceResult;
+  let after = null;
+  if (cursor !== null) {
+    after = await decodeDashboardTimelineCursor(cursor, ownerId, hostId, sessionId);
+    if (after === null) return { ok: false, error_code: "invalid_cursor", status: 400 };
+  }
+  const sql = after === null
+    ? [
+      "SELECT cloud_seq, source_revision, kind, action, target_backend, content_kind,",
+      "state_status, state_revision, observed_at FROM observations",
+      "WHERE owner_id = ? AND host_id = ? AND session_id = ?",
+      "ORDER BY cloud_seq DESC LIMIT ?",
+    ].join(" ")
+    : [
+      "SELECT cloud_seq, source_revision, kind, action, target_backend, content_kind,",
+      "state_status, state_revision, observed_at FROM observations",
+      "WHERE owner_id = ? AND host_id = ? AND session_id = ? AND cloud_seq > ?",
+      "ORDER BY cloud_seq ASC LIMIT ?",
+    ].join(" ");
+  try {
+    const bindings = after === null
+      ? [ownerId, hostId, sessionId, limit + 1]
+      : [ownerId, hostId, sessionId, after, limit + 1];
+    const result = await env.OBSERVATION_DB.prepare(sql).bind(...bindings).all();
+    if (result?.success === false || !Array.isArray(result?.results) || result.results.length > limit + 1) {
+      return { ok: false, error_code: "replica_unavailable" };
+    }
+    const hasMore = result.results.length > limit;
+    const selected = result.results.slice(0, limit);
+    if (after === null) selected.reverse();
+    const events = selected.map(projectTimelineEvent);
+    if (events.some((event) => event === null)) return { ok: false, error_code: "replica_unavailable" };
+    const lastSequence = events.at(-1)?.cloud_seq;
+    return {
+      ok: true,
+      source: sourceResult.source,
+      events,
+      after,
+      next_cursor: nonNegativeInt(lastSequence)
+        ? await encodeDashboardTimelineCursor(ownerId, hostId, sessionId, lastSequence)
+        : null,
+      has_more: after === null ? false : hasMore,
+      has_older: after === null ? hasMore : false,
+    };
+  } catch {
+    return { ok: false, error_code: "replica_unavailable" };
+  }
+}
+
+export async function encodeDashboardTimelineCursor(ownerId, hostId, sessionId, after) {
+  if (!nonNegativeInt(after)) throw new TypeError("invalid timeline cursor position");
+  const scope = await digestHex(`${ownerId}\0${hostId}\0${sessionId}`);
+  const check = await digestHex(`dashboard-timeline-v1\0${scope}\0${after}`);
+  const encoded = btoa(JSON.stringify({ v: 1, scope, after, check }));
+  return encoded.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+
+export async function decodeDashboardTimelineCursor(cursor, ownerId, hostId, sessionId) {
+  if (typeof cursor !== "string" || cursor.length < 1 || cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) return null;
+  try {
+    const normalized = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const payload = JSON.parse(atob(padded));
+    const keys = Object.keys(payload ?? {}).sort();
+    if (
+      !payload
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || keys.join(",") !== "after,check,scope,v"
+      || payload.v !== 1
+      || !nonNegativeInt(payload.after)
+      || typeof payload.scope !== "string"
+      || typeof payload.check !== "string"
+    ) return null;
+    const scope = await digestHex(`${ownerId}\0${hostId}\0${sessionId}`);
+    const check = await digestHex(`dashboard-timeline-v1\0${scope}\0${payload.after}`);
+    if (payload.scope !== scope || payload.check !== check) return null;
+    return payload.after;
+  } catch {
+    return null;
+  }
+}
+
+function projectUnresolvedItem(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !boundedString(value.task_id, 256)) return null;
+  const output = {
+    task_id: value.task_id,
+    ...(safeLabel(value.status) ? { status: value.status } : {}),
+    ...(CONTEXT_REASONS.has(value.reason) ? { reason: value.reason } : {}),
+    refs: projectObservationRefs(value.refs),
+  };
+  return output;
+}
+
+function projectRelatedTask(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !boundedString(value.task_id, 256)) return null;
+  const result = { task_id: value.task_id };
+  if (CONTEXT_BACKENDS.has(value.backend)) result.backend = value.backend;
+  const instruction = value.instruction && typeof value.instruction === "object" && !Array.isArray(value.instruction)
+    ? value.instruction
+    : null;
+  if (instruction) {
+    result.instruction = {
+      ...copyNonNegativeInts(instruction, ["revision"]),
+      ...(isoTimestamp(instruction.observed_at) ? { observed_at: isoTimestamp(instruction.observed_at) } : {}),
+      ...(boundedString(instruction.operation_id, 128) ? { operation_id: instruction.operation_id } : {}),
+      ...(safeLabel(instruction.actor?.transport) ? { actor: { transport: instruction.actor.transport } } : {}),
+    };
+  }
+  const state = value.state && typeof value.state === "object" && !Array.isArray(value.state)
+    ? value.state
+    : null;
+  if (state) {
+    result.state = {
+      ...copyNonNegativeInts(state, ["revision"]),
+      ...(isoTimestamp(state.observed_at) ? { observed_at: isoTimestamp(state.observed_at) } : {}),
+      ...(safeLabel(state.status) ? { status: state.status } : {}),
+      ...(boundedString(state.execution_id, 128) ? { execution_id: state.execution_id } : {}),
+      ...(typeof state.reconciliation_required === "boolean"
+        ? { reconciliation_required: state.reconciliation_required }
+        : {}),
+    };
+  }
+  if (isoTimestamp(value.last_observed_at)) result.last_observed_at = isoTimestamp(value.last_observed_at);
+  result.refs = projectObservationRefs(value.refs);
+  return result;
+}
+
+function projectObservationRefs(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 64).map((item) => {
+    if (
+      !item
+      || typeof item !== "object"
+      || Array.isArray(item)
+      || !boundedString(item.observation_id, 64)
+      || !nonNegativeInt(item.revision)
+      || !OBSERVATION_KINDS.has(item.kind)
+    ) return null;
+    return { observation_id: item.observation_id, revision: item.revision, kind: item.kind };
+  }).filter(Boolean);
+}
+
+function projectTimelineEvent(row) {
+  if (
+    !row
+    || typeof row !== "object"
+    || !nonNegativeInt(Number(row.cloud_seq))
+    || !nonNegativeInt(Number(row.source_revision))
+    || !OBSERVATION_KINDS.has(row.kind)
+    || !validIsoDate(row.observed_at)
+  ) return null;
+  return {
+    cloud_seq: Number(row.cloud_seq),
+    source_revision: Number(row.source_revision),
+    kind: row.kind,
+    ...(safeLabel(row.action) ? { action: row.action } : {}),
+    ...(safeLabel(row.target_backend) ? { target_backend: row.target_backend } : {}),
+    ...(CONTENT_KINDS.has(row.content_kind) ? { content_kind: row.content_kind } : {}),
+    ...(safeLabel(row.state_status) ? { state_status: row.state_status } : {}),
+    ...(row.state_revision !== null && row.state_revision !== undefined
+      && nonNegativeInt(Number(row.state_revision))
+      ? { state_revision: Number(row.state_revision) }
+      : {}),
+    observed_at: row.observed_at,
+  };
+}
+
+function copyNonNegativeInts(value, fields) {
+  return Object.fromEntries(fields
+    .filter((field) => nonNegativeInt(value?.[field]))
+    .map((field) => [field, value[field]]));
 }
 
 export function projectReplica(row) {
@@ -473,6 +743,12 @@ function validReplicaRow(row, sessionScoped = false) {
 
 function validIsoDate(value) {
   return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+}
+
+async function digestHex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function isD1(value) {

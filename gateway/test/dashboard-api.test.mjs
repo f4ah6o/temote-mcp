@@ -85,7 +85,7 @@ function registryHost(hostId, overrides = {}) {
   };
 }
 
-function d1Fixture(rows = []) {
+function d1Fixture(rows = [], { success = true } = {}) {
   return {
     prepare(sql) {
       return {
@@ -96,6 +96,7 @@ function d1Fixture(rows = []) {
               const owner = bindings[0];
               const hosts = new Set(bindings.slice(1));
               return {
+                success,
                 results: rows.filter((row) => row.owner_id === owner && hosts.has(row.host_id))
                   .map((row) => ({
                     host_id: row.host_id,
@@ -135,6 +136,9 @@ function makeEnv(fixture, {
   }],
   sessions = [sessionView()],
   taskList = null,
+  d1Success = true,
+  contextResolve = null,
+  contextStatus = null,
 } = {}) {
   const calls = [];
   const probeCalls = [];
@@ -170,6 +174,8 @@ function makeEnv(fixture, {
       truncated: false,
     }],
   ]);
+  if (contextResolve !== null) values.set("context_resolve", contextResolve);
+  if (contextStatus !== null) values.set("context_status", contextStatus);
   const registryStub = {
     async fetch(request) {
       assert.equal(new URL(typeof request === "string" ? request : request.url).pathname, "/hosts");
@@ -216,7 +222,7 @@ function makeEnv(fixture, {
     GATEWAY_DEPLOYMENT: { id: "deployment-test-9" },
     GATEWAY_REGISTRY: { idFromName() { return "registry"; }, get() { return registryStub; } },
     GATEWAY_SESSIONS: sessionsNamespace,
-    OBSERVATION_DB: d1Fixture(d1Rows),
+    OBSERVATION_DB: d1Fixture(d1Rows, { success: d1Success }),
   };
   return { env, calls, probeCalls };
 }
@@ -279,6 +285,29 @@ test("host inventory is limited to strict configured membership and labels unkno
   assert.equal(JSON.stringify(body).includes("outside-host"), false);
 });
 
+test("a failed D1 all-result cannot masquerade as complete replica data", async () => {
+  const fixture = await makeAccessFixture();
+  const { env } = makeEnv(fixture, {
+    membership: { "mac-main": "host-token" },
+    registry: [registryHost("mac-main")],
+    d1Success: false,
+  });
+
+  await withJwks(fixture, async () => {
+    const hostsResponse = await worker.fetch(request("/dash/api/v1/hosts", fixture), env);
+    const hosts = await hostsResponse.json();
+    assert.equal(hosts.data.hosts[0].availability, "online");
+    assert.equal(hosts.data.components.replica.status, "unavailable");
+
+    const timelineResponse = await worker.fetch(
+      request("/dash/api/v1/hosts/mac-main/sessions/project-a/timeline", fixture),
+      env,
+    );
+    assert.equal(timelineResponse.status, 503);
+    assert.equal((await timelineResponse.json()).error_code, "replica_unavailable");
+  });
+});
+
 test("session list and detail return only allow-listed metadata through read-only session_list", async () => {
   const fixture = await makeAccessFixture();
   const { env, calls } = makeEnv(fixture, {
@@ -337,6 +366,51 @@ test("task list preserves partial backend data and strips result detail", async 
   assert.deepEqual(calls.map((call) => call.name), ["session_list", "task_list"]);
 });
 
+test("context envelope is stale when resolver freshness is stale or a projection is unavailable", async () => {
+  const fixture = await makeAccessFixture();
+  const contextStatus = {
+    session_id: "project-a",
+    journal: { exists: true, degraded: false, revision: 4 },
+    memory: { worker: "not_implemented", stale: true },
+  };
+  const options = {
+    membership: { "mac-main": "host-token" },
+    registry: [registryHost("mac-main")],
+    d1Rows: [],
+    contextResolve: {
+      session_id: "project-a",
+      current_summary: {},
+      freshness: { stale: true, resolved_revision: 4, at_least_revision: 5 },
+      partial: { journal_degraded: false },
+    },
+    contextStatus,
+  };
+  const { env: staleEnv } = makeEnv(fixture, options);
+  await withJwks(fixture, async () => {
+    const staleResponse = await worker.fetch(
+      request("/dash/api/v1/hosts/mac-main/sessions/project-a/context", fixture),
+      staleEnv,
+    );
+    const stale = await staleResponse.json();
+    assert.equal(stale.status, "stale");
+    assert.equal(stale.freshness, "stale");
+    assert.equal(stale.data.context_resolve.status, "confirmed");
+
+    const { env: unavailableEnv } = makeEnv(fixture, {
+      ...options,
+      contextResolve: { session_id: "other-session" },
+    });
+    const unavailableResponse = await worker.fetch(
+      request("/dash/api/v1/hosts/mac-main/sessions/project-a/context", fixture),
+      unavailableEnv,
+    );
+    const unavailable = await unavailableResponse.json();
+    assert.equal(unavailable.status, "stale");
+    assert.equal(unavailable.freshness, "stale");
+    assert.equal(unavailable.data.context_resolve.status, "unavailable");
+  });
+});
+
 test("malformed, duplicate, oversized, or cross-host session lists fail closed on direct routes", async () => {
   const fixture = await makeAccessFixture();
   const invalidCases = [
@@ -369,6 +443,37 @@ test("malformed, duplicate, oversized, or cross-host session lists fail closed o
       assert.deepEqual(calls.map((call) => call.name), ["session_list"]);
     }
   });
+});
+
+test("detail and task routes can validate sessions beyond the display page cap", async () => {
+  const fixture = await makeAccessFixture();
+  const sessions = Array.from({ length: 300 }, (_value, index) => ({
+    session_id: `session-${index}`,
+    status: "active",
+  }));
+  const target = "session-299";
+  const { env, calls } = makeEnv(fixture, { sessions });
+  await withJwks(fixture, async () => {
+    const listResponse = await worker.fetch(request("/dash/api/v1/hosts/mac-main/sessions", fixture), env);
+    const list = await listResponse.json();
+    assert.equal(list.data.sessions.length, 256);
+    assert.equal(list.data.truncated, true);
+
+    const detailResponse = await worker.fetch(
+      request(`/dash/api/v1/hosts/mac-main/sessions/${target}`, fixture),
+      env,
+    );
+    assert.equal(detailResponse.status, 200);
+    assert.equal((await detailResponse.json()).data.session.session_id, target);
+
+    const tasksResponse = await worker.fetch(
+      request(`/dash/api/v1/hosts/mac-main/sessions/${target}/tasks`, fixture),
+      env,
+    );
+    assert.equal(tasksResponse.status, 200);
+    assert.equal((await tasksResponse.json()).data.session_id, target);
+  });
+  assert.deepEqual(calls.map((call) => call.name), ["session_list", "session_list", "session_list", "task_list"]);
 });
 
 test("malformed membership, registry, and direct nonmember host requests fail explicitly", async () => {
@@ -417,6 +522,15 @@ test("pending summaries require a coherent fresh producer-owned projection", () 
     truncated: false,
   };
   assert.equal(projectPendingInteraction(base, now).state, "none");
+  const noneWithoutCount = { ...base };
+  delete noneWithoutCount.count;
+  assert.equal(projectPendingInteraction(noneWithoutCount, now).state, "none");
+  const pendingWithoutCount = { ...base, state: "pending", types: ["permission"] };
+  delete pendingWithoutCount.count;
+  assert.equal(projectPendingInteraction(pendingWithoutCount, now).state, "pending");
+  const unavailableWithoutCount = { ...base, state: "unavailable" };
+  delete unavailableWithoutCount.count;
+  assert.equal(projectPendingInteraction(unavailableWithoutCount, now).state, "unavailable");
   assert.equal(projectPendingInteraction({ ...base, summary_revision: 0 }, now).state, "unavailable");
   assert.equal(projectPendingInteraction({ ...base, producer_epoch: 0 }, now).state, "unavailable");
   assert.equal(projectPendingInteraction({ ...base, expires_at: now + 31 }, now).state, "unavailable");
