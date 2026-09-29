@@ -1,9 +1,9 @@
 # PR #85 design review fixes: provisioning retry identity + RepositoryId grammar
 
-Status: done — contract corrections delivered in this PR (docs only; runtime unchanged)  
-Repository: `f4ah6o/temote-mcp`  
-Source review: PR #85 `docs: make managed provisioning session-first` (merged at `5bdedb3`), reviewed HEAD `9afe5cd`, codex review comments  
-Created: 2026-09-29 (Asia/Tokyo)
+- Status: done — contract corrections delivered in this PR (docs only; runtime unchanged)
+- Repository: `f4ah6o/temote-mcp`
+- Source review: PR #85 `docs: make managed provisioning session-first` (merged at `5bdedb3`), reviewed HEAD `9afe5cd`, codex review comments
+- Created: 2026-09-29 (Asia/Tokyo)
 
 ## 1. Findings and fix mapping
 
@@ -53,11 +53,26 @@ Fixes applied:
 
 ## 3. Known residual (outside this PR's docs-only scope)
 
-- `src/session_source.rs` (merged via PR #86) predates the strengthened §3 contract: its component check does not yet enforce the full F1 grammar (e.g. percent escapes currently parse) and serde derives do not enforce the §3 invariants. A conformance change belongs to a follow-up implementation packet; this PR deliberately contains no runtime changes.
+- `src/session_source.rs` (merged via PR #86) predates the strengthened §3 contract: `validate_component()` is a deny-list that does not yet enforce the full F1 grammar (e.g. percent escapes currently parse), and the `Deserialize` derive / public fields leave construction paths that never pass the parser's invariants. Tracked by `issues/polished/20260929-s0a-contract-conformance.md`; that conformance fix must land before S1+ provisioning wires `SessionStartSpec` / `RepositoryId` into managed `session_start`. This PR deliberately contains no runtime changes.
 - The §5.3 retry contract has no runtime implementation yet; it lands with the S1+ provisioning packets.
 
 ## 4. Verification
 
-- `git diff --check`: clean.
-- Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/polished/20260929-s0a-typed-session-source-contract.md`, `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, this record.
-- NOT RUN: Rust unit/integration tests, host/macOS gates, provisioning E2E — docs-only change; the added test lists are acceptance specifications for implementation packets, not executed tests.
+Verification target (fixed at record time):
+
+- base (PR #87 base): `origin/main` `d3b7d53ae3b10caa7f11f42adb1e506a0800d2fe`
+- merge-base (`git merge-base origin/main HEAD`): `d3b7d53ae3b10caa7f11f42adb1e506a0800d2fe`
+- head (PR #87 head): `d9ff75079e0a072c2dc413d5dd7ca9a87b02d31e`
+- working-tree diff: present — this record's own follow-up edits (verification-record rewrite, S0a status sections, new conformance packet) are uncommitted on top of `d9ff750`. The committed PR diff is `d3b7d53...d9ff750`; the combined review diff is the working tree vs `d3b7d53`.
+- diff identifiers: committed PR diff `git diff origin/main...d9ff750` → SHA-256 `163215af8cb202e7be693ecbd317bbc4da082789c72efb69ed88f6a84e3025e9`; the follow-up diff and combined diff are re-identifiable from the SHAs above (follow-up patch + SHA-256 delivered with the session report).
+
+Commands and results (`gh git` / gh-git extension is not installed on this machine — `gh git diff --check` would dispatch the same `git diff --check`, which is what ran):
+
+- `git diff --check origin/main...HEAD` at `d9ff750` (before the whitespace fix): exit 2 — FAIL. 5 trailing-whitespace notices on added/changed lines (3 header lines in this file, 1 `Status:` line in each edited doc). Recorded as a failed check, not waived.
+- Fix applied to the failing changed lines only: `Status:` lines stand as their own paragraph instead of the two-space hard break; this file's and the conformance packet's headers use a bullet list. No unrelated reformatting; pre-existing `  ` metadata lines are outside the diff. No check configuration was weakened.
+- `git diff --check origin/main` after the fix — combined diff, including this record's own edits: exit 0 — PASS.
+- `git diff --check` — working tree vs `d9ff750` (this follow-up's own diff): exit 0 — PASS.
+- Prior "`git diff --check`: clean" line: removed. It was read from an empty working-tree diff after committing and never covered the PR diff; it is not carried forward as a verified result.
+- NOT RUN: doc lint / link check (no such tooling in this repo); Rust unit/integration tests, host/macOS gates, provisioning E2E — docs-only change; the added test lists are acceptance specifications for implementation packets, not executed tests.
+
+Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/polished/20260929-s0a-typed-session-source-contract.md`, `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `issues/polished/20260929-s0a-contract-conformance.md` (new conformance packet), this record.

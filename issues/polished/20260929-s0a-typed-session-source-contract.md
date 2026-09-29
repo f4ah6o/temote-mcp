@@ -1,12 +1,13 @@
 # S0a: typed session source contract
 
-Status: ready for implementation / revised 2026-09-29 (PR #85 review follow-up: §3 inherits the F1 component grammar)  
+Status: initial implementation merged (PR #86) / conformance to the strengthened contract pending — tracked by `issues/polished/20260929-s0a-contract-conformance.md`
+
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260929-session-first-managed-provisioning.md`  
 Created: 2026-09-29 (Asia/Tokyo)  
 Observed baseline: `main` `3947fc2a6d1e53e0bc85219a176ab4240b5abc16`
 
-Revision note: this packet's contract was strengthened after the PR #85 design review. The S0a implementation merged in PR #86 predates the inherited component grammar and the checked-entry-point requirements below; bring it into conformance in a follow-up change rather than treating the contract as already satisfied by that revision.
+Revision note: this packet's contract was strengthened after the PR #85 design review. The S0a implementation merged in PR #86 predates the inherited component grammar and the checked-entry-point requirements below; conformance is tracked by `issues/polished/20260929-s0a-contract-conformance.md` and must land before this type is wired into S1+ provisioning.
 
 ## 1. Goal
 
@@ -23,6 +24,8 @@ The codebase currently assumes a path-first start in several places:
 This packet does **not** replace those paths yet. It creates a backend-neutral typed input model that later provisioning packets can wire into the supervisor.
 
 ## 2. Scope
+
+Landed: the initial module (`src/session_source.rs`) was added in PR #86. The scope below is the original packet text, kept as history; the remaining conformance delta is listed in §13.
 
 Add one small module, preferably `src/session_source.rs` (or an equivalent orchestration-core location if the implementation finds an already suitable module), containing:
 
@@ -147,6 +150,8 @@ No silent `auto -> git` implementation should be introduced here.
 
 ## 7. Read/change scope
 
+Landed in PR #86; kept as the original change-scope record.
+
 Expected:
 
 - new `src/session_source.rs` or equivalent
@@ -238,6 +243,8 @@ Do not report unexecuted host/macOS gates as PASS.
 
 ## 12. Follow-on
 
+Before the follow-on packets wire `SessionStartSpec` / `RepositoryId` into provisioning, the conformance fixes tracked by `issues/polished/20260929-s0a-contract-conformance.md` must land (§13).
+
 After S0a:
 
 1. S1a RepositoryStore adapter
@@ -245,3 +252,12 @@ After S0a:
 3. S2b bare store -> jj workspace / logical change
 4. S3a repository-first session_start composition
 5. S4a verified revision -> delivery ref
+
+## 13. Remaining conformance work
+
+Tracked by `issues/polished/20260929-s0a-contract-conformance.md` (full acceptance criteria there). At `main` `d3b7d53`, static inspection of `src/session_source.rs` shows:
+
+- `validate_component()` enumerates forbidden characters instead of enforcing the F1 grammar `^[A-Za-z0-9][A-Za-z0-9._-]*$` — e.g. `repo%2Fother` parses because `%` is not on the deny-list.
+- `RepositoryId` derives `Deserialize` and exposes public fields, so serde input and struct literals bypass the parser's validation/normalization (`deny_unknown_fields` constrains field names only).
+
+Remaining work: component grammar for `host` / `owner` / `name` and the supplied default host; checked constructor / parser / serde enforcing identical invariants; rejection of percent escapes, backslashes, whitespace, NUL/control characters and malformed serde input; the §8 negative and property tests (16–27); serde round-trip preserving a normalized identity; GitHub case normalization kept. These fixes and their verification must land before S1+ provisioning wires this type in.

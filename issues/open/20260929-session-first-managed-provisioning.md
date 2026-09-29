@@ -1,8 +1,11 @@
 # S1: session-first managed repository provisioning
 
-Status: design ready / S0a polished and ready for implementation / 2026-09-29 PR #85 review revisions (provisioning retry identity; RepositoryId grammar は S0a 側)  
+Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/polished/20260929-s0a-contract-conformance.md`)
+
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-29 (Asia/Tokyo)
+
+Revision note (2026-09-29, PR #85 review follow-up): added the §5.3 provisioning retry contract — required caller-supplied `operation_id`, durable Accepted receipt before the first session-owned side effect, replay / `operation_conflict` / `reconciliation_required` semantics. The inherited F1 `RepositoryId` component grammar lives on the S0a packet side.
 
 Related:
 - `issues/open/20260924-temote-development-harness-restructure.md`
@@ -526,6 +529,8 @@ Acceptance:
 - [ ] existing session lifecycle tests remain green
 
 This packet creates the seam required before repository provisioning is wired into session start.
+
+S0a landed via PR #86; conformance to the strengthened §3 contract is tracked by `issues/polished/20260929-s0a-contract-conformance.md` and must land before S1+ packets wire `SessionStartSpec` / `RepositoryId` into managed `session_start`.
 
 ## 14. Follow-on implementation packets
 
