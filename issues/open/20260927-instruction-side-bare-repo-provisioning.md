@@ -1,6 +1,6 @@
 # Add instruction-side bare repository provisioning flow
 
-Status: open  
+Status: superseded as caller-flow architecture by `issues/open/20260929-session-first-managed-provisioning.md`; retained as RepositoryStore adapter/provisioning child requirements  
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)
 
@@ -8,6 +8,32 @@ Related:
 - `issues/done/20260925-f1-repository-store-workspace-contract.md`
 - `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-named-root-workspace-identity.md`
+
+## 0. 2026-09-29 architecture correction
+
+The repository preparation requirements below remain valid, but the top-level ordering changes.
+
+Old framing:
+
+```text
+repository identity
+  -> bare repository store
+  -> managed workspace
+  -> session / task
+```
+
+Session-first framing:
+
+```text
+session request
+  -> repository source normalization
+  -> bare RepositoryStore ensure/fetch
+  -> base pin
+  -> managed VCS workspace allocation
+  -> agent execution
+```
+
+For the Jujutsu normal path, managed workspace allocation means **jj workspace directly from the Git-backed store**. It does not first create a Git branch/worktree. Git branch/worktree remains the explicit Git compatibility backend. See `issues/open/20260929-session-first-managed-provisioning.md`.
 
 ## 1. Problem
 
