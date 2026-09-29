@@ -15,6 +15,7 @@ Related:
 - `issues/open/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
 - `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
+- `issues/open/20260929-session-first-managed-provisioning.md` (session-first repository source -> managed workspace provisioning; path is not session identity)
 - `issues/done/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
 - `issues/open/20260926-task-change-orchestration-stacked-pr.md` (Task/Change graph as source of truth for executor assignment and stacked PR delivery)
 - `issues/done/20260916-managed-worktree-session-integration.md`
@@ -36,7 +37,7 @@ Related:
 
 1. **yolo を使わず、極力 approve-free な agent mode。** repository / workspace / network / 操作範囲について既に与えられた許可を task に引き継ぎ、その範囲内の準備・実装・テスト・許可済み commit / push / PR 作成では操作ごとの再承認を要求しない。delivery という分類だけで毎回承認にしない。権限拡張や未許可の破壊的操作は明示的に扱い、sandbox・秘密情報保護・他作業の保護を維持する。
 2. **指示役が cloud / local のどちらでも同じように使える。** authenticated caller が同じ権限を持つ場合、transport によって task の操作能力・承認方針・状態参照が変わらない。cloud から開始した task を local から追跡・制御でき、その逆もできる。指示役の場所と agent の実行場所 (host-local / hosted) は別の軸として扱う。
-3. **独立して遅れ・未統合 commit の蓄積・分岐が生じる local main を持たない。** 新規 managed repository は bare repository store + task worktrees を標準とし、local `main` を作業・統合・追従のために維持しない。基準は fetch で確認した `origin/main` とその commit。既存 checkout は勝手に移動・削除・reset せず、明示的な移行契約で保全する。
+3. **独立して遅れ・未統合 commit の蓄積・分岐が生じる local main を持たない。** 新規 managed repository は bare RepositoryStore + Temote-managed VCS workspace を標準とする。Jujutsu backend の normal path は bare store から jj workspace を直接割り当て、Session start 時に Git branch / git worktree を作らない。Git worktree は explicit compatibility backend。基準は fetch で確認した `origin/main` とその commit。既存 checkout は勝手に移動・削除・reset せず、明示的な移行契約で保全する。
 4. **指示役を替えても context / knowledge を失わない。** coding agent に memory 管理を要求せず、Temote の共通 orchestration 境界で instruction / execution / evidence を自動観測する。raw observation と derived knowledge を分離し、専用 worker が非同期に整理する。次の head は authorized Context Resolver から provenance 付きの relevant context を取得する。hidden chain-of-thought や Temote 外の全 transcript を収集する設計にはしない。
 
 ### Agent-mode authorization contract
@@ -109,6 +110,25 @@ Temote の中心価値は、**どの coding agent に任せても、適切な作
 ## Current direction
 
 コード操作は Temote 自身が shell / Git broker で代行するのではなく、server-mode の coding agent に委譲する (上表の 4 backend)。Temote 自身が各 Git command を emulation / proxy することは中心責務にしない。
+
+### Session-first provisioning correction (2026-09-29)
+
+新規 managed flow の一次 object は repository checkout / directory ではなく **Session** とする。
+
+```text
+Session request
+  -> RepositorySource
+  -> shared bare RepositoryStore
+  -> pinned base revision
+  -> managed Workspace / Change
+  -> Execution
+```
+
+physical cwd は generated host-local projection であり Session identity ではない。named root は host filesystem admission boundary / workspace-pool placement として維持する。
+
+Jujutsu backend では `bare store -> jj workspace -> logical change` を normal path とし、Git branch/worktree は session start で作らない。delivery 時に verified revision から bookmark/ref を materialize する。Git branch/worktree は Git compatibility backend に限定する。
+
+Authoritative child contract: `issues/open/20260929-session-first-managed-provisioning.md`.
 
 ### Responsibility boundaries
 
