@@ -1,10 +1,12 @@
 # Fabric dashboard
 
-The read-only dashboard lives at `/dash/` on the existing Temote Fabric Worker and hostname. `/dash` redirects after authentication. Cloudflare Access protects the whole hostname; the Worker independently verifies the assertion signature, issuer, audience, expiry, subject, and allowed email. Client and host bearer tokens cannot open the dashboard. Existing MCP client-token compatibility is separate.
+The read-only dashboard lives at `/dash/` on the existing Temote Fabric Worker and hostname. `/dash` redirects after authentication. Cloudflare Access protects the whole hostname; the Worker independently verifies the assertion signature, issuer, audience, expiry, not-before time, subject, and allowed email. Client and host bearer tokens cannot open the dashboard. Existing MCP client-token compatibility is separate.
 
 The dashboard uses configured host membership from `HOST_TOKENS_JSON`. Token values are never displayed. An offline entry means Fabric has no confirmed live route, and unknown means discovery could not establish availability. Neither describes a machine shutdown or a disconnection time. Connection history without evidence remains unknown. “Last synchronized” describes observation replication, rather than a live backend check.
 
 Session and task panels use existing bounded Host reads. Task state is a retained record; a reachable Host does not establish that its backend state was just reconciled. Pending interaction summaries are produced on the Host independently of dashboard access and task lists. They expire after 30 seconds. A missing summary from an older Host is unsupported, and an expired or failed observation is unavailable. Approval details, question text, choices, prompts, output, environment values, and raw evidence are excluded.
+
+After a runtime process restarts, matching thread/session identity or reading saved turn history does not reconstruct outstanding requests. A reopened Codex/ACP runtime keeps a zero-counter summary unavailable until its current in-process request scope is established by a new admitted turn/prompt. A confirmed pending event may still report pending. Listing and dashboard refresh never reconnect a runtime to obtain this proof.
 
 Context uses the live resolver when available. Without a usable live or offline resolver the component is unavailable. Timeline contains allow-listed metadata from replicated observations, scoped to the configured owner, selected Host, and session. A replica is never used to infer current execution state.
 
