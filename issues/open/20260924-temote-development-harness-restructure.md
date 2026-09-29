@@ -3,7 +3,7 @@
 Status: open / umbrella tracker (implementation underway)
 Execution unit: one bounded child packet per run (small-model implementation guide below)
 Created: 2026-09-24 (Asia/Tokyo)
-Updated: 2026-09-26 (Asia/Tokyo) — Phase O O1/O2 implemented; cloud observation / knowledge child design added; earlier PR #47 scope boundaries retained
+Updated: 2026-09-29 (Asia/Tokyo) — session-first provisioning target added; Phase O O1/O2 implementation and earlier PR #47 scope boundaries retained
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
@@ -134,7 +134,7 @@ Authoritative child contract: `issues/open/20260929-session-first-managed-provis
 
 | 層 | 責務 |
 | --- | --- |
-| gh-git | repository-scoped identity、repository / worktree の作成・検査等の Git primitive |
+| gh-git | repository-scoped GitHub identity、bare Git RepositoryStore / Git compatibility worktree の primitive |
 | Temote workspace | task への割当、reservation / 書込み排他、回収条件 |
 | Temote environment | vp / Cargo 等の準備、ready-state、cache policy |
 | agent backend | 実装・調査・テストの実行 |
