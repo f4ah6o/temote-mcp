@@ -2729,6 +2729,11 @@ async fn run_actor(
     } = context;
     let _connection_guard = ActorConnectionGuard(Arc::clone(&connected));
     let mut reader = BufReader::new(stdout);
+    // Keep partial JSONL data outside the cancellable select future. If a
+    // command arrives while fill_buf is waiting for the rest of a line, Tokio
+    // drops only the read future; this buffer retains the bytes already
+    // consumed from the child pipe for the next iteration.
+    let mut partial_line = Vec::new();
     let (server_tx, mut server_rx) = mpsc::channel::<ServerResponse>(16);
     let mut next_id = 1u64;
     let mut pending = HashMap::<u64, oneshot::Sender<std::result::Result<Value, String>>>::new();
@@ -2772,7 +2777,7 @@ async fn run_actor(
                     }
                 }
             }
-            line = read_bounded_json_line(&mut reader) => {
+            line = read_bounded_json_line(&mut reader, &mut partial_line) => {
                 match line {
                     Ok(Some(value)) => {
                         if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -2842,11 +2847,10 @@ async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn read_bounded_json_line<R>(reader: &mut R) -> Result<Option<Value>>
+async fn read_bounded_json_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<Option<Value>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = Vec::new();
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
@@ -2872,7 +2876,8 @@ where
         let len = chunk.len();
         reader.consume(len);
     }
-    let value = serde_json::from_slice(&line).context("invalid Codex app-server JSON line")?;
+    let value = serde_json::from_slice(line).context("invalid Codex app-server JSON line")?;
+    line.clear();
     Ok(Some(value))
 }
 
@@ -4557,8 +4562,122 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
     use std::sync::{Arc, Barrier, mpsc};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct NotifyOnReadPending<R> {
+        inner: R,
+        read_data: bool,
+        pending_notice: Option<oneshot::Sender<()>>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for NotifyOnReadPending<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let filled_before = buffer.filled().len();
+            let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+            match &result {
+                Poll::Ready(Ok(())) if buffer.filled().len() > filled_before => {
+                    this.read_data = true;
+                }
+                Poll::Pending if this.read_data => {
+                    if let Some(notice) = this.pending_notice.take() {
+                        let _ = notice.send(());
+                    }
+                }
+                _ => {}
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_keeps_prefix_when_cancelled_waiting_for_newline() {
+        let (mut writer, raw_reader) = tokio::io::duplex(128);
+        let (pending_notice, pending_notice_rx) = oneshot::channel();
+        let reader = NotifyOnReadPending {
+            inner: raw_reader,
+            read_data: false,
+            pending_notice: Some(pending_notice),
+        };
+        let mut reader = BufReader::new(reader);
+        let mut partial_line = Vec::new();
+        writer.write_all(b"{\"id\":").await.unwrap();
+
+        {
+            let read = read_bounded_json_line(&mut reader, &mut partial_line);
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => panic!("read completed before the line suffix: {result:?}"),
+                result = pending_notice_rx => result.expect("read did not consume the prefix"),
+            }
+        }
+
+        assert_eq!(partial_line, b"{\"id\":");
+        writer
+            .write_all(b"7,\"result\":{\"ok\":true}}\n")
+            .await
+            .unwrap();
+        let value = read_bounded_json_line(&mut reader, &mut partial_line)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, json!({"id": 7, "result": {"ok": true}}));
+        assert!(partial_line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_rejects_overflowing_retained_prefix() {
+        let (mut writer, raw_reader) = tokio::io::duplex(16);
+        let mut reader = BufReader::new(raw_reader);
+        let mut partial_line = vec![b' '; MAX_RPC_LINE_BYTES];
+        writer.write_all(b"x\n").await.unwrap();
+        let error = read_bounded_json_line(&mut reader, &mut partial_line)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {MAX_RPC_LINE_BYTES} bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_handles_multiple_lines_and_complete_eof() {
+        let (mut writer, raw_reader) = tokio::io::duplex(128);
+        let mut reader = BufReader::new(raw_reader);
+        let mut partial_line = Vec::new();
+        writer.write_all(b"{\"id\":1}\n{\"id\":2}").await.unwrap();
+        drop(writer);
+
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            Some(json!({"id": 1}))
+        );
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            Some(json!({"id": 2}))
+        );
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(partial_line.is_empty());
+    }
 
     fn session(root: &Path, id: &str, yolo: bool) -> config::Session {
         let cwd = config::canonical_directory(root).unwrap();

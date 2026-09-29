@@ -27,6 +27,7 @@
 
 ### Fixed
 
+- Codex and Devin ACP runtime actors retain bounded partial JSONL messages while processing another command, preventing cancelled reads from discarding a message prefix. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - Accepted Codex task runtimes now tolerate one-off session metadata or liveness probe failures while monitoring their already-authorized owner. Verified inactive or replaced sessions still stop immediately, and three consecutive unknown observations stop fail-closed.
 - Session lifecycle admission now accepts standard linked worktrees backed by bare repositories, using the validated canonical common Git directory as the repository reservation identity. Managed-worktree authority and Git mutation brokers still require the supported primary-checkout layout, and malformed reciprocal pointers or symlinked `.git` metadata remain rejected.
 - Completed OpenCode and Devin ACP tasks keep malformed final replies recoverable through scoped evidence. Task responses show report decode status and truncation without changing execution status. ([completed task result recovery](issues/open/20260927-completed-task-malformed-final-report-json.md))
