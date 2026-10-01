@@ -46,6 +46,10 @@ jobs:
       - name: Install gateway dependencies
         run: npm ci --prefix gateway
 
+      - name: Install Chromium and system dependencies
+        working-directory: gateway
+        run: npx playwright install --with-deps chromium
+
       - name: Set up Linux sandbox runtime
         shell: bash
         run: |
