@@ -5,7 +5,7 @@ Repository: `f4ah6o/temote-mcp`
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related:
 - `issues/open/20260925-observation-context-memory-plane.md`
-- `issues/open/20260926-cloud-observation-knowledge-plane.md`
+- `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Created: 2026-09-26 (Asia/Tokyo)
 
 ## 1. Naming decision
