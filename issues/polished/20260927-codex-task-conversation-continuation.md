@@ -5,7 +5,7 @@ explicit terminal-runtime handoff + atomic successor claim — the handoff
 alone does not serialize two concurrent continuations of the same task).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
-Parent issue: `issues/open/20260925-agent-conversation-continuation.md`
+Parent issue: `issues/closed/20260925-agent-conversation-continuation.md`
 Prerequisites: orchestration A1/A2 slices on `main`
 (`src/orchestration.rs`, `src/orchestration/requests.rs`)
 
