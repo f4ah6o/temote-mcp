@@ -2,13 +2,13 @@
 
 ## Status
 
-open — implementation landed; post-fix live parity and cloud-mode verification remain
+done — implementation landed; remaining live parity and cloud-mode verification are centralized in `issues/open/20260908-live-acceptance-matrix.md`
 
 Model: coordinator decision (f4ah6o)
 Created: 2026-09-23 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
-Triage (2026-09-27): keep open only for current-binary live acceptance after the JSON-RPC envelope fix and for `devin acp --cloud` parity; the backend implementation itself is no longer proposed work.
+Historical triage (2026-09-27): this was kept open only for current-binary live acceptance after the JSON-RPC envelope fix and for `devin acp --cloud` parity; on 2026-10-01 those live-only residuals were centralized in the live acceptance matrix and this implementation issue was archived as done.
 
 ## Decision
 
@@ -69,7 +69,7 @@ vendor 独自 `thread/*`/`turn/*` より wire 面が小さい。`devin acp` は�
 - 2026-09-24: live 検証 (devin 3000.11.1 on macOS)。`devin_status`/`devin_task_start` が `initialize: deadline has elapsed` で必ず失敗 — actor が送る JSON-RPC message に `"jsonrpc":"2.0"` が無く、devin が返す `-32700` (`id:null`) parse error を pending にマッチできず 30s timeout していた。同 envelope を手動で流すと `jsonrpc` 有りで initialize ~10ms 応答 (protocolVersion 1, loadSession advertise, authMethods `devin-browser`)。修正は PR #43。`session/new` 以降の live parity は修正版 supervisor の再デプロイ後に再確認が必要。
 - 2026-09-24: `devin acp --cloud` 対応を PR #43 に追加 (coordinator 依頼)。`devin_task_start` に `cloud` (boolean) を追加し、`devin acp --cloud` を spawn — stdio ACP を Devin Cloud ACP WebSocket に relay するため `auth login` account で hosted session が駆動できる (API key 不要)。`devin acp --cloud` では `--model`/`--agent-type` が無視されるため `cloud` との併用は拒否し、spawn 引数は `AcpSpawnSpec` に集約 (clippy `too_many_arguments` 対応)。`TaskRecord.cloud` (`#[serde(default)]`)・request fingerprint・task view・approval metadata・tool schema・gateway contract・usage docs (en/ja) を同期。`swe-2-max` 等の model 指定はこの経路では渡せない点に注意 — model 選択が必要な場合は `devin_cloud_task_start` を使う。cloud mode の live parity は修正版 supervisor の再デプロイ後に確認が必要。
 
-- 2026-09-27 polish: `session/new` 以降の live parity・`--cloud` 経路・`session/request_permission`→`waiting_approval` 写像の実機確認は live acceptance matrix (`issues/open/20260908-live-acceptance-matrix.md`「Delegation backends — Devin and interaction answers」) に fold した。issue は matrix row が PASS するまで open のまま。
+- 2026-09-27 polish: `session/new` 以降の live parity・`--cloud` 経路・`session/request_permission`→`waiting_approval` 写像の実機確認は live acceptance matrix (`issues/open/20260908-live-acceptance-matrix.md`「Delegation backends — Devin and interaction answers」) に fold した。2026-10-01 triage で live-only residual を matrix に一元化し、本 issue 自体は done へ移動した。
 
 ## Related
 
