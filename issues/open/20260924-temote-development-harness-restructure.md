@@ -10,7 +10,7 @@ Related:
 
 - `issues/open/20260922-agent-server-backends-cli-deprecation.md` (server-primary backend umbrella)
 - `issues/done/20260923-devin-acp-backend.md`
-- `issues/open/20260924-devin-cloud-backend.md`
+- `issues/done/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
 - `issues/done/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
 - `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
