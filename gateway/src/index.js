@@ -53,6 +53,10 @@ import {
   handleObservationSync,
   observationSyncHostId,
 } from "./observation/index.js";
+import {
+  callFabricTool, fabricResources, isFabricTool, readFabricResource,
+  FABRIC_RESOURCES_CAPABILITY,
+} from "./fabric-app/index.js";
 import { resolveCloudContext } from "./context/index.js";
 import {
   handleDashboardRequest,
@@ -166,7 +170,7 @@ async function handleMcp(request, env, identity) {
     case "initialize":
       return mcpJson(rpcResult(id, {
         protocolVersion: negotiateProtocolVersion(rpc),
-        capabilities: { tools: { listChanged: false } },
+        capabilities: { tools: { listChanged: false }, resources: FABRIC_RESOURCES_CAPABILITY },
         serverInfo: {
           name: "temote-mcp-gateway",
           title: "Temote MCP Gateway",
@@ -191,6 +195,17 @@ async function handleMcp(request, env, identity) {
           ? modernizeResult("tools/list", result, gatewayVersion(env))
           : result,
       ));
+    }
+    case "resources/list": {
+      const result = fabricResources();
+      return mcpJson(rpcResult(id, isModernRequest(rpc)
+        ? modernizeResult("resources/list", result, gatewayVersion(env)) : result));
+    }
+    case "resources/read": {
+      const resource = readFabricResource(rpc.params);
+      if (resource.error) return mcpJson(rpcError(id, resource.error.code, resource.error.message));
+      return mcpJson(rpcResult(id, isModernRequest(rpc)
+        ? modernizeResult("resources/read", resource.result, gatewayVersion(env)) : resource.result));
     }
     case "tools/call":
       return handleToolCall(rpc, env);
@@ -255,6 +270,14 @@ async function handleToolCall(rpc, env) {
   const args = rpc?.params?.arguments ?? {};
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     return mcpJson(rpcError(id, -32602, "tool arguments must be an object"));
+  }
+
+  if (isFabricTool(name)) {
+    const response = await callFabricTool(id, name, args, env);
+    if (response.result && isModernRequest(rpc)) {
+      response.result = modernizeResult("tools/call", response.result, gatewayVersion(env));
+    }
+    return mcpJson(response);
   }
 
   if (name === "host_list") {

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a read-only Fabric MCP App with an OpenAI global entrypoint, authenticated UI resources, and host/session/task browsing tools with text fallback. ([Fabric MCP App](docs/fabric-dashboard.md#fabric-mcp-app))
 - Added an Access-protected read-only Fabric dashboard at `/dash/`, with configured host inventory, retained task interaction summaries, scoped context, and replicated timeline metadata. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - `temote-mcp upgrade --dry-run` now lists each unrestorable session's `session_id` and reason in `blocked_sessions`, and `temote-mcp upgrade --force` stops those sessions before the handoff (they are not restored) instead of aborting; protocol, ingress, and helper compatibility gates still apply. ([upgrade force and blocked session list](issues/open/20260928-upgrade-force-blocked-sessions.md))
 - Fabric now synchronizes eligible host observations automatically and resolves bounded repository context with provenance; a configured Memory Worker can derive supported knowledge from the D1 replica. Instruction and error previews remain opt-in, and their policy must stay unchanged until pending batches are acknowledged. ([cloud observation and knowledge plane](issues/open/20260926-cloud-observation-knowledge-plane.md))

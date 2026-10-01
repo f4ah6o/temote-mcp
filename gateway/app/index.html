@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temote Fabric</title>
+<style>/* APP_STYLES */</style>
+</head>
+<body>
+<main>
+<header><div><h1>Temote Fabric</h1><p>Read-only hosts, sessions, and retained tasks</p></div><button id="refresh" type="button" disabled>Refresh</button></header>
+<p id="connection" role="status">Connecting to MCP host…</p>
+<p id="error" role="alert" hidden></p>
+<section aria-labelledby="hosts-heading"><h2 id="hosts-heading">Hosts</h2><div id="hosts"></div></section>
+<section aria-labelledby="sessions-heading"><h2 id="sessions-heading">Sessions</h2><div id="sessions"></div></section>
+<section aria-labelledby="tasks-heading"><h2 id="tasks-heading">Retained tasks</h2><p id="session-detail"></p><div id="tasks"></div></section>
+<footer><p>Task records are saved state; viewing does not reconcile backends.</p><p id="updated"></p></footer>
+</main>
+<script type="module">/* APP_SCRIPT */</script>
+</body>
+</html>

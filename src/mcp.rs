@@ -919,8 +919,47 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
         "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
     }));
+    routed_tools.extend(fabric_gateway_tools());
     validate_gateway_tool_metadata(&routed_tools)?;
     Ok(routed_tools)
+}
+
+/// Fabric UI reads terminate at the gateway, never at a host dispatcher.
+fn fabric_gateway_tools() -> Vec<Value> {
+    let host = json!({"type": "string", "minLength": 1, "maxLength": 128,
+        "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$"});
+    let session = json!({"type": "string", "minLength": 1, "maxLength": 64,
+        "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$"});
+    let mut tools = vec![
+        json!({
+            "name": "fabric_overview", "title": "Temote Fabric",
+            "description": "Read Fabric service information and configured hosts with live availability and replica freshness. No session or task mutations.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "icons": [{"src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='3' y='2.5' width='14' height='6' rx='1.5'/%3E%3Crect x='3' y='11.5' width='14' height='6' rx='1.5'/%3E%3Cpath d='M6 5.5h.01M6 14.5h.01M10 5.5h4M10 14.5h4'/%3E%3C/svg%3E", "mimeType": "image/svg+xml"}],
+            "_meta": {"ui": {"resourceUri": "ui://temote-fabric/overview", "visibility": ["model", "app"]},
+                "openai/ui": {"entrypoints": [{"type": "global"}]}}
+        }),
+        json!({
+            "name": "fabric_session_list", "title": "List Fabric host sessions",
+            "description": "Read the bounded redacted session list for one explicitly selected configured Fabric host.",
+            "inputSchema": {"type": "object", "properties": {"host_id": host.clone()},
+                "required": ["host_id"], "additionalProperties": false}
+        }),
+        json!({
+            "name": "fabric_session_read", "title": "Read a Fabric session and retained tasks",
+            "description": "Read redacted session details and bounded retained task state for an explicit host and session. Does not reconcile tasks or return transcripts, output, approval details, or filesystem paths.",
+            "inputSchema": {"type": "object", "properties": {"host_id": host, "session_id": session},
+                "required": ["host_id", "session_id"], "additionalProperties": false}
+        }),
+    ];
+    for tool in &mut tools {
+        tool["annotations"] = json!({"readOnlyHint": true, "destructiveHint": false,
+            "idempotentHint": true, "openWorldHint": false});
+        if tool["name"] != "fabric_overview" {
+            tool["_meta"] = json!({"ui": {"visibility": ["model", "app"]}});
+        }
+    }
+    tools
 }
 
 /// Fabric deliberately adds a second, repository-scoped authorization path.
@@ -2766,6 +2805,31 @@ mod tests {
     }
 
     #[test]
+    fn fabric_tools_are_gateway_only_and_explicitly_scoped() {
+        let fabric = fabric_gateway_tools();
+        for public in [false, true] {
+            for managed in [false, true] {
+                let host_tools = tools(public, managed);
+                assert!(host_tools.as_array().unwrap().iter().all(|tool| {
+                    !fabric
+                        .iter()
+                        .any(|candidate| candidate["name"] == tool["name"])
+                }));
+            }
+        }
+        assert_eq!(fabric[0]["inputSchema"]["properties"], json!({}));
+        assert_eq!(fabric[1]["inputSchema"]["required"], json!(["host_id"]));
+        assert_eq!(
+            fabric[2]["inputSchema"]["required"],
+            json!(["host_id", "session_id"])
+        );
+        assert_eq!(
+            fabric[0]["_meta"]["openai/ui"]["entrypoints"],
+            json!([{"type":"global"}])
+        );
+    }
+
+    #[test]
     fn gateway_generated_contract_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("gateway")
@@ -3079,7 +3143,18 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["host_list", "host_info", "alpha_tool", "beta_tool"]);
+        assert_eq!(
+            names,
+            [
+                "host_list",
+                "host_info",
+                "alpha_tool",
+                "beta_tool",
+                "fabric_overview",
+                "fabric_session_list",
+                "fabric_session_read"
+            ]
+        );
         assert_eq!(routed[2]["description"], "Fixture description");
         assert_eq!(
             routed[2]["inputSchema"]["properties"]["value"]["description"],

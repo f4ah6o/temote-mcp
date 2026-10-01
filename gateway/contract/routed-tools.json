@@ -1162,6 +1162,113 @@
         "type": "object"
       },
       "name": "stop_job"
+    },
+    {
+      "_meta": {
+        "openai/ui": {
+          "entrypoints": [
+            {
+              "type": "global"
+            }
+          ]
+        },
+        "ui": {
+          "resourceUri": "ui://temote-fabric/overview",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "icons": [
+        {
+          "mimeType": "image/svg+xml",
+          "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='3' y='2.5' width='14' height='6' rx='1.5'/%3E%3Crect x='3' y='11.5' width='14' height='6' rx='1.5'/%3E%3Cpath d='M6 5.5h.01M6 14.5h.01M10 5.5h4M10 14.5h4'/%3E%3C/svg%3E"
+        }
+      ],
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "fabric_overview"
+    },
+    {
+      "_meta": {
+        "ui": {
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "type": "object"
+      },
+      "name": "fabric_session_list"
+    },
+    {
+      "_meta": {
+        "ui": {
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "fabric_session_read"
     }
   ]
 }

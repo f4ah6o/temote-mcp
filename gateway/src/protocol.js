@@ -132,7 +132,7 @@ export function discoverResult(version) {
   return {
     resultType: "complete",
     supportedVersions: [MODERN_PROTOCOL_VERSION],
-    capabilities: { tools: { listChanged: false } },
+    capabilities: { tools: { listChanged: false }, resources: { listChanged: false, subscribe: false } },
     instructions:
       "This is one MCP gateway for multiple federated Temote hosts. Use host_list and session_list, then pass host_id with session_id. An unqualified session_id is accepted only when ownership is unambiguous.",
     ttlMs: 0,
