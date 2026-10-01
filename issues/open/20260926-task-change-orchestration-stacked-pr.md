@@ -1,11 +1,12 @@
 # Task / Change graph を orchestration と stacked PR delivery の source of truth にする
 
-Status: design ready / implementation not started  
+Status: design parent / D1 polished as `issues/polished/20261001-change-record-correlation.md`; D2-D4 remain  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/done/20260925-v2-vcs-workspace-contract.md`  
 Created: 2026-09-26 (Asia/Tokyo)
+Polished first packet: `issues/polished/20261001-change-record-correlation.md` (D1, ready)
 
 ## 1. Problem
 
