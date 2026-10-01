@@ -10,7 +10,7 @@ Branch: feat/fabric-web-dashboard
 PR: https://github.com/f4ah6o/temote-mcp/pull/88 (Draft; deployed acceptance blocked)
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`
 Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`
-Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`
+Observation plane: `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Related local viewer: `issues/done/20260914-local-activity-viewer.md`
 
 ## 1. Decision
