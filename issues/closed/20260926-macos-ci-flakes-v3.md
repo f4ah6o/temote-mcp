@@ -4,7 +4,7 @@ Status: closed — session-retention family fixed by merged PR #66; remaining Co
 Repository: `f4ah6o/temote-mcp`  
 Observed: 2026-09-26 (Asia/Tokyo)  
 Related PR: #59 (`feat: add jj-first VCS transaction core`)
-Triage (2026-09-27): PR #66 now owns the reproduced ENOTCONN/retention-determinism family. Keep this tracker open for the independent Codex restart-drain failure until it is reproduced/fixed or explicitly closed as non-recurrent.
+Historical triage (2026-09-27): PR #66 owned the reproduced ENOTCONN/retention-determinism family, while this tracker stayed open for the independent Codex restart-drain failure. On 2026-10-01 that residual was split into `issues/polished/20261001-codex-restart-drain-broken-pipe.md`, so this umbrella was closed.
 
 ## Summary
 
