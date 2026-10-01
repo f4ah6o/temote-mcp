@@ -1,6 +1,6 @@
 # A4: execution / verification / delivery 状態の分離
 
-Status: current-main port locally qualified; full host suite / CI pending; replaces PR #55
+Status: current-main port locally qualified; host-only gates / CI pending; replaces PR #55
 Repository: `f4ah6o/temote-mcp`
 Base: `main` `fada256`; branch: `integrate/a4-current-main`
 Parent issue: `issues/open/20260924-temote-development-harness-restructure.md` (PR #47)
@@ -178,5 +178,6 @@ mock / fixture だけで実サービス PASS を報告しない。
 - `cargo check --no-default-features --all-targets`: PASS (existing feature-gated unused warnings).
 - `cargo test --no-run`: PASS using `CARGO_INCREMENTAL=0 RUSTFLAGS="-C link-arg=-fuse-ld=bfd"`; the default lld link failed with undefined hidden symbols on this environment, including a retry without incremental compilation. No repository toolchain/linker policy was changed.
 - Focused outcome/backend compatibility and Cloud observer/migration tests: PASS.
-- Full `cargo test`: running at initial PR creation; do not treat this as PASS.
+- Full `cargo test`: interrupted explicitly (exit 130) after nested Linux host sandbox tests blocked; NOT PASS.
+- Repository-prescribed sandboxed test subset: PASS (`cargo test --lib --all-features --locked -- --skip sandbox::linux_tests`, and binary filters `activity_job`, `activity_coverage`, `upgrade_transaction::tests::`, `upgrade_coordinator::tests::`, `session_control::tests::session_gc`). Host-only sandbox/process acceptance remains NOT RUN to completion locally; CI must qualify it before merge.
 - Live backend acceptance: NOT RUN. Gateway runtime/protocol code unchanged; no new gateway test run.
