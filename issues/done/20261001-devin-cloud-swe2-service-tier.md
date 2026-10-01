@@ -1,10 +1,10 @@
 # DC1: finish capability-driven Devin Cloud SWE-2 service tier
 
-Status: ready / implementation already in draft PR #63; bring contract snapshots and gates green before merge
+Status: done — implementation already on main in `9151effc09367d925df64ce929105f9a8312a418`; draft PR #63 is superseded
 Repository: `f4ah6o/temote-mcp`
 Created: 2026-10-01 (Asia/Tokyo)
 Source backend: `issues/done/20260924-devin-cloud-backend.md`
-PR: #63 (`feat/20260926-devin-swe2-priority`)
+Historical PR: #63 (`feat/20260926-devin-swe2-priority`), superseded by the implementation already on main
 
 ## 1. Goal
 
@@ -32,7 +32,7 @@ The backend must preserve the requested effort and select a priority/fast accoun
 
 ## 3. Existing implementation state
 
-Draft PR #63 contains the implementation direction. Treat it as continuation work rather than restarting the feature. Review the current diff, resolve contract snapshot/fingerprint drift, and keep changes limited to the tier contract.
+Current main already contains the tier selection, generated contract, and schema-versioned start fingerprint. `start_request_fingerprint` preserves schema-v1 receipts without the tier key; replay uses the retained fingerprint version/effective mode before catalog discovery. Schema-v1 requests adding a new tier fail as `OPERATION_CONFLICT` before a side effect. `swe_priority_resolves_catalog_uid_and_replays_without_rediscovery`, `schema_v1_replay_rejects_new_swe_tier_before_side_effect`, and `observer_migration_promotes_legacy_record_and_preserves_start_replay_marker` cover these boundaries. Do not merge the older duplicate PR #63 over this implementation. Repository-local tests were not rerun during this documentation triage; live entitlement proof remains pending in the matrix.
 
 ## 4. Acceptance
 
@@ -40,11 +40,11 @@ Draft PR #63 contains the implementation direction. Treat it as continuation wor
 - [ ] `swe_tier=priority` resolves only a unique account-visible priority/fast UID compatible with the requested effort.
 - [ ] missing/ambiguous catalog fails closed; no guessed UID is sent.
 - [ ] non-SWE-2 mode + `swe_tier` is rejected.
-- [ ] operation fingerprint distinguishes service tier.
+- [ ] operation fingerprint distinguishes service tier while retaining exact replay for pre-tier schema-v1 receipts.
 - [ ] tool schema, gateway routed metadata/snapshots, docs, and fingerprints agree.
 - [ ] no secret-bearing catalog/auth data appears in status or ordinary output.
 - [ ] `cargo fmt --all -- --check` PASS.
-- [ ] focused Devin Cloud tests PASS.
+- [ ] focused Devin Cloud tests PASS, including legacy receipt replay after migration and rejection of a changed tier before remote side effects.
 - [ ] `cargo test` PASS.
 - [ ] `cargo clippy --all-targets -- -D warnings` PASS.
 - [ ] `cargo check --no-default-features --all-targets` PASS.
@@ -60,3 +60,7 @@ Do not keep this implementation packet open for entitlement-dependent proof afte
 - Reworking the already-landed Devin Cloud create/get/control backend.
 - Re-testing the generic suspended→resume lifecycle in repository-local tests only.
 - Changing Devin ACP cloud relay semantics.
+
+## 7. Triage disposition (2026-10-02)
+
+Archived because the implementation is already present on main, not because this triage reran every acceptance command. The checklist above preserves the original gate inventory. New regressions belong in a focused follow-up; account-dependent verification stays explicitly pending in the live matrix.

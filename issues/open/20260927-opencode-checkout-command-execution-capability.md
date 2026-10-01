@@ -9,6 +9,8 @@ Triage: this is not a duplicate of bare-repository provisioning. The bare-repo i
 
 Polished child packet: `issues/polished/20260927-opencode-task-preflight-capability-blockers.md` (OC1, ready)。preflight / blocker 分類のみを先に実装し、実際の checkout provisioning は Phase F/C 側に残す。
 
+Current-main evidence (2026-10-02): `src/opencode_server.rs::serve_permission_config` explicitly denies the OpenCode V2 `shell` capability for `*`. A fix must provide workspace-scoped execution with protected-state, cwd, approval, and containment boundaries; simply deleting the deny rule is not sufficient. This preserves the source evidence from PR #74.
+
 ## Summary
 
 OpenCode を実装に使うには、Temote 側で対象 repository の checkout と command-execution capability を事前に用意する必要がある。

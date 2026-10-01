@@ -8,7 +8,7 @@ Related: `issues/polished/20261001-agent-child-cleanup-retry-and-provider-aggreg
 
 ## 1. Goal
 
-A non-terminal Codex/OpenCode task record must remain discoverable and recoverable through the supported task lifecycle when its provider child runtime exits or cleanup is retried. Runtime loss must not turn durable task metadata into an inaccessible orphan.
+A non-terminal Codex/OpenCode/Devin ACP task record must remain discoverable and recoverable through the supported task lifecycle when its provider child runtime exits or cleanup is retried. Runtime loss must not turn durable task metadata into an inaccessible orphan.
 
 ## 2. Confirmed risk
 
@@ -29,7 +29,7 @@ The source investigation found that non-terminal durable records can outlive the
 
 ## 4. Scope
 
-Implement the smallest common behavior needed by Codex/OpenCode retained task APIs. Avoid adding a new generic execution API in this packet.
+Implement the smallest common behavior needed by Codex/OpenCode/Devin ACP retained task APIs. Avoid adding a new generic execution API in this packet.
 
 ## 5. Acceptance
 
@@ -43,7 +43,7 @@ Implement the smallest common behavior needed by Codex/OpenCode retained task AP
 
 ## 6. Tests
 
-Add focused crash/runtime-loss fixtures for Codex and OpenCode, including same-id replacement isolation, then run:
+Add focused crash/runtime-loss fixtures for Codex, OpenCode, and Devin ACP, including same-id replacement isolation, then run:
 
 - [ ] focused retained-task recovery tests PASS
 - [ ] `cargo fmt --all -- --check` PASS
@@ -56,4 +56,4 @@ Add focused crash/runtime-loss fixtures for Codex and OpenCode, including same-i
 
 - General task waiting/polling optimization.
 - New cross-backend task migration.
-- Devin lifecycle behavior without a verified equivalent defect.
+- Attributing the historical Devin incident to the verified equivalent source defect without incident evidence.
