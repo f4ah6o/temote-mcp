@@ -24,7 +24,7 @@ Fixes applied:
   - §12 Phase S1: caller-supplied `operation_id` ownership + Accepted receipt before the first side effect + pinned revision recorded on the receipt.
   - §14 S3a: clarified that the caller surface exposes the retry semantics while receipt durability is established in S1, not deferred to S3a.
   - §15: added the retry acceptance bullet plus the eight scenario-level acceptance test specifications (lost response, concurrent resend, conflicting resend, crash after Accepted receipt, crash before Completed receipt, retry after remote base update, cross-caller key reuse, explicit new key). These are test specifications, not executed-test claims.
-- `issues/open/20260927-instruction-side-bare-repo-provisioning.md`
+- `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`
   - §4: `operation_id` added to the composed `session_start` example; the operation's retry semantics now reference parent §5.3, with `ensure_repository` participating in the session provisioning operation's receipt.
   - §8 P1: idempotency bullet restated in terms of the shared contract.
 
@@ -75,4 +75,4 @@ Commands and results (`gh git` / gh-git extension is not installed on this machi
 - Prior "`git diff --check`: clean" line: removed. It was read from an empty working-tree diff after committing and never covered the PR diff; it is not carried forward as a verified result.
 - NOT RUN: doc lint / link check (no such tooling in this repo); Rust unit/integration tests, host/macOS gates, provisioning E2E — docs-only change; the added test lists are acceptance specifications for implementation packets, not executed tests.
 
-Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/polished/20260929-s0a-typed-session-source-contract.md`, `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `issues/polished/20260929-s0a-contract-conformance.md` (new conformance packet), this record.
+Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/polished/20260929-s0a-typed-session-source-contract.md`, `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/polished/20260929-s0a-contract-conformance.md` (new conformance packet), this record.
