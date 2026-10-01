@@ -138,6 +138,9 @@ Fabric derives repository keys from supported Git forge metadata; local paths an
 
 Operators can inspect a session's journal directly with the owner-only `temote-mcp observation list|get|status <session_id>` debug command; `--include-content` is opt-in and raw records never leave the local surface.
 
+Every task view returned by the delegation backends keeps the backend execution `status` and adds three separated states: `execution` (the stable id and generation of the current execution of the logical task), `verification` (`not_run` / `passed` / `failed`, bound to the task record revision the result was recorded against), and `delivery` (`not_started` / `pending` / `submitted` / `merged` / `closed` / `failed`). A `completed` execution is not a verification pass: until a result applies to the current revision, `verification.status` stays `not_run`, and a result from an older revision is reported as `stale: true` with its previous target instead of a current PASS. Delivery is set only by a recorded delivery operation; pull requests reported by an agent do not set it. Records written before these fields existed read as `not_run` / `not_started`.
+
+
 ### Experimental Codex tasks
 
 The opt-in `codex_status`, `codex_task_start`, `codex_task_get`, and `codex_task_control` tools connect to a local `codex app-server --stdio` and accept only the named status/task operations. Temote does not pin compatibility to a Codex app-server version string. The initialize response is bounded and shape-checked, the app-server version is reported only as best-effort diagnostic metadata when it can be parsed, and compatibility is enforced by validating the concrete `model/list`, `thread/*`, and `turn/*` requests and responses that Temote actually uses. A task is owned by the complete session instance and its canonical working directory, so it cannot be resumed from another session, process generation, or scope.

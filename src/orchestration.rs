@@ -12,6 +12,7 @@
 //! raw input is validated onto it (including backend-specific options and
 //! unsupported actions) before any approval prompt or backend side effect.
 
+pub(crate) mod outcome;
 mod requests;
 
 use std::collections::BTreeMap;

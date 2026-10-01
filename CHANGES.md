@@ -22,6 +22,8 @@
 
 ### Changed
 
+- Delegation task views (`*_task_get` / `task_list`) now report `execution`, `verification`, and `delivery` as separate states: a completed execution is not a verification PASS, a verification result applies only to the task record revision it was recorded against (older results are reported as `not_run` with `stale: true`), and delivery stays `not_started` until a delivery operation records it. Records written before these fields existed read as `not_run` / `not_started`. ([task state separation](issues/open/20260925-a4-task-state-separation.md))
+
 - Devin Cloud retained task records use schema 3 for durable observation ownership; older binaries reject promoted records, so Host rollback needs a compatible reader or reviewed record recovery. OpenCode metadata reads are bounded and refuse redirects. ([Fabric dashboard](issues/done/20260929-fabric-web-dashboard.md))
 - Dogfood comparisons accept completed, verified issue work without requiring a measured Temote improvement; reports distinguish `improved`, `unchanged`, and `regressed`, while regressions and missing acceptance evidence remain blocked.
 - Supervisor upgrades now coordinate session restore, direct-ingress recovery, endpoint checks, and binary-owned Codex plugin reconciliation before reporting terminal status.

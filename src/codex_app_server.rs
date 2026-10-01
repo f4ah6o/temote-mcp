@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::orchestration::outcome::{self, DeliveryRecord, VerificationRecord};
 use crate::pending_interaction::{
     InteractionType, PendingInteractionSummary, ProducerKind, REFRESH_INTERVAL_SECS, Summary,
     SummaryState,
@@ -443,6 +444,10 @@ struct TaskRecord {
     pending_interaction: Option<PendingInteractionSummary>,
     created_at: u64,
     updated_at: u64,
+    #[serde(default)]
+    verification: Option<VerificationRecord>,
+    #[serde(default)]
+    delivery: Option<DeliveryRecord>,
     operations: Vec<OperationReceipt>,
     #[serde(default)]
     operation_tombstones: Vec<OperationTombstone>,
@@ -1483,6 +1488,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
         canonical == record.scope_cwd,
         "Codex task scope is not canonical"
     );
+    if let Some(verification) = &record.verification {
+        verification.validate()?;
+    }
+    if let Some(delivery) = &record.delivery {
+        delivery.validate()?;
+    }
     validate_argument(&record.model, "model")?;
     validate_argument(&record.effort, "effort")?;
     anyhow::ensure!(record.revision > 0, "Codex task revision must be positive");
@@ -1629,6 +1640,9 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "status": record.status.as_str(),
         "revision": record.revision,
         "generation": record.generation,
+        "execution": outcome::execution_view(record.task_id, record.generation, record.status.as_str()),
+        "verification": outcome::verification_view(record.verification.as_ref(), record.revision),
+        "delivery": outcome::delivery_view(record.delivery.as_ref()),
         "model": record.model,
         "effort": record.effort,
         "thread_id": record.thread_id,
@@ -3566,6 +3580,8 @@ pub(crate) fn seed_completed_task_for_test(
         pending_interaction: None,
         created_at: now,
         updated_at: now,
+        verification: None,
+        delivery: None,
         operations: Vec::new(),
         operation_tombstones: Vec::new(),
     };
@@ -3698,6 +3714,8 @@ where
         pending_interaction: None,
         created_at: now,
         updated_at: now,
+        verification: None,
+        delivery: None,
         operations: Vec::new(),
         operation_tombstones: Vec::new(),
     };
@@ -5107,6 +5125,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
@@ -5241,6 +5261,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: vec![OperationReceipt {
                 operation_id,
                 request_fingerprint: fingerprint(&json!({"task":"prompt-secret-marker"})).unwrap(),
@@ -5726,6 +5748,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         };
@@ -5782,6 +5806,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: vec![OperationReceipt {
                 operation_id,
                 request_fingerprint: fp,
@@ -6914,6 +6940,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: vec![OperationReceipt {
                 operation_id,
                 request_fingerprint,
@@ -7341,6 +7369,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         };
@@ -7409,6 +7439,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         };
@@ -7495,6 +7527,8 @@ for raw in sys.stdin:
             pending_interaction: None,
             created_at: config::unix_time(),
             updated_at: config::unix_time(),
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         };
@@ -9008,5 +9042,134 @@ for raw in sys.stdin:
                 .to_string(),
             "task_list limit must be an integer"
         );
+    }
+
+    // ---------- separated execution / verification / delivery state (A4) ----------
+
+    fn passed_verification_at(record_revision: u64) -> VerificationRecord {
+        VerificationRecord {
+            status: outcome::VerificationStatus::Passed,
+            target: outcome::VerificationTarget::Commit {
+                commit: "abc123".to_owned(),
+            },
+            record_revision,
+            checked_at: 1_700_000_000,
+        }
+    }
+
+    fn submitted_delivery() -> DeliveryRecord {
+        DeliveryRecord {
+            status: outcome::DeliveryStatus::Submitted,
+            branch: Some("feat/a4".to_owned()),
+            pull_request: Some("https://example.invalid/pr/1".to_owned()),
+            updated_at: 1_700_000_001,
+        }
+    }
+
+    #[test]
+    fn task_view_separates_execution_from_verification_and_delivery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "state-separation", true);
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Completed,
+            3,
+            Some("thread-1"),
+            Some("turn-1"),
+        );
+
+        // A completed execution alone is not a verification PASS and not a
+        // delivery.
+        let view = task_view(&record, None);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["execution"]["state"], "completed");
+        assert_eq!(view["execution"]["generation"], record.generation);
+        assert_eq!(
+            view["execution"]["id"],
+            outcome::execution_id(task_id, record.generation).to_string()
+        );
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["verification"]["stale"], false);
+        assert_eq!(view["delivery"]["status"], "not_started");
+
+        // Recorded states are reported verbatim while they apply.
+        record.verification = Some(passed_verification_at(record.revision));
+        record.delivery = Some(submitted_delivery());
+        let view = task_view(&record, None);
+        assert_eq!(view["verification"]["status"], "passed");
+        assert_eq!(view["verification"]["stale"], false);
+        assert_eq!(view["delivery"]["status"], "submitted");
+        assert_eq!(view["delivery"]["branch"], "feat/a4");
+    }
+
+    #[test]
+    fn legacy_records_without_outcome_fields_read_as_not_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "legacy-state", true);
+        let record = task_record(
+            &owner,
+            Uuid::new_v4(),
+            TaskStatus::Completed,
+            3,
+            Some("thread-1"),
+            Some("turn-1"),
+        );
+
+        // Current records write both fields, and a pre-A4 record without
+        // them deserializes through the serde defaults: no migration step.
+        let mut value = serde_json::to_value(&record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("verification").is_some());
+        assert!(object.remove("delivery").is_some());
+        let legacy: TaskRecord = serde_json::from_value(value).unwrap();
+        assert!(legacy.verification.is_none());
+        assert!(legacy.delivery.is_none());
+
+        let view = task_view(&legacy, None);
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["delivery"]["status"], "not_started");
+    }
+
+    #[test]
+    fn stale_verification_is_not_reported_as_a_current_pass() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "stale-state", true);
+        let mut record = task_record(
+            &owner,
+            Uuid::new_v4(),
+            TaskStatus::Completed,
+            3,
+            Some("thread-1"),
+            Some("turn-1"),
+        );
+        record.verification = Some(passed_verification_at(2));
+
+        let view = task_view(&record, None);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["verification"]["stale"], true);
+        assert_eq!(view["verification"]["record_revision"], 2);
+        assert_eq!(
+            view["verification"]["target"]["commit"], "abc123",
+            "the stale result stays visible without being a current PASS"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_out_of_contract_outcome_records() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "invalid-state", true);
+        let mut record = task_record(&owner, Uuid::new_v4(), TaskStatus::Completed, 3, None, None);
+        record.verification = Some(VerificationRecord {
+            status: outcome::VerificationStatus::Passed,
+            target: outcome::VerificationTarget::Commit {
+                commit: String::new(),
+            },
+            record_revision: 3,
+            checked_at: 1_700_000_000,
+        });
+        assert!(validate_record(&record).is_err());
     }
 }
