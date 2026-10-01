@@ -27,6 +27,10 @@ jobs:
       - name: Install pinned gateway tooling
         run: npm ci --prefix gateway
 
+      - name: Install Chromium and system dependencies
+        working-directory: gateway
+        run: npx playwright install --with-deps chromium
+
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
 

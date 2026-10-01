@@ -5,8 +5,9 @@ import { startFabricFixture } from "./fabric-app-fixture.mjs";
 
 test("real MCP Apps SDK initializes in an iframe, uses initial data, and supports selection, refresh, theme and partial failures", async () => {
   const fixture = await startFabricFixture();
-  const browser = await chromium.launch({ headless: true });
+  let browser;
   try {
+    browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
@@ -41,15 +42,19 @@ test("real MCP Apps SDK initializes in an iframe, uses initial data, and support
     }
     assert.deepEqual(errors, []);
   } finally {
-    await browser.close();
-    await fixture.close();
+    try {
+      await browser?.close();
+    } finally {
+      await fixture.close();
+    }
   }
 });
 
 test("automatic refresh observes foreground and background intervals without an initial duplicate call", async () => {
   const fixture = await startFabricFixture();
-  const browser = await chromium.launch({ headless: true });
+  let browser;
   try {
+    browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
     await page.clock.install();
     await page.goto(fixture.url);
@@ -66,7 +71,10 @@ test("automatic refresh observes foreground and background intervals without an 
     await page.clock.runFor(200);
     assert.equal(await page.evaluate(() => window.fabricHarness.calls.length), 2);
   } finally {
-    await browser.close();
-    await fixture.close();
+    try {
+      await browser?.close();
+    } finally {
+      await fixture.close();
+    }
   }
 });
