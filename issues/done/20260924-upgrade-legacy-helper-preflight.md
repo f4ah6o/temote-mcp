@@ -63,4 +63,4 @@ Implementation: PR #40 / merge commit `2513117a6812fb79e521a6faac4003d4fcda5c41`
 
 ## Archived from open (2026-10-01)
 
-Implementation and repository validation landed in PR #40. The issue stays open only because the destructive/live acceptance on the host with the legacy supervisor has not been recorded yet. Do not redo the merged code work; next action is the documented `upgrade --dry-run` → `upgrade` → session/ingress health verification on an explicitly accepted host.
+Implementation and repository validation landed in PR #40. The only remaining work is destructive/live acceptance on a host with the legacy supervisor, now tracked in `issues/open/20260908-live-acceptance-matrix.md`. Do not redo the merged code work; the live matrix owns the documented `upgrade --dry-run` → `upgrade` → session/ingress health verification on an explicitly accepted host.
