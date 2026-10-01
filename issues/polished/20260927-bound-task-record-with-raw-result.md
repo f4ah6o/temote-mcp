@@ -1,6 +1,6 @@
 # Keep completed task records within the storage limit when retaining raw results
 
-Status: open
+Status: ready
 Model: gpt-6-sol
 Created: 2026-09-27
 Updated: 2026-09-27
@@ -12,7 +12,7 @@ Completed OpenCode and Devin ACP tasks retain a bounded raw final reply. Verify 
 
 ## 背景
 
-The result-recovery implementation is recorded in [the malformed-report issue](20260927-completed-task-malformed-final-report-json.md) and [the dogfood log](../../docs/dogfood-20260927.md). Independent OpenCode review found that the new 16 KiB `raw_result` shares a 64 KiB JSON record with report, usage, operation receipts, and operation tombstones. This is a static risk finding; no oversize failure has been reproduced.
+The result-recovery implementation is recorded in [the malformed-report issue](../done/20260927-completed-task-malformed-final-report-json.md) and [the dogfood log](../../docs/dogfood-20260927.md). Independent OpenCode review found that the new 16 KiB `raw_result` shares a 64 KiB JSON record with report, usage, operation receipts, and operation tombstones. This is a static risk finding; no oversize failure has been reproduced.
 
 ## 問題
 
@@ -57,3 +57,8 @@ An implementation that merely drops old operation IDs could permit duplicate mut
 ## 注記
 
 The dogfood review identified this edge case without a live failure. Preserve that distinction when prioritizing the issue.
+
+
+## Polish decision (2026-10-01)
+
+This is implementation-ready as a single bounded packet: first reproduce the size boundary with maximal valid records, then make the smallest persistence change only if overflow is reachable. Preserve operation replay protection and the scoped-evidence boundary. The issue records a static risk, not a reproduced production failure; tests must preserve that distinction.

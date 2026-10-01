@@ -1,6 +1,6 @@
 # 旧 supervisor からの upgrade で helper 世代判定が unavailable になる
 
-Status: open — implementation merged in PR #40; live-host handoff validation remains
+Status: done — implementation merged in PR #40; destructive/live-host handoff validation is centralized in `issues/open/20260908-live-acceptance-matrix.md`
 Model: openai/gpt-6-sol
 Created: 2026-09-24
 Updated: 2026-09-24
@@ -61,6 +61,6 @@ Implementation: PR #40 / merge commit `2513117a6812fb79e521a6faac4003d4fcda5c41`
 関連: `issues/done/20260916-upgrade-helper-generation-preflight.md`、`docs/managed-sessions.ja.md`。
 
 
-## Triage update (2026-09-27)
+## Archived from open (2026-10-01)
 
-Implementation and repository validation landed in PR #40. The issue stays open only because the destructive/live acceptance on the host with the legacy supervisor has not been recorded yet. Do not redo the merged code work; next action is the documented `upgrade --dry-run` → `upgrade` → session/ingress health verification on an explicitly accepted host.
+Implementation and repository validation landed in PR #40. The only remaining work is destructive/live acceptance on a host with the legacy supervisor, now tracked in `issues/open/20260908-live-acceptance-matrix.md`. Do not redo the merged code work; the live matrix owns the documented `upgrade --dry-run` → `upgrade` → session/ingress health verification on an explicitly accepted host.

@@ -21,7 +21,7 @@ bare-repository work remain separate.
 
 Code inspection confirmed O1/O2 and C0/C1. Cloud context only exposed a binding
 readiness helper; C2-C5 were not implemented. The canonical contract is
-`issues/open/20260926-cloud-observation-knowledge-plane.md`.
+`issues/done/20260926-cloud-observation-knowledge-plane.md`.
 
 ## Baseline
 

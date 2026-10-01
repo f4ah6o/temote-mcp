@@ -1,10 +1,10 @@
 # macOS CI flakes observed during V3 VCS adapter work
 
-Status: open — retention/parity family has a fix in PR #66; Codex restart-drain `Broken pipe` remains open  
+Status: closed — session-retention family fixed by merged PR #66; remaining Codex restart-drain flake split to `issues/polished/20261001-codex-restart-drain-broken-pipe.md`
 Repository: `f4ah6o/temote-mcp`  
 Observed: 2026-09-26 (Asia/Tokyo)  
 Related PR: #59 (`feat: add jj-first VCS transaction core`)
-Triage (2026-09-27): PR #66 now owns the reproduced ENOTCONN/retention-determinism family. Keep this tracker open for the independent Codex restart-drain failure until it is reproduced/fixed or explicitly closed as non-recurrent.
+Historical triage (2026-09-27): PR #66 owned the reproduced ENOTCONN/retention-determinism family, while this tracker stayed open for the independent Codex restart-drain failure. On 2026-10-01 that residual was split into `issues/polished/20261001-codex-restart-drain-broken-pipe.md`, so this umbrella was closed.
 
 ## Summary
 
@@ -92,3 +92,8 @@ Likely investigation area, not yet confirmed:
 Run the two focused tests repeatedly on macOS before and after a fix, then run the normal full CI matrix.
 
 Do not treat a single rerun PASS as proof that either underlying race is fixed.
+
+
+## Triage closure (2026-10-01)
+
+PR #66 is merged and owns the reproduced session-retention/parity family. The independent Codex restart-drain EPIPE observation is now a focused polished packet. This umbrella no longer needs to occupy the open queue.

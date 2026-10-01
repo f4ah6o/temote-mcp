@@ -9,10 +9,10 @@ Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
 
 - `issues/open/20260922-agent-server-backends-cli-deprecation.md` (server-primary backend umbrella)
-- `issues/open/20260923-devin-acp-backend.md`
-- `issues/open/20260924-devin-cloud-backend.md`
+- `issues/done/20260923-devin-acp-backend.md`
+- `issues/done/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
-- `issues/open/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
+- `issues/done/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
 - `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/open/20260929-session-first-managed-provisioning.md` (session-first repository source -> managed workspace provisioning; path is not session identity)
@@ -627,7 +627,7 @@ A / O / B と F1 の repository identity・freshness・no-local-main の generic
 - [x] O0: observation boundary / raw-vs-derived authority / worker / Context Resolver contract
 - [x] O1: common orchestration boundary の owner-only observation journal。bounded JSONL + reference-first content + idempotent append
 - [x] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + observed task/execution/verification state で local head switch を成立
-- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Temote Fabric ingest -> D1 -> Queue worker とする
+- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/done/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Temote Fabric ingest -> D1 -> Queue worker とする
 - [ ] O4: knowledge-aware Context Resolver。Temote Fabric は D1 projection を利用し、host offline でも last synced revision まで provenance 付き repository context を返す
 - [ ] worker failure / stale projection を task failure に読み替えず、last processed observation revision を明示する
 

@@ -1,6 +1,6 @@
 # Add instruction-side bare repository provisioning flow
 
-Status: superseded as caller-flow architecture by `issues/open/20260929-session-first-managed-provisioning.md`; retained as RepositoryStore adapter/provisioning child requirements  
+Status: closed — caller-flow architecture superseded by `issues/open/20260929-session-first-managed-provisioning.md`; this document is retained as historical RepositoryStore provisioning design
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)
 

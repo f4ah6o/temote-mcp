@@ -3,11 +3,13 @@
 Status: open — confirmed task-provisioning gap  
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)  
-Related: `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260925-v2-vcs-workspace-contract.md`
+Related: `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260925-v2-vcs-workspace-contract.md`
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.
 
 Polished child packet: `issues/polished/20260927-opencode-task-preflight-capability-blockers.md` (OC1, ready)。preflight / blocker 分類のみを先に実装し、実際の checkout provisioning は Phase F/C 側に残す。
+
+Current-main evidence (2026-10-02): `src/opencode_server.rs::serve_permission_config` explicitly denies the OpenCode V2 `shell` capability for `*`. A fix must provide workspace-scoped execution with protected-state, cwd, approval, and containment boundaries; simply deleting the deny rule is not sufficient. This preserves the source evidence from PR #74.
 
 ## Summary
 

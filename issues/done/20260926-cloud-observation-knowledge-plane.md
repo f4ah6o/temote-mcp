@@ -1,6 +1,6 @@
 # O3C: Temote Fabric shared observation / knowledge plane
 
-Status: C0-C5 locally implemented and qualified; Cloudflare remote NOT RUN; optional C6 remains open
+Status: done — C0-C5 locally implemented and qualified; Cloudflare remote acceptance moved to the live matrix; optional C6 deferred separately
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
@@ -986,3 +986,10 @@ This packet does not add:
 
 Temote Fabric は「仕事をする場所」ではなく、host-independent observation / context continuity の authenticated shared substrate になる。
 Execution authority は host に残し、D1 knowledge は provenance 付きの rebuildable projection とする。
+
+
+## Triage closure (2026-10-01)
+
+C0-C5 are implemented and locally qualified. The remaining Cloudflare-account deployment and remote E2E require external bindings/credentials and are tracked only in `issues/open/20260908-live-acceptance-matrix.md`.
+
+Optional C6 (R2 Tier 2 large-content storage) is not required for C0-C5 continuity and is deferred in `issues/closed/20261001-fabric-r2-tier2-content-store.md` until there is a concrete need for cloud-eligible large content. This parent therefore no longer belongs in the actionable open queue.

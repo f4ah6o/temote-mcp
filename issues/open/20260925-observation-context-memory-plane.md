@@ -1,13 +1,17 @@
 # O0: head-independent observation / context / memory plane
 
-Status: high-priority / O1–O4 locally implemented and qualified; Cloudflare remote NOT RUN
+Status: open umbrella — O1–O4 locally implemented/qualified; direct-agent prompt ingress O1P remains; Cloudflare remote acceptance is centralized in the live matrix
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
-Cloud extension: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
+Cloud extension: `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Fabric naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
 Created: 2026-09-25 (Asia/Tokyo)
+
+## 0. 2026-10-01 triage
+
+Keep this parent open only as the observation/context umbrella. Core O1–O4 repository-local work is complete; the implemented Fabric cloud extension is archived at `issues/done/20260926-cloud-observation-knowledge-plane.md`, and deployment/credential-dependent proof lives in `issues/open/20260908-live-acceptance-matrix.md`. The actionable new gap is direct-agent user-prompt coverage in `issues/open/20261001-agent-prompt-observation-ingress.md`, whose first local-ingress packet is already polished.
 
 ## 1. Goal
 
@@ -481,7 +485,7 @@ Authority:
 - Cloud observation: sanitized replicated observation, execution authority ではない
 - Knowledge: derived / rebuildable projection
 
-O3/O4 の shared plane は Temote Fabric とする。`issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、現行 Cloudflare Gateway deployment を拡張して Fabric へ移行する。
+O3/O4 の shared plane は Temote Fabric とする。`issues/done/20260926-cloud-observation-knowledge-plane.md` に従い、現行 Cloudflare Gateway deployment を拡張して Fabric へ移行する。
 
 初期 cloud layout:
 
@@ -580,7 +584,7 @@ Memory Worker が未実装でも、過去の instruction と verified state を�
 ### O3 — Memory Worker
 
 Prerequisite: O1 + O2。
-Cloud shared implementation / replication / D1 / Queue contract は `issues/open/20260926-cloud-observation-knowledge-plane.md` を canonical child packet とする。
+Cloud shared implementation / replication / D1 / Queue contract は `issues/done/20260926-cloud-observation-knowledge-plane.md` を canonical child packet とする。
 
 - [x] worker checkpoint
 - [x] batch read

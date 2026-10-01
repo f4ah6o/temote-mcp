@@ -1,6 +1,6 @@
 # Codex app-server: related tasks should optionally continue an existing conversation thread
 
-Status: open — polished child packet: `issues/polished/20260927-codex-task-conversation-continuation.md` (CC1, ready)
+Status: closed — superseded by bounded implementation packet `issues/polished/20260927-codex-task-conversation-continuation.md` (CC1, ready)
 Created: 2026-09-25 (Asia/Tokyo)  
 Repository: `f4ah6o/temote-mcp`  
 Related:
@@ -226,3 +226,8 @@ When implemented, report separately:
 - tests executed and PASS / FAIL / NOT RUN
 - live Codex acceptance if actually executed
 - final git status and delivery commit/PR
+
+
+## Triage closure (2026-10-01)
+
+The design has been fully transferred to CC1, including conversation fencing, atomic successor claim, ownership checks, idempotent replay, and focused tests. Keep implementation work in the polished child rather than duplicating an open source-design tracker.

@@ -11,7 +11,7 @@ Related:
 - `skills/temote-mcp/SKILL.md` (current operating guidance and friction feedback)
 - `issues/open/20260924-temote-development-harness-restructure.md` (umbrella development-harness architecture)
 - `issues/open/20260925-observation-context-memory-plane.md`
-- `issues/open/20260926-cloud-observation-knowledge-plane.md`
+- `issues/done/20260926-cloud-observation-knowledge-plane.md`
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 - `issues/open/20260927-bounded-wait-for-delegated-tasks.md`
 

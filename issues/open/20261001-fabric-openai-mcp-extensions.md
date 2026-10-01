@@ -6,7 +6,7 @@ Related:
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 - `issues/open/20260924-temote-development-harness-restructure.md`
 - `issues/open/20260925-observation-context-memory-plane.md`
-- `issues/open/20260926-cloud-observation-knowledge-plane.md`
+- `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Created: 2026-10-01 (Asia/Tokyo)
 
 ## 0. Current implementation boundary (2026-10-02)

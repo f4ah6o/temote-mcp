@@ -12,7 +12,7 @@ Related:
 - `issues/open/20260925-vcs-transaction-jj-first.md`
 - `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-named-root-workspace-identity.md`
-- `issues/open/20260927-instruction-side-bare-repo-provisioning.md`
+- `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`
 - `issues/open/20260926-task-change-orchestration-stacked-pr.md`
 - `issues/polished/20260929-s0a-typed-session-source-contract.md` (first behavior-preserving implementation packet)
 

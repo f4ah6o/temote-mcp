@@ -2,15 +2,15 @@
 
 ## Status
 
-open — core backend implemented and live-tested; suspended→resume and SWE-2 tier follow-up remain
+done — core backend implemented and live-tested; suspended→resume moved to live matrix; SWE-2 tier already implemented on main
 
 Model: coordinator decision (f4ah6o)
 Created: 2026-09-24 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
-Related: `issues/open/20260923-devin-acp-backend.md` (local `devin acp`; 別系統)
-SWE-2 service-tier follow-up: PR #63 (`swe_tier=promo|priority`; current draft must regain green contract snapshots before merge)
-Triage (2026-09-27): keep open for the remaining live suspended→resume case and the SWE-2 tier follow-up; core create/get/control live acceptance is already recorded below.
+Related: `issues/done/20260923-devin-acp-backend.md` (local `devin acp`; 別系統)
+SWE-2 service tier: implemented on main in `9151eff`; PR #63 is an older duplicate. Legacy start fingerprints and changed-tier rejection are preserved; live entitlement proof remains pending.
+Historical triage (2026-09-27): this was kept open for the live suspended→resume case and SWE-2 tier follow-up. On 2026-10-01, live-only acceptance moved to the live matrix and the core backend was archived. On 2026-10-02, DC1 was also archived after confirming the tier implementation was already on main.
 
 ## Decision
 
@@ -90,3 +90,13 @@ session はその organization の ACU / credit を消費するため、subscrip
 - hosted session が `waiting_for_approval` のとき、Temote-local approval console へ橋渡しするか
   (現状は task status として表面化するのみ。承認は Devin web/Slack 側で行う)。
 - `repos` の secret-scanning / allowlist (現状は文字列長のみ検証)。
+
+
+## Triage closure (2026-10-01)
+
+The Devin Cloud API-v3 backend itself is implemented and has recorded live create/get/control/interrupt evidence. Remaining work is no longer one backend issue:
+
+- entitlement/live lifecycle residuals stay in `issues/open/20260908-live-acceptance-matrix.md`;
+- SWE-2 service-tier implementation is `issues/done/20261001-devin-cloud-swe2-service-tier.md` and was already implemented on main; draft PR #63 is superseded.
+
+Do not reopen this core backend issue for those independent residuals.

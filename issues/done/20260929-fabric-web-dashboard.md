@@ -1,6 +1,6 @@
 # Fabric Dashboard: Zero Trust 配下の `/dash` Web dashboard
 
-Status: open / implemented locally; deployed acceptance blocked
+Status: done — implementation merged in PR #88; deployed Zero Trust E2E is centralized in `issues/open/20260908-live-acceptance-matrix.md`
 Repository: `f4ah6o/temote-mcp`
 Priority: P1 operator visibility
 Created: 2026-09-29 (Asia/Tokyo)
@@ -10,7 +10,7 @@ Branch: feat/fabric-web-dashboard
 PR: https://github.com/f4ah6o/temote-mcp/pull/88 (Draft; deployed acceptance blocked)
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`
 Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`
-Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`
+Observation plane: `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Related local viewer: `issues/done/20260914-local-activity-viewer.md`
 
 ## 1. Decision
@@ -1114,6 +1114,6 @@ Platform-specific behavior must be rechecked when implementation starts; repo se
 
 ## 17. Implementation tracking
 
-D0–D4 implementation and gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. This issue remains open until all acceptance gates are evidenced. Deployed acceptance and independent PR review are separate from local tests.
+D0–D3 implementation and repository-local gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. Deployed D4 / Zero Trust acceptance is now tracked centrally in `issues/open/20260908-live-acceptance-matrix.md`; this implementation issue is done. Deployed acceptance remains separate from local tests.
 
 D0–D3 code and local regression gates pass. Checked §14 items denote local implementation/test evidence, not deployed or independent approval. Same-deployment identity, Access edge acceptance, and deployed Zero Trust E2E remain unchecked pending approved candidate Worker/Host rollout and browser login. The acceptance matrix contains layer-specific results and the operator rerun.
