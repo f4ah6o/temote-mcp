@@ -1,13 +1,21 @@
 # Fabric: standard MCP core + OpenAI MCP Extensions adapter
 
-Status: proposed / implementation to land on the accompanying draft PR  
-Repository: `f4ah6o/temote-mcp`  
+Status: active design umbrella — initial read-only adapter landed via PR #90; later phases remain open
+Repository: `f4ah6o/temote-mcp`
 Related:
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 - `issues/open/20260924-temote-development-harness-restructure.md`
 - `issues/open/20260925-observation-context-memory-plane.md`
 - `issues/open/20260926-cloud-observation-knowledge-plane.md`
 Created: 2026-10-01 (Asia/Tokyo)
+
+## 0. Current implementation boundary (2026-10-02)
+
+PR #90 is already merged. It adds an optional read-only Fabric MCP App while retaining the custom standard protocol adapter; see `docs/fabric-dashboard.md`. This PR now delivers the design umbrella, not a second runtime implementation branch. Do not interpret the phase checklist as a report that no implementation exists. Mentions, settings, and interaction UI remain future work.
+
+Platform support must be tracked per feature and client version. The upstream Web table refers to ChatGPT Work and excludes classic ChatGPT; composer mentions and form elicitation have platform limitations. Repository fixtures and Chromium harnesses do not prove live ChatGPT, Devin, or OpenCode compatibility.
+
+For every extension, record the exact advertisement/negotiation seam and standard fallback. Discovery-only calls must not persist a caller capability globally or leak it across authenticated callers. Metadata changes must either preserve the existing fingerprint inputs with a separately versioned extension contract, or deliberately version and regenerate the public contract. UI resource/tools/call authorization uses the same owner/scope boundary; entrypoint visibility is never approval authority.
 
 ## 1. Goal
 
