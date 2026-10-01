@@ -4,7 +4,7 @@ Status: open / design parent — P0+P1 polished as `issues/polished/20261001-age
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
-Related: `issues/open/20260925-agent-conversation-continuation.md`  
+Related: `issues/closed/20260925-agent-conversation-continuation.md`  
 Created: 2026-10-01 (Asia/Tokyo)
 
 ## 0. Triage / next packet
