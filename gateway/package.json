@@ -9,12 +9,19 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:preflight": "node scripts/deployment-preflight.mjs",
-    "deploy:dry-run": "wrangler deploy --dry-run"
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "build:app": "node scripts/build-fabric-app.mjs",
+    "check:app": "node scripts/build-fabric-app.mjs --check",
+    "pretest": "npm run check:app"
   },
   "devDependencies": {
     "@mizchi/vlmkit": "^0.22.0",
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@openai/mcp-extensions": "0.1.0",
     "esbuild": "0.28.1",
     "miniflare": "5.20260926.0-alpha",
+    "playwright": "1.63.0",
     "wrangler": "4.142.0"
   },
   "engines": {

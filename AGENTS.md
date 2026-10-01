@@ -19,7 +19,7 @@ Temote MCP is a Rust MCP server for delegating local-machine work through explic
 
 Do not weaken these without an explicit issue describing the security model change:
 
-- Session-bound task, evidence, and job tools require `session_id`. Federated discovery/lifecycle tools are documented exceptions: `host_list`, `host_info`, host-aware `session_list`, and `session_start` may be sessionless only for host discovery or lifecycle scope.
+- Session-bound task, evidence, and job tools require `session_id`. Federated discovery/lifecycle tools are documented exceptions: `host_list`, `host_info`, host-aware `session_list`, `session_start`, and Gateway-only `fabric_overview` / `fabric_session_list` may be sessionless only for host discovery or lifecycle scope.
 - Authenticated direct-HTTP `upgrade_preflight` and `upgrade_status` are sessionless host-lifecycle exceptions. `upgrade_apply` requires an active managed normal session and explicit local-user approval. These tools must not be exposed by stdio MCP or the gateway.
 - Remote `session_start` is host-scoped and limited to named-root-relative normal sandbox sessions; it must not create `--yolo` sessions.
 - Unqualified session routing must fail closed whenever ownership is ambiguous or cannot be determined because any relevant leased host/session status is unavailable. Explicit `host_id` routing must remain isolated from unrelated host discovery failures.
