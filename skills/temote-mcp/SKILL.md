@@ -95,31 +95,13 @@ When a tool fails:
 - do not retry non-idempotent operations blindly — reuse the same `operation_id` only for exact retries;
 - prefer a generic repository/product fix over a one-off workaround when implementing software changes.
 
-## Feed Temote friction back into Temote
+## Keep friction feedback independent of ordinary coding tasks
 
-When developing Temote itself, use the repository-owned scenarios and local
-harness in `docs/self-improvement-dogfood.md` for reproducible before/after
-measurements. Keep scenario logic and metrics in the harness; use this Skill for
-session choice, safe delegation, observation review, and follow-up decisions.
-Do not invent measured values when the harness or a live provider is unavailable.
+Preserve exact meaningful errors, reconcile uncertain side effects, and complete the requested coding task. Do not switch to the Temote repository, widen filesystem roots, file Temote issues or open feedback PRs merely because Temote added friction during another project's task.
 
-When Temote MCP itself adds meaningful friction to a development task, treat that friction as product feedback instead of normalizing a repeated workaround.
+Temote records observable activity automatically. The remaining friction observer/publisher is proposed, not implemented; treat automatic friction publication as unavailable and do not assign that work back to the ordinary coding agent. Keep private source content out of public artifacts.
 
-Record it when the problem is Temote-specific and is reproducible, likely to recur, or has a generally useful fix. Examples include unnecessary approval/interaction, awkward session or workspace lifecycle, missing task/job observability, a confusing recovery path, avoidable backend-specific handling, or a workflow that forces callers to understand Temote internals. Do not file the target project's own bug, a one-off upstream outage, or an unverified guess as Temote friction.
-
-Do not derail or weaken the current task to report it. Preserve the user's work first. Then, when an authorized `f4ah6o/temote-mcp` workspace is available, add or update a dated Markdown entry under `issues/open/` that includes:
-
-- the observed event and exact evidence;
-- why it created friction or required a workaround;
-- the expected lower-friction behavior;
-- a generic proposed resolution, not a project-specific exception;
-- concrete acceptance criteria that would prove the friction is removed.
-
-Use a separate Temote MCP session/workspace for `temote-mcp` when needed; never widen the current project's filesystem roots just to write the report. Check for an existing matching `issues/open/` entry before creating a duplicate.
-
-After recording the issue, create a focused pull request to `f4ah6o/temote-mcp` containing the issue entry (and a small general fix only when it is clearly in scope and safe). The PR should link the observed evidence and explain how the proposed acceptance criteria remove the friction. Do not merge it unless the user explicitly requested that.
-
-If no authorized Temote repository workspace or GitHub write path is available, do not weaken permissions or block the original task. Return a ready-to-file issue entry and state exactly what access is missing.
+When the user explicitly requests a Temote friction report, or when developing Temote itself, use the normal authorized issue/PR workflow: deduplicate existing entries, include permitted observed evidence and concrete acceptance criteria, and create a focused PR only within the granted write scope. Do not merge without authorization. For Temote development, use `docs/self-improvement-dogfood.md` for reproducible measurements; never invent measured values when the harness or provider is unavailable.
 
 ## Completion
 

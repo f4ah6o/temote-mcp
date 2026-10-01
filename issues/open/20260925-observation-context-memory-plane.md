@@ -657,7 +657,11 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 - [x] raw transcript dump を通常の public surface にしない
 - [x] worker failure 時も task execution は独立して継続できる
 
-## 21. Principle
+## 21. Remaining friction feedback track
+
+`issues/open/20260926-observation-friction-worker.md` defines the remaining F1 friction consumer/candidate and F2 authorized publisher. Reuse the implemented O1–O4/Fabric memory baseline; do not reopen completed memory work. Consumer checkpoints and publication receipts are independent, and failures never change coding-task success.
+
+## 22. Principle
 
 > Temote が仕事をする agent に「覚えておけ」と頼むのではなく、Temote 自身が observable execution を構造化して記録し、別 worker が後から理解する。次の head は、その整理済み context と根拠を受け取って続行する。
 
