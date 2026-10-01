@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
+use crate::orchestration::outcome::{self, DeliveryRecord, VerificationRecord};
 use crate::pending_interaction::{
     self, InteractionType, PendingInteractionSummary, ProducerKind, Summary, SummaryState,
 };
@@ -705,6 +706,10 @@ struct TaskRecord {
     last_error: Option<String>,
     created_at: u64,
     updated_at: u64,
+    #[serde(default)]
+    verification: Option<VerificationRecord>,
+    #[serde(default)]
+    delivery: Option<DeliveryRecord>,
     operations: Vec<OperationReceipt>,
     #[serde(default)]
     operation_tombstones: Vec<OperationTombstone>,
@@ -1666,6 +1671,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
                 .all(|url| url.len() <= MAX_BASE_URL_BYTES),
         "Devin Cloud task pull request list exceeds limits"
     );
+    if let Some(verification) = &record.verification {
+        verification.validate()?;
+    }
+    if let Some(delivery) = &record.delivery {
+        delivery.validate()?;
+    }
     anyhow::ensure!(
         record.revision > 0,
         "Devin Cloud task revision must be positive"
@@ -2264,6 +2275,9 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "status": record.status.as_str(),
         "revision": record.revision,
         "generation": record.generation,
+        "execution": outcome::execution_view(record.task_id, record.generation, record.status.as_str()),
+        "verification": outcome::verification_view(record.verification.as_ref(), record.revision),
+        "delivery": outcome::delivery_view(record.delivery.as_ref()),
         "org_id": record.org_id,
         "title": record.title,
         "devin_mode": record.devin_mode,
@@ -3096,6 +3110,8 @@ async fn task_start_with_store(
         last_error: None,
         created_at: now,
         updated_at: now,
+        verification: None,
+        delivery: None,
         operations: Vec::new(),
         operation_tombstones: Vec::new(),
         pending_interaction_summary: None,
@@ -4466,6 +4482,8 @@ mod tests {
             last_error: None,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
             pending_interaction_summary: None,
@@ -4618,6 +4636,8 @@ mod tests {
         let task_id = Uuid::new_v4();
         let mut record = cloud_observer_record(&owner, task_id, TaskStatus::Running);
         record.revision = 19;
+        record.verification = Some(passed_verification_at(19));
+        record.delivery = Some(submitted_delivery());
         record.updated_at = config::unix_time();
         record.created_at = record.updated_at.saturating_sub(123);
         record.operations.push(OperationReceipt {
@@ -4635,6 +4655,8 @@ mod tests {
             record.updated_at,
             record.operations.clone(),
             record.operation_tombstones.clone(),
+            record.verification.clone(),
+            record.delivery.clone(),
         );
         store.save(&record).unwrap();
         let binding = CloudObservationBinding::from_record(&record).unwrap();
@@ -4655,6 +4677,8 @@ mod tests {
                 after_acquire.updated_at,
                 after_acquire.operations.clone(),
                 after_acquire.operation_tombstones.clone(),
+                after_acquire.verification.clone(),
+                after_acquire.delivery.clone(),
             ),
             task_metadata,
             "observer metadata writes must not touch task state, receipts, or retention clocks"
@@ -4699,6 +4723,14 @@ mod tests {
         assert!(!store.release_cloud_observation_lease(&first).unwrap());
         let after_publish = store.read_record(task_id).unwrap();
         assert_eq!(
+            task_view(&after_publish, None)["verification"]["status"],
+            "passed"
+        );
+        assert_eq!(
+            after_publish.start_fingerprint_version,
+            record.start_fingerprint_version
+        );
+        assert_eq!(
             (
                 after_publish.status,
                 after_publish.revision,
@@ -4707,6 +4739,8 @@ mod tests {
                 after_publish.updated_at,
                 after_publish.operations.clone(),
                 after_publish.operation_tombstones.clone(),
+                after_publish.verification.clone(),
+                after_publish.delivery.clone(),
             ),
             task_metadata
         );
@@ -5497,5 +5531,102 @@ mod tests {
                 .to_string(),
             "task_list limit must be an integer"
         );
+    }
+
+    // ---------- separated execution / verification / delivery state (A4) ----------
+
+    fn passed_verification_at(record_revision: u64) -> VerificationRecord {
+        VerificationRecord {
+            status: outcome::VerificationStatus::Passed,
+            target: outcome::VerificationTarget::Commit {
+                commit: "abc123".to_owned(),
+            },
+            record_revision,
+            checked_at: 1_700_000_000,
+        }
+    }
+
+    fn submitted_delivery() -> DeliveryRecord {
+        DeliveryRecord {
+            status: outcome::DeliveryStatus::Submitted,
+            branch: Some("feat/a4".to_owned()),
+            pull_request: Some("https://example.invalid/pr/1".to_owned()),
+            updated_at: 1_700_000_001,
+        }
+    }
+
+    #[test]
+    fn task_view_separates_execution_from_verification_and_delivery() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "state-separation");
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Completed);
+
+        // A completed execution alone is not a verification PASS and not a
+        // delivery.
+        let view = task_view(&record, None);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["execution"]["state"], "completed");
+        assert_eq!(
+            view["execution"]["id"],
+            outcome::execution_id(task_id, record.generation).to_string()
+        );
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["delivery"]["status"], "not_started");
+
+        record.verification = Some(passed_verification_at(record.revision));
+        record.delivery = Some(submitted_delivery());
+        let view = task_view(&record, None);
+        assert_eq!(view["verification"]["status"], "passed");
+        assert_eq!(view["delivery"]["status"], "submitted");
+    }
+
+    #[test]
+    fn agent_reported_pull_requests_do_not_set_delivery_state() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "delivery-separation");
+        let mut record = record_for(&owner, Uuid::new_v4(), TaskStatus::Completed);
+        record.pull_requests = vec!["https://example.invalid/org/repo/pull/1".to_owned()];
+
+        let view = task_view(&record, None);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(
+            view["delivery"]["status"], "not_started",
+            "an agent-reported pull request is not a Temote delivery operation"
+        );
+        assert_eq!(view["delivery"]["pull_request"], Value::Null);
+    }
+
+    #[test]
+    fn legacy_records_without_outcome_fields_read_as_not_run() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "legacy-state");
+        let record = record_for(&owner, Uuid::new_v4(), TaskStatus::Completed);
+
+        let mut value = serde_json::to_value(&record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("verification").is_some());
+        assert!(object.remove("delivery").is_some());
+        let legacy: TaskRecord = serde_json::from_value(value).unwrap();
+        assert!(legacy.verification.is_none());
+        assert!(legacy.delivery.is_none());
+
+        let view = task_view(&legacy, None);
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["delivery"]["status"], "not_started");
+    }
+
+    #[test]
+    fn stale_verification_is_not_reported_as_a_current_pass() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "stale-state");
+        let mut record = record_for(&owner, Uuid::new_v4(), TaskStatus::Completed);
+        record.revision = 2;
+        record.verification = Some(passed_verification_at(1));
+
+        let view = task_view(&record, None);
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["verification"]["stale"], true);
+        assert_eq!(view["verification"]["target"]["commit"], "abc123");
     }
 }

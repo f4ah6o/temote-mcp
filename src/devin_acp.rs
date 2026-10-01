@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::orchestration::outcome::{self, DeliveryRecord, VerificationRecord};
 use crate::pending_interaction::{
     InteractionType, PendingInteractionSummary, ProducerKind, REFRESH_INTERVAL_SECS, Summary,
     SummaryState,
@@ -443,6 +444,10 @@ struct TaskRecord {
     raw_result_truncated: bool,
     created_at: u64,
     updated_at: u64,
+    #[serde(default)]
+    verification: Option<VerificationRecord>,
+    #[serde(default)]
+    delivery: Option<DeliveryRecord>,
     operations: Vec<OperationReceipt>,
     #[serde(default)]
     operation_tombstones: Vec<OperationTombstone>,
@@ -1542,6 +1547,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "Devin task raw result exceeds {MAX_RAW_RESULT_BYTES} bytes"
         );
     }
+    if let Some(verification) = &record.verification {
+        verification.validate()?;
+    }
+    if let Some(delivery) = &record.delivery {
+        delivery.validate()?;
+    }
     anyhow::ensure!(record.revision > 0, "Devin task revision must be positive");
     anyhow::ensure!(
         record.operations.len() <= MAX_OPERATION_HISTORY,
@@ -1632,6 +1643,9 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "status": record.status.as_str(),
         "revision": record.revision,
         "generation": record.generation,
+        "execution": outcome::execution_view(record.task_id, record.generation, record.status.as_str()),
+        "verification": outcome::verification_view(record.verification.as_ref(), record.revision),
+        "delivery": outcome::delivery_view(record.delivery.as_ref()),
         "model": record.model,
         "agent": record.agent,
         "cloud": record.cloud,
@@ -3784,6 +3798,8 @@ async fn task_start_with_store_and_binary(
         raw_result_truncated: false,
         created_at: now,
         updated_at: now,
+        verification: None,
+        delivery: None,
         operations: Vec::new(),
         operation_tombstones: Vec::new(),
     };
@@ -5340,6 +5356,8 @@ mod tests {
             raw_result_truncated: false,
             created_at: now,
             updated_at: now,
+            verification: None,
+            delivery: None,
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
@@ -5947,5 +5965,100 @@ mod tests {
                 .to_string(),
             "task_list limit must be an integer"
         );
+    }
+
+    // ---------- separated execution / verification / delivery state (A4) ----------
+
+    fn passed_verification_at(record_revision: u64) -> VerificationRecord {
+        VerificationRecord {
+            status: outcome::VerificationStatus::Passed,
+            target: outcome::VerificationTarget::Commit {
+                commit: "abc123".to_owned(),
+            },
+            record_revision,
+            checked_at: 1_700_000_000,
+        }
+    }
+
+    fn submitted_delivery() -> DeliveryRecord {
+        DeliveryRecord {
+            status: outcome::DeliveryStatus::Submitted,
+            branch: Some("feat/a4".to_owned()),
+            pull_request: Some("https://example.invalid/pr/1".to_owned()),
+            updated_at: 1_700_000_001,
+        }
+    }
+
+    #[test]
+    fn task_view_separates_execution_from_verification_and_delivery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "state-separation");
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(
+            &owner,
+            task_id,
+            TaskStatus::Completed,
+            Some("acp-session-1"),
+        );
+
+        // A completed execution alone is not a verification PASS and not a
+        // delivery.
+        let view = task_view(&record, None);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["execution"]["state"], "completed");
+        assert_eq!(
+            view["execution"]["id"],
+            outcome::execution_id(task_id, record.generation).to_string()
+        );
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["delivery"]["status"], "not_started");
+
+        record.verification = Some(passed_verification_at(record.revision));
+        record.delivery = Some(submitted_delivery());
+        let view = task_view(&record, None);
+        assert_eq!(view["verification"]["status"], "passed");
+        assert_eq!(view["delivery"]["status"], "submitted");
+    }
+
+    #[test]
+    fn legacy_records_without_outcome_fields_read_as_not_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "legacy-state");
+        let record = record_for(
+            &owner,
+            Uuid::new_v4(),
+            TaskStatus::Completed,
+            Some("acp-session-1"),
+        );
+
+        let mut value = serde_json::to_value(&record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("verification").is_some());
+        assert!(object.remove("delivery").is_some());
+        let legacy: TaskRecord = serde_json::from_value(value).unwrap();
+        assert!(legacy.verification.is_none());
+        assert!(legacy.delivery.is_none());
+
+        let view = task_view(&legacy, None);
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["delivery"]["status"], "not_started");
+    }
+
+    #[test]
+    fn stale_verification_is_not_reported_as_a_current_pass() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "stale-state");
+        let mut record = record_for(
+            &owner,
+            Uuid::new_v4(),
+            TaskStatus::Completed,
+            Some("acp-session-1"),
+        );
+        record.verification = Some(passed_verification_at(record.revision - 1));
+
+        let view = task_view(&record, None);
+        assert_eq!(view["verification"]["status"], "not_run");
+        assert_eq!(view["verification"]["stale"], true);
+        assert_eq!(view["verification"]["target"]["commit"], "abc123");
     }
 }
