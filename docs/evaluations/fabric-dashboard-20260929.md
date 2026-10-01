@@ -1,6 +1,6 @@
 # Fabric dashboard acceptance and verification, 2026-09-29
 
-Issue: [Fabric dashboard](../../issues/open/20260929-fabric-web-dashboard.md).
+Issue: [Fabric dashboard](../../issues/done/20260929-fabric-web-dashboard.md).
 
 This record separates implementation, local checks, deployed acceptance, CI, and independent review. No merge or release is authorized.
 
