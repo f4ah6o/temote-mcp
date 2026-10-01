@@ -1,10 +1,11 @@
 # Bound delegated-task waiting and avoid unchanged polling responses
 
-Status: open
+Status: open — measured P1 friction; BW1 semantic-revision prerequisite is polished
 Model: gpt-6-sol
 Created: 2026-09-27
 Updated: 2026-09-27
 Branch: feat/20260927-bounded-wait-for-delegated-tasks
+Polished prerequisite: `issues/polished/20261001-task-get-semantic-revision-stability.md` (BW1, ready)
 
 ## 概要
 
@@ -59,4 +60,4 @@ A server-side loop that polls a backend too often could reduce client calls with
 
 ## 注記
 
-This is measured P1 friction. The exact API shape is intentionally left open until transport and backend behavior are verified.
+This is measured P1 friction. Implement BW1 first. The exact bounded-wait API shape remains intentionally open until the semantic cursor is stable and transport/backend behavior can be measured without revision churn.
