@@ -22,6 +22,7 @@ This file is the single tracking issue for live evidence that cannot be establis
 - `20260908-multi-host-federation.md`
 - `20260923-devin-acp-backend.md`
 - `20260924-upgrade-legacy-helper-preflight.md`
+- `20260926-cloud-observation-knowledge-plane.md`
 - `20260929-fabric-web-dashboard.md`
 
 The source issues are archived under `issues/done/` after this consolidation.
@@ -46,6 +47,15 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] On the deployed Fabric hostname, `/dash` and its read APIs are reachable only through the intended Cloudflare Access policy; unauthenticated/bypassed access is denied.
 - [ ] The deployed dashboard shows host/session/task/context/timeline projections with freshness/degraded states preserved, including pending-interaction summaries without converting unknown/unavailable into "none" (implementation merged in PR #88; source issue archived at `issues/done/20260929-fabric-web-dashboard.md`).
+
+
+### Fabric observation / context / memory remote qualification
+
+- [ ] On an approved Cloudflare account, provision the required D1 / Queue bindings and extractor configuration for the C0-C5 Fabric observation/memory path; verify the deployed Worker reports the expected bindings without exposing secrets.
+- [ ] A real Host syncs an O1 observation batch through Fabric, contiguous acknowledgement advances correctly, Queue processing completes a memory run, and a different authenticated head resolves the repository context with support/freshness metadata.
+- [ ] With the source Host offline, Fabric context resolution returns only the last synchronized authority and does not claim current live execution state.
+- [ ] A second Host contributes observations for the same repository scope without mixing an unrelated repository/owner scope.
+- [ ] Queue/D1/provider failure leaves Task/Execution state independent and surfaces lag/degraded state rather than fabricating success (source implementation archived at `issues/done/20260926-cloud-observation-knowledge-plane.md`).
 
 ### Connection profile matrix
 
