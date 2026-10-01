@@ -1,11 +1,15 @@
 # O1P: agent-side user prompt observation ingress
 
-Status: open / design packet
+Status: open / design parent — P0+P1 polished as `issues/polished/20261001-agent-prompt-local-ingress-contract.md`; P2-P7 remain
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Related: `issues/open/20260925-agent-conversation-continuation.md`  
 Created: 2026-10-01 (Asia/Tokyo)
+
+## 0. Triage / next packet
+
+Implement `issues/polished/20261001-agent-prompt-local-ingress-contract.md` first. It establishes the durable local contract without taking a dependency on Codex/Devin hook mechanics. Keep this parent open for P2-P7 only.
 
 ## 1. Problem
 
