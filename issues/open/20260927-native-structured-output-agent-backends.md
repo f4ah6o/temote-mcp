@@ -13,7 +13,7 @@ Related:
 - `issues/done/20260923-devin-acp-backend.md`
 - `issues/done/20260924-devin-cloud-backend.md`
 - `issues/open/20260908-live-acceptance-matrix.md`
-- `issues/open/20260927-completed-task-malformed-final-report-json.md` (fallback/retrieval guarantee; remains required even when native structured output is available)
+- `issues/done/20260927-completed-task-malformed-final-report-json.md` (fallback/retrieval guarantee; remains required even when native structured output is available)
 
 ## Problem
 
