@@ -1,6 +1,6 @@
 # macOS CI flakes observed during V3 VCS adapter work
 
-Status: closed — session-retention family fixed by merged PR #66; remaining Codex restart-drain flake split to `issues/polished/20261001-codex-restart-drain-broken-pipe.md`  
+Status: closed — session-retention family fixed by merged PR #66; remaining Codex restart-drain flake split to `issues/polished/20261001-codex-restart-drain-broken-pipe.md`
 Repository: `f4ah6o/temote-mcp`  
 Observed: 2026-09-26 (Asia/Tokyo)  
 Related PR: #59 (`feat: add jj-first VCS transaction core`)

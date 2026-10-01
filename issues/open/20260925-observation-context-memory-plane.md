@@ -4,7 +4,7 @@ Status: open umbrella — O1–O4 locally implemented/qualified; direct-agent pr
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
-Cloud extension: `issues/done/20260926-cloud-observation-knowledge-plane.md`  
+Cloud extension: `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Fabric naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
 Created: 2026-09-25 (Asia/Tokyo)

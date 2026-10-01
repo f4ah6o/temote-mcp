@@ -1,6 +1,6 @@
 # Task / Change graph を orchestration と stacked PR delivery の source of truth にする
 
-Status: design parent / D1 polished as `issues/polished/20261001-change-record-correlation.md`; D2-D4 remain  
+Status: design parent / D1 polished as `issues/polished/20261001-change-record-correlation.md`; D2-D4 remain
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
