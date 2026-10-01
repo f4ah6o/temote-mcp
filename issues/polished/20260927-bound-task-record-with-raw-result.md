@@ -12,7 +12,7 @@ Completed OpenCode and Devin ACP tasks retain a bounded raw final reply. Verify 
 
 ## 背景
 
-The result-recovery implementation is recorded in [the malformed-report issue](20260927-completed-task-malformed-final-report-json.md) and [the dogfood log](../../docs/dogfood-20260927.md). Independent OpenCode review found that the new 16 KiB `raw_result` shares a 64 KiB JSON record with report, usage, operation receipts, and operation tombstones. This is a static risk finding; no oversize failure has been reproduced.
+The result-recovery implementation is recorded in [the malformed-report issue](../done/20260927-completed-task-malformed-final-report-json.md) and [the dogfood log](../../docs/dogfood-20260927.md). Independent OpenCode review found that the new 16 KiB `raw_result` shares a 64 KiB JSON record with report, usage, operation receipts, and operation tombstones. This is a static risk finding; no oversize failure has been reproduced.
 
 ## 問題
 
