@@ -3,7 +3,7 @@
 Status: open — confirmed task-provisioning gap  
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)  
-Related: `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260925-v2-vcs-workspace-contract.md`
+Related: `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260925-v2-vcs-workspace-contract.md`
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.
 
