@@ -3,7 +3,7 @@
 - Status: Open / tracking; external evidence pending
 - Model: deepseek-v4.1-flash
 - Date: 2026-09-08 (Asia/Tokyo)
-- Updated: 2026-09-16
+- Updated: 2026-10-01
 - Priority: P2
 - Type: validation / deployment tracking
 
@@ -20,6 +20,9 @@ This file is the single tracking issue for live evidence that cannot be establis
 - `20260823-ingress-auth-provider-profiles.md`
 - `20260823-installed-runtime-migration.md`
 - `20260908-multi-host-federation.md`
+- `20260923-devin-acp-backend.md`
+- `20260924-upgrade-legacy-helper-preflight.md`
+- `20260929-fabric-web-dashboard.md`
 
 The source issues are archived under `issues/done/` after this consolidation.
 
@@ -39,6 +42,11 @@ The source issues are archived under `issues/done/` after this consolidation.
 - [ ] Reconnect/generation fencing is observed live; stale generations are rejected and non-idempotent calls are not auto-replayed.
 - [ ] On a real account, the chosen gateway deployment target (custom domain binding or existing-DNS Worker route) is applied with `workers_dev = false`, deploy output is checked so `No targets deployed` is not treated as success, and the route/domain binding is verified read-only (from `issues/done/20260911-gateway-deployment-target.md`). 2026-09-15 salvaged read-only evidence: `wrangler whoami` authenticated, `deployments status` reported one current `temote-mcp-gateway` version without proving a route/custom-domain target, `secret list` was empty (`HOST_TOKENS_JSON` absent under that account/script), and an unauthenticated `/healthz` returned an OAuth error document — reachability and auth enforcement, not an authenticated MCP session. See `docs/evaluations/completion-20260915-salvaged-evidence.md`.
 
+### Fabric Dashboard / Zero Trust
+
+- [ ] On the deployed Fabric hostname, `/dash` and its read APIs are reachable only through the intended Cloudflare Access policy; unauthenticated/bypassed access is denied.
+- [ ] The deployed dashboard shows host/session/task/context/timeline projections with freshness/degraded states preserved, including pending-interaction summaries without converting unknown/unavailable into "none" (implementation merged in PR #88; source issue archived at `issues/done/20260929-fabric-web-dashboard.md`).
+
 ### Connection profile matrix
 
 - [ ] Cloudflare profile external live acceptance is re-run on the current release.
@@ -51,6 +59,7 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] On a disposable or otherwise explicitly accepted live host, a valid legacy `serve + cloudflared` pair referenced by legacy `up.pids` is stopped by `temote-mcp migrate` only after process identity verification.
 - [ ] The destructive acceptance confirms unrelated local sessions/processes remain untouched.
+- [ ] On an explicitly accepted host still running a legacy supervisor, the PR #40 helper-generation fallback passes `upgrade --dry-run` with `blocked_session_count: 0` and `helper_generation: compatible`, then the real handoff restores the planned sessions and ingress health without disturbing unrelated processes (source issue archived at `issues/done/20260924-upgrade-legacy-helper-preflight.md`).
 
 ### Multi-host federation
 
@@ -93,8 +102,8 @@ Live evidence left open by issues closed at the 2026-09-22 consolidation; each r
 
 ### Delegation backends — Devin and interaction answers
 
-- [ ] Devin ACP local backend parity on a host with the fixed supervisor and installed `devin` CLI: `initialize` (post-PR-#43 `"jsonrpc":"2.0"` envelope fix) followed by `session/new` → `session/prompt` turn completion, `devin_task_get` reconcile, `steer` → additional `session/prompt`, `interrupt` → `session/cancel`, `session/request_permission` → Temote `waiting_approval` mapping, `loadSession`-gated `resume` accepted only when advertised, orphan-free `devin acp` shutdown (from `issues/open/20260923-devin-acp-backend.md`).
-- [ ] Devin ACP cloud mode: `devin_task_start` with `cloud=true` relays stdio ACP to Devin Cloud via `devin acp --cloud` under the `auth login` account (no API key); `model`/`agent`+`cloud` combination is rejected; cloud turn completes and reports (from `issues/open/20260923-devin-acp-backend.md`).
+- [ ] Devin ACP local backend parity on a host with the fixed supervisor and installed `devin` CLI: `initialize` (post-PR-#43 `"jsonrpc":"2.0"` envelope fix) followed by `session/new` → `session/prompt` turn completion, `devin_task_get` reconcile, `steer` → additional `session/prompt`, `interrupt` → `session/cancel`, `session/request_permission` → Temote `waiting_approval` mapping, `loadSession`-gated `resume` accepted only when advertised, orphan-free `devin acp` shutdown (from `issues/done/20260923-devin-acp-backend.md`).
+- [ ] Devin ACP cloud mode: `devin_task_start` with `cloud=true` relays stdio ACP to Devin Cloud via `devin acp --cloud` under the `auth login` account (no API key); `model`/`agent`+`cloud` combination is rejected; cloud turn completes and reports (from `issues/done/20260923-devin-acp-backend.md`).
 - [ ] Devin Cloud backend live residuals: `suspended` → `resume` remote lifecycle observed; `waiting_for_approval` Devin-side approval surfaced as task status; `swe_tier=promo|priority` behavior on a live account (priority may be unavailable until the account catalog exposes a SWE-2 priority UID); `report_source` (`native_structured_output` vs `final_message_compat`) recorded per backend once S1+ land (from `issues/open/20260924-devin-cloud-backend.md` and `issues/open/20260927-native-structured-output-agent-backends.md`).
 - [ ] OpenCode pending interaction answer: a real `opencode serve` session emits a permission and a question; each is enumerated via `pending_interactions`, answered through `opencode_task_control` `answer` with its `interaction_id`, and the task resumes without re-pending the same request (from `issues/done/20260927-opencode-pending-interaction-answer-api.md`).
 
@@ -120,6 +129,10 @@ Repository-local implementation regressions belong in their owning implementatio
 ## Triage note
 
 - 2026-09-16: Classified `keep-open` and kept in `issues/open/` as the single tracker. The unchecked matrix items require external credentials, real providers, physical multi-host hardware, and macOS/Windows hosts; they do not block repository-local implementation work. Unmerged branches contain bounded evidence that should be folded in when integrated (Cloudflare account/read-only deployment status and the OpenCode provider entitlement attempt on 2026-09-15). The OpenCode delegation implementation issue is complete and its provider entitlement remains tracked here.
+
+## 2026-10-01 triage update
+
+Implementation-complete issues whose only remaining work was external/live validation were archived from `issues/open/` and their residual gates were centralized here. This keeps `issues/open/` actionable while preserving the single source of truth for credentialed, destructive, deployment, and real-host acceptance.
 
 ## 2026-09-16 consolidation update
 
