@@ -10,7 +10,7 @@ Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
 Related: `issues/done/20260923-devin-acp-backend.md` (local `devin acp`; 別系統)
 SWE-2 service-tier follow-up: PR #63 (`swe_tier=promo|priority`; current draft must regain green contract snapshots before merge)
-Triage (2026-09-27): keep open for the remaining live suspended→resume case and the SWE-2 tier follow-up; core create/get/control live acceptance is already recorded below.
+Historical triage (2026-09-27): this was kept open for the live suspended→resume case and SWE-2 tier follow-up. On 2026-10-01, live-only acceptance moved to the live matrix and the SWE-2 tier implementation moved to `issues/polished/20261001-devin-cloud-swe2-service-tier.md`; the core backend was archived as done.
 
 ## Decision
 
