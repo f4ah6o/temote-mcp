@@ -1114,6 +1114,6 @@ Platform-specific behavior must be rechecked when implementation starts; repo se
 
 ## 17. Implementation tracking
 
-D0–D4 implementation and gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. This issue remains open until all acceptance gates are evidenced. Deployed acceptance and independent PR review are separate from local tests.
+D0–D3 implementation and repository-local gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. Deployed D4 / Zero Trust acceptance is now tracked centrally in `issues/open/20260908-live-acceptance-matrix.md`; this implementation issue is done. Deployed acceptance remains separate from local tests.
 
 D0–D3 code and local regression gates pass. Checked §14 items denote local implementation/test evidence, not deployed or independent approval. Same-deployment identity, Access edge acceptance, and deployed Zero Trust E2E remain unchecked pending approved candidate Worker/Host rollout and browser login. The acceptance matrix contains layer-specific results and the operator rerun.
