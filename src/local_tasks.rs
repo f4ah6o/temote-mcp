@@ -133,13 +133,26 @@ pub(crate) struct SessionInstance {
 }
 
 impl SessionInstance {
-    fn matches(&self, session: &config::Session) -> bool {
+    pub(crate) fn matches(&self, session: &config::Session) -> bool {
         self.cwd == session.cwd
             && self.started_at == session.started_at
             && self.process_id == session.process_id
             && self.permission_mode == session.permission_mode
             && self.permitted_directories == session.permitted_directories
             && self.grants == session.grants
+    }
+}
+
+impl From<&config::Session> for SessionInstance {
+    fn from(session: &config::Session) -> Self {
+        Self {
+            cwd: session.cwd.clone(),
+            started_at: session.started_at,
+            process_id: session.process_id,
+            permission_mode: session.permission_mode,
+            permitted_directories: session.permitted_directories.clone(),
+            grants: session.grants.clone(),
+        }
     }
 }
 

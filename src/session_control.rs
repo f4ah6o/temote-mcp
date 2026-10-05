@@ -128,6 +128,8 @@ enum ControlRequest {
         session_id: String,
     },
     Task(Box<TaskPacket>),
+    McpTask(Box<crate::mcp_tasks::TaskPacket>),
+    McpEvidence(Box<crate::mcp_tasks::EvidencePacket>),
     RepositoryCloneAdmission {
         session_id: String,
         root: String,
@@ -1271,12 +1273,24 @@ async fn handle_control_connection(
     supervisor: Arc<SessionSupervisor>,
     console_registration: mpsc::Sender<mpsc::Sender<ApprovalPrompt>>,
 ) -> Result<()> {
-    let (line, buffered_input) =
+    let (line, buffered_input, mcp_relay) =
         tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut stream))
             .await
             .context("timed out waiting for supervisor control request")??;
     let request: ControlRequest = serde_json::from_str(line.trim())
         .map_err(|_| anyhow::anyhow!("invalid control request"))?;
+    anyhow::ensure!(
+        mcp_relay
+            == matches!(
+                &request,
+                ControlRequest::McpTask(_) | ControlRequest::McpEvidence(_)
+            ),
+        "MCP task relay requires its dedicated frame"
+    );
+    anyhow::ensure!(
+        !mcp_relay || !buffered_input,
+        "unexpected trailing MCP task relay input"
+    );
 
     match request {
         ControlRequest::AttachConsole => {
@@ -1312,6 +1326,11 @@ async fn handle_control_connection(
             .await
         }
         request => {
+            let response_limit = match &request {
+                ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_RESPONSE_BYTES,
+                ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+                _ => MAX_CONTROL_MESSAGE_BYTES,
+            };
             let result = dispatch_request(request, &supervisor).await;
             let response = match result {
                 Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
@@ -1319,7 +1338,9 @@ async fn handle_control_connection(
                     json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")})
                 }
             };
-            stream.write_all(&encode_line(&response)?).await?;
+            stream
+                .write_all(&encode_line_with_limit(&response, response_limit)?)
+                .await?;
             let _ = stream.shutdown().await;
             Ok(())
         }
@@ -1330,6 +1351,11 @@ async fn dispatch_request(
     request: ControlRequest,
     supervisor: &Arc<SessionSupervisor>,
 ) -> Result<Value> {
+    match &request {
+        ControlRequest::McpTask(packet) => packet.validate()?,
+        ControlRequest::McpEvidence(packet) => packet.validate()?,
+        _ => {}
+    }
     supervisor.reap_finished().await;
     match request {
         ControlRequest::Ping => Ok(json!({
@@ -1340,6 +1366,7 @@ async fn dispatch_request(
             "pid": std::process::id(),
             "control_protocol": CONTROL_PROTOCOL_VERSION,
             "local_task_protocol": local_tasks::PROTOCOL_VERSION,
+            "mcp_task_protocol": crate::mcp_tasks::PROTOCOL_VERSION,
             "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
             "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
             "roots_configured": supervisor.roots_configured(),
@@ -1403,6 +1430,8 @@ async fn dispatch_request(
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::Task(packet) => local_tasks::dispatch(*packet).await,
+        ControlRequest::McpTask(packet) => crate::mcp_tasks::dispatch(*packet).await,
+        ControlRequest::McpEvidence(packet) => crate::mcp_tasks::dispatch_evidence(*packet).await,
         ControlRequest::RepositoryCloneAdmission {
             session_id,
             root,
@@ -3152,13 +3181,90 @@ async fn request(request: ControlRequest) -> Result<Value> {
 
 async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
     let mut stream = connect_supervisor_at(path).await?;
-    stream.write_all(&encode_line(&request)?).await?;
+    let mcp_relay = matches!(
+        &request,
+        ControlRequest::McpTask(_) | ControlRequest::McpEvidence(_)
+    );
+    let request_limit = match &request {
+        ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_REQUEST_BYTES,
+        ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_REQUEST_BYTES,
+        _ => MAX_CONTROL_MESSAGE_BYTES,
+    };
+    let bytes = encode_line_with_limit(&request, request_limit)?;
+    if mcp_relay {
+        stream.write_all(crate::mcp_tasks::FRAME_PREFIX).await?;
+    }
+    stream.write_all(&bytes).await?;
     finish_control_request_half_close(stream.shutdown().await)?;
     let mut reader = BufReader::new(stream);
-    let line = read_line_limited(&mut reader, "supervisor response").await?;
+    let response_limit = match &request {
+        ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_RESPONSE_BYTES,
+        ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+        _ => MAX_CONTROL_MESSAGE_BYTES,
+    };
+    let line = read_line_with_limit(&mut reader, "supervisor response", response_limit).await?;
+    anyhow::ensure!(
+        !mcp_relay || line.ends_with('\n'),
+        "incomplete MCP task relay response"
+    );
     let response: ControlResponse =
         serde_json::from_str(line.trim()).context("invalid supervisor response")?;
     ensure_response_ok(response)
+}
+
+/// Only a successful legacy Ping lacking the new capability permits direct
+/// MCP execution. Negotiation failures and all relay errors are terminal; a
+/// possibly accepted operation must never move to a second runtime owner.
+pub(crate) async fn mcp_task(packet: crate::mcp_tasks::TaskPacket) -> Result<Option<Value>> {
+    let path = config::supervisor_socket_path()?;
+    mcp_task_at_path(&path, packet).await
+}
+
+async fn mcp_task_at_path(
+    path: &Path,
+    packet: crate::mcp_tasks::TaskPacket,
+) -> Result<Option<Value>> {
+    mcp_relay_at_path(path, ControlRequest::McpTask(Box::new(packet))).await
+}
+
+pub(crate) async fn mcp_evidence(
+    packet: crate::mcp_tasks::EvidencePacket,
+) -> Result<Option<Value>> {
+    let path = config::supervisor_socket_path()?;
+    mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet))).await
+}
+
+async fn mcp_relay_at_path(path: &Path, request: ControlRequest) -> Result<Option<Value>> {
+    match &request {
+        ControlRequest::McpTask(packet) => packet.validate()?,
+        ControlRequest::McpEvidence(packet) => packet.validate()?,
+        _ => anyhow::bail!("unsupported MCP relay operation"),
+    }
+    let ping = tokio::time::timeout(
+        CONTROL_READ_TIMEOUT,
+        request_at_path(path, ControlRequest::Ping),
+    )
+    .await
+    .context("MCP task relay capability negotiation timed out")??;
+    anyhow::ensure!(
+        ping.get("status").and_then(Value::as_str) == Some("active"),
+        "invalid supervisor Ping"
+    );
+    let Some(version) = ping.get("mcp_task_protocol") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        version.as_u64() == Some(crate::mcp_tasks::PROTOCOL_VERSION),
+        "unsupported supervisor MCP task relay protocol"
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(300),
+        request_at_path(path, request),
+    )
+    .await
+    .context("reconciliation_required: MCP task relay timed out; reconcile through the supervisor and preserve operation_id")?
+    .context("reconciliation_required: MCP task relay failed; reconcile through the supervisor and preserve operation_id")?;
+    Ok(Some(result))
 }
 
 fn finish_control_request_half_close(result: std::io::Result<()>) -> Result<()> {
@@ -4928,16 +5034,20 @@ fn status_name(status: LifecycleStatus) -> &'static str {
 }
 
 fn encode_line<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    encode_line_with_limit(value, MAX_CONTROL_MESSAGE_BYTES)
+}
+
+fn encode_line_with_limit<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value)?;
     anyhow::ensure!(
-        bytes.len() < MAX_CONTROL_MESSAGE_BYTES,
-        "supervisor control message exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
+        bytes.len() < limit,
+        "supervisor control message exceeds {limit} bytes"
     );
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)> {
+async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool, bool)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let read = (&mut reader)
@@ -4953,26 +5063,40 @@ async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)>
         read <= MAX_CONTROL_MESSAGE_BYTES,
         "supervisor control request exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
     );
-    Ok((line, !reader.buffer().is_empty()))
+    if line.as_bytes() == crate::mcp_tasks::FRAME_PREFIX {
+        let line = read_line_with_limit(
+            &mut reader,
+            "MCP task relay request",
+            crate::mcp_tasks::MAX_REQUEST_BYTES,
+        )
+        .await?;
+        anyhow::ensure!(line.ends_with('\n'), "incomplete MCP task relay request");
+        return Ok((line, !reader.buffer().is_empty(), true));
+    }
+    Ok((line, !reader.buffer().is_empty(), false))
 }
 
 async fn read_line_limited<R>(reader: &mut R, label: &str) -> Result<String>
 where
     R: AsyncBufReadExt + Unpin,
 {
+    read_line_with_limit(reader, label, MAX_CONTROL_MESSAGE_BYTES).await
+}
+
+async fn read_line_with_limit<R>(reader: &mut R, label: &str, limit: usize) -> Result<String>
+where
+    R: AsyncBufReadExt + Unpin,
+{
     let mut line = String::new();
     let read = reader
-        .take((MAX_CONTROL_MESSAGE_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_line(&mut line)
         .await
         .with_context(|| format!("failed to read {label}"))?;
     if read == 0 {
         return Ok(String::new());
     }
-    anyhow::ensure!(
-        read <= MAX_CONTROL_MESSAGE_BYTES,
-        "{label} exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
-    );
+    anyhow::ensure!(read <= limit, "{label} exceeds {limit} bytes");
     Ok(line)
 }
 
@@ -5031,6 +5155,387 @@ mod tests {
                 .to_string()
                 .contains("failed to half-close supervisor control request")
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_legacy_requires_successful_ping_without_new_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                ControlRequest::Ping
+            ));
+            stream
+                .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "local_task_protocol": 1}})).unwrap())
+                .await
+                .unwrap();
+        });
+        assert!(
+            mcp_task_at_path(
+                &path,
+                crate::mcp_tasks::tests::start_packet("first".to_owned())
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        server.await.unwrap();
+        // Socket absence is an error, not proof of an explicitly legacy owner.
+        assert!(
+            mcp_task_at_path(
+                &temp.path().join("absent.sock"),
+                crate::mcp_tasks::tests::start_packet("first".to_owned())
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_negotiation_failures_never_select_legacy_fallback() {
+        for result in [
+            None,
+            Some(json!({"ok": false, "error": "supervisor unavailable"})),
+            Some(json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": null}})),
+            Some(json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 2}})),
+            Some(json!({"ok": true, "result": {"mcp_task_protocol": 1}})),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_control_request(&mut stream).await.unwrap();
+                if let Some(result) = result {
+                    stream
+                        .write_all(&encode_line(&result).unwrap())
+                        .await
+                        .unwrap();
+                }
+            });
+            assert!(
+                mcp_task_at_path(
+                    &path,
+                    crate::mcp_tasks::tests::start_packet("first".to_owned())
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_routes_all_operations_and_large_frames_to_advertised_owner() {
+        use crate::orchestration::{Backend, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected in [
+                Operation::Status,
+                Operation::TaskStart,
+                Operation::TaskGet,
+                Operation::TaskControl,
+                Operation::TaskList,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(!relay);
+                assert!(matches!(
+                    serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                    ControlRequest::Ping
+                ));
+                stream
+                    .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap())
+                    .await
+                    .unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(relay);
+                let ControlRequest::McpTask(packet) = serde_json::from_str(&line).unwrap() else {
+                    panic!("typed MCP relay")
+                };
+                packet.validate().unwrap();
+                assert_eq!(packet.operation, expected);
+                assert_eq!(packet.actor.transport, "mcp-public");
+                if expected == Operation::TaskStart {
+                    assert!(line.len() > 6 * 1024 * 1024);
+                    assert_eq!(packet.args["continuation"]["type"], "previous_task");
+                }
+                let response = json!({"ok": true, "result": {"operation": expected, "bounded_view": "a".repeat(128 * 1024)}});
+                assert!(encode_line(&response).is_err());
+                stream
+                    .write_all(
+                        &encode_line_with_limit(&response, crate::mcp_tasks::MAX_RESPONSE_BYTES)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        for operation in [
+            Operation::Status,
+            Operation::TaskStart,
+            Operation::TaskGet,
+            Operation::TaskControl,
+            Operation::TaskList,
+        ] {
+            let args = match operation {
+                Operation::Status => json!({}),
+                Operation::TaskStart => {
+                    crate::mcp_tasks::tests::start_packet("\u{1}".repeat(1024 * 1024)).args
+                }
+                Operation::TaskGet => json!({"task_id": Uuid::new_v4(), "wait_ms": 30_000}),
+                Operation::TaskControl => {
+                    json!({"task_id": Uuid::new_v4(), "operation_id": Uuid::new_v4(), "action": "interrupt"})
+                }
+                Operation::TaskList => json!({"limit": 128}),
+            };
+            let packet = crate::mcp_tasks::TaskPacket::new(
+                Backend::Codex,
+                operation,
+                &args,
+                &crate::mcp_tasks::tests::session(),
+                true,
+            )
+            .unwrap();
+            let result = mcp_task_at_path(&path, packet).await.unwrap().unwrap();
+            assert_eq!(result["operation"], json!(operation));
+            assert_eq!(result["bounded_view"].as_str().unwrap().len(), 128 * 1024);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_uncertainty_and_errors_never_select_legacy_fallback() {
+        for response in [
+            None,
+            Some(json!({"ok": false, "error": "owner rejected"})),
+            Some(json!({"ok": true, "result": "unterminated"})),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_control_request(&mut stream).await.unwrap();
+                stream
+                    .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap())
+                    .await
+                    .unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(relay);
+                if let Some(response) = response {
+                    let mut bytes = encode_line(&response).unwrap();
+                    if response["ok"] == true {
+                        bytes.pop();
+                    }
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            let result = mcp_task_at_path(
+                &path,
+                crate::mcp_tasks::tests::start_packet("first".to_owned()),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "relay errors must never return the legacy None route"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_does_not_expand_ordinary_control_or_local_task_frames() {
+        let packet = crate::mcp_tasks::tests::start_packet("a".repeat(128 * 1024));
+        assert!(encode_line(&ControlRequest::McpTask(Box::new(packet))).is_err());
+        let local = ControlRequest::Task(Box::new(TaskPacket {
+            schema_version: local_tasks::PROTOCOL_VERSION,
+            session_id: "relay-test".to_owned(),
+            instance: (&crate::mcp_tasks::tests::session()).into(),
+            action: local_tasks::TaskAction::Control {
+                backend: local_tasks::BackendName::Codex,
+                task_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
+                action: local_tasks::ControlAction::Steer,
+                input: Some("a".repeat(64 * 1024)),
+            },
+        }));
+        assert!(encode_line(&local).is_err());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            let _ = client
+                .write_all(&vec![b'x'; MAX_CONTROL_MESSAGE_BYTES + 1])
+                .await;
+        });
+        assert!(read_control_request(&mut server).await.is_err());
+        drop(server);
+        writer.await.unwrap();
+    }
+
+    // Invoked in a separate test process so the evidence OnceLock belongs to
+    // the supervisor fixture, never to the frontend test's address space.
+    #[tokio::test]
+    async fn mcp_relay_evidence_owner_process_fixture() {
+        let Some(manifest) = std::env::var_os("TEMOTE_TEST_MCP_EVIDENCE_MANIFEST") else {
+            return;
+        };
+        let manifest = PathBuf::from(manifest);
+        let root = manifest.parent().unwrap();
+        let cwd = std::fs::canonicalize(root).unwrap();
+        let mut session = crate::mcp_tasks::tests::session();
+        session.cwd = cwd.clone();
+        session.permitted_directories = vec![cwd];
+        session.process_id = std::process::id();
+        let reference = crate::evidence::store_for_session(
+            &session,
+            "\u{1}".repeat(crate::evidence::MAX_READ_BYTES + 11),
+        )
+        .unwrap()
+        .unwrap();
+        let listener = UnixListener::bind(root.join("evidence.sock")).unwrap();
+        let pending_manifest = manifest.with_extension("pending");
+        std::fs::write(
+            &pending_manifest,
+            serde_json::to_vec(&json!({"session": session, "evidence": reference})).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(pending_manifest, &manifest).unwrap();
+        for _ in 0..6 {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                ControlRequest::Ping
+            ));
+            stream.write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap()).await.unwrap();
+            drop(stream);
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(relay);
+            let ControlRequest::McpEvidence(packet) = serde_json::from_str(&line).unwrap() else {
+                panic!("typed evidence relay")
+            };
+            let response = match packet.read_for_session(&session) {
+                Ok(chunk) => json!({"ok": true, "result": chunk}),
+                Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            };
+            stream
+                .write_all(
+                    &encode_line_with_limit(
+                        &response,
+                        crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_reads_supervisor_evidence_across_process_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("manifest.json");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_control::tests::mcp_relay_evidence_owner_process_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TEMOTE_TEST_MCP_EVIDENCE_MANIFEST", &manifest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manifest.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "evidence owner exited before readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "evidence owner readiness timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let session: config::Session = serde_json::from_value(manifest["session"].clone()).unwrap();
+        assert_ne!(session.process_id, std::process::id());
+        let id = Uuid::parse_str(manifest["evidence"]["evidence_id"].as_str().unwrap()).unwrap();
+        assert!(
+            crate::evidence::read_for_session(&session, id, 0, 1).is_err(),
+            "the frontend must not possess the supervisor's evidence"
+        );
+        let path = temp.path().join("evidence.sock");
+        for (offset, expected) in [
+            (0, crate::evidence::MAX_READ_BYTES),
+            (crate::evidence::MAX_READ_BYTES, 11),
+        ] {
+            let packet = crate::mcp_tasks::EvidencePacket::new(&json!({"evidence_id": id, "offset_bytes": offset, "max_bytes": crate::evidence::MAX_READ_BYTES}), &session, true).unwrap();
+            let chunk = mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(chunk["content"].as_str().unwrap(), "\u{1}".repeat(expected));
+            assert_eq!(chunk["returned_bytes"], expected);
+            assert_eq!(chunk["total_bytes"], crate::evidence::MAX_READ_BYTES + 11);
+        }
+        for change in 0..3 {
+            let mut replacement = session.clone();
+            match change {
+                0 => replacement.cwd = std::fs::canonicalize(temp.path().join("..")).unwrap(),
+                1 => replacement.process_id += 1,
+                _ => replacement.permission_mode = config::PermissionMode::Ask,
+            }
+            let packet = crate::mcp_tasks::EvidencePacket::new(
+                &json!({"evidence_id": id}),
+                &replacement,
+                true,
+            )
+            .unwrap();
+            assert!(
+                mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                    .await
+                    .is_err()
+            );
+        }
+        // The frontend owns this ID, but a modern supervisor miss must stay an
+        // error rather than crossing to the frontend's private evidence store.
+        let local = crate::evidence::store_for_session(&session, "frontend-only".to_owned())
+            .unwrap()
+            .unwrap();
+        let packet = crate::mcp_tasks::EvidencePacket::new(
+            &json!({"evidence_id": local.evidence_id}),
+            &session,
+            true,
+        )
+        .unwrap();
+        assert!(
+            mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                .await
+                .is_err()
+        );
+        assert!(child.wait().unwrap().success());
     }
 
     #[tokio::test]
@@ -5177,6 +5682,11 @@ mod tests {
         );
         assert_eq!(result["pid"], std::process::id());
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(result["local_task_protocol"], local_tasks::PROTOCOL_VERSION);
+        assert_eq!(
+            result["mcp_task_protocol"],
+            crate::mcp_tasks::PROTOCOL_VERSION
+        );
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);

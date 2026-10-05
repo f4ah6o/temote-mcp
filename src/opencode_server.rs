@@ -2311,13 +2311,9 @@ fn store_evidence_for_instance(
     {
         return None;
     }
-    evidence::store(
-        &session.id,
-        &session.cwd,
-        serde_json::to_string(response).ok()?,
-    )
-    .ok()
-    .flatten()
+    evidence::store_for_session(session, serde_json::to_string(response).ok()?)
+        .ok()
+        .flatten()
 }
 
 // ---------- opencode serve transport ----------

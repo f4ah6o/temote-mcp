@@ -1996,13 +1996,9 @@ fn store_evidence_for_instance(
     {
         return None;
     }
-    evidence::store(
-        &session.id,
-        &session.cwd,
-        serde_json::to_string(response).ok()?,
-    )
-    .ok()
-    .flatten()
+    evidence::store_for_session(session, serde_json::to_string(response).ok()?)
+        .ok()
+        .flatten()
 }
 
 fn apply_thread_start_response(
@@ -2794,6 +2790,10 @@ fn configured_codex_binary() -> Result<PathBuf> {
         return Ok(PathBuf::from("codex"));
     };
     let path = PathBuf::from(configured);
+    validate_configured_codex_binary(&path)
+}
+
+fn validate_configured_codex_binary(path: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
         path.is_absolute(),
         "configured Codex binary must be absolute"
@@ -2808,7 +2808,10 @@ fn configured_codex_binary() -> Result<PathBuf> {
         metadata.permissions().mode() & 0o111 != 0,
         "configured Codex binary is not executable"
     );
-    Ok(resolved)
+    // Validate the resolved target, but execute the configured invocation path.
+    // Multicall executables select their applet from argv[0] (e.g. a `codex`
+    // symlink to a host-owned launcher); canonicalizing it changes the applet.
+    Ok(path.to_path_buf())
 }
 
 async fn spawn_initialized_client_with_binary(
@@ -5249,6 +5252,34 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_multicall_codex_keeps_invocation_path() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("launcher");
+        std::fs::write(&target, b"#!/bin/sh\n[ \"${0##*/}\" = codex ]\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let invocation = root.path().join("codex");
+        std::os::unix::fs::symlink(&target, &invocation).unwrap();
+        let validated = validate_configured_codex_binary(&invocation).unwrap();
+        assert_eq!(validated, invocation);
+        assert!(
+            std::process::Command::new(validated)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !std::process::Command::new(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_ne!(std::fs::canonicalize(&invocation).unwrap(), invocation);
+        assert!(validate_configured_codex_binary(Path::new("codex")).is_err());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_configured_codex_binary(&invocation).is_err());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::io;

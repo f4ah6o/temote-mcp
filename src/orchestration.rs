@@ -123,7 +123,8 @@ use requests::{DevinCloudStartOptions, OpenCodeStartOptions};
 /// Capability differences (hosted execution, resume support, the meaning of
 /// interrupt, wait-for-input) are typed data on the request boundary in
 /// [`requests`]; this enum only names which backend owns an operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Backend {
     Codex,
     #[cfg(feature = "network")]
@@ -136,7 +137,8 @@ pub(crate) enum Backend {
 /// One operation of the shared typed task contract. `Status` is a read-only
 /// compatibility probe; the task operations accept, read, or control
 /// retained tasks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Operation {
     Status,
     TaskStart,

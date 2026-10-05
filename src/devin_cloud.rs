@@ -2724,9 +2724,8 @@ async fn reconcile(
                 .take(MAX_EVIDENCE_MESSAGES)
                 .collect::<Vec<_>>(),
         });
-        evidence_ref = evidence::store(
-            &session.id,
-            &session.cwd,
+        evidence_ref = evidence::store_for_session(
+            session,
             serde_json::to_string(&payload).unwrap_or_default(),
         )
         .ok()

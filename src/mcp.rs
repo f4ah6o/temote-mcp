@@ -1368,19 +1368,19 @@ async fn call_tool(
             "context_status" => text_result(serde_json::to_string_pretty(
                 &observation::resolver::status(&session, &args)?,
             )?),
-            "evidence_read" => evidence_read_tool(&args, &session),
+            "evidence_read" => evidence_read_tool(&args, &session, public).await,
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
-            "task_list" => task_list_tool(&args, &session).await,
+            "task_list" => task_list_tool(&args, &session, public).await,
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
             _ => match delegation_operation(name) {
                 Some((backend, operation)) => text_result(serde_json::to_string_pretty(
-                    &orchestration::invoke(
+                    &invoke_backend_task(
                         backend,
                         operation,
                         &args,
                         &session,
-                        &observation::ActorRef::mcp(public),
+                        public,
                         activity.as_ref(),
                     )
                     .await?,
@@ -1392,6 +1392,31 @@ async fn call_tool(
     .await;
     finish_covered_tool_activity(coverage, activity.as_ref(), &result);
     result
+}
+
+async fn invoke_backend_task(
+    backend: orchestration::Backend,
+    operation: orchestration::Operation,
+    args: &Value,
+    session: &config::Session,
+    public: bool,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let packet = crate::mcp_tasks::TaskPacket::new(backend, operation, args, session, public)?;
+    match crate::session_control::mcp_task(packet).await? {
+        Some(result) => Ok(result),
+        None => {
+            orchestration::invoke(
+                backend,
+                operation,
+                args,
+                session,
+                &observation::ActorRef::mcp(public),
+                activity,
+            )
+            .await
+        }
+    }
 }
 
 async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
@@ -1583,32 +1608,19 @@ fn finish_covered_tool_activity(
     };
 }
 
-fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>> {
-    args.get(key)
-        .map(|value| {
-            let value = value
-                .as_u64()
-                .with_context(|| format!("{key} must be a non-negative integer"))?;
-            usize::try_from(value).with_context(|| format!("{key} is too large"))
-        })
-        .transpose()
-}
-
-fn evidence_read_tool(args: &Value, session: &config::Session) -> Result<Value> {
-    let evidence_id = args
-        .get("evidence_id")
-        .and_then(Value::as_str)
-        .context("missing evidence_id")
-        .and_then(|value| Uuid::parse_str(value).context("invalid evidence_id"))?;
-    let offset_bytes = optional_usize(args, "offset_bytes")?.unwrap_or(0);
-    let max_bytes = optional_usize(args, "max_bytes")?.unwrap_or(evidence::DEFAULT_READ_BYTES);
-    let chunk = evidence::read(
-        &session.id,
-        &session.cwd,
-        evidence_id,
-        offset_bytes,
-        max_bytes,
-    )?;
+async fn evidence_read_tool(
+    args: &Value,
+    session: &config::Session,
+    public: bool,
+) -> Result<Value> {
+    let packet = crate::mcp_tasks::EvidencePacket::new(args, session, public)?;
+    let chunk = match crate::session_control::mcp_evidence(packet).await? {
+        Some(chunk) => chunk,
+        // Frontend-local evidence belongs only to the explicitly legacy mode.
+        // A modern owner miss/error must never probe another process's store.
+        None => crate::mcp_tasks::EvidencePacket::new(args, session, public)?
+            .read_for_session(session)?,
+    };
     text_result(serde_json::to_string(&chunk)?)
 }
 
@@ -1965,7 +1977,7 @@ fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
 /// per-backend `unavailable` reporting live in
 /// [`orchestration::task_list`]; this adapter only bounds the argument
 /// surface to the advertised schema.
-async fn task_list_tool(args: &Value, session: &config::Session) -> Result<Value> {
+async fn task_list_tool(args: &Value, session: &config::Session, public: bool) -> Result<Value> {
     let object = args
         .as_object()
         .context("task_list arguments must be an object")?;
@@ -1975,7 +1987,17 @@ async fn task_list_tool(args: &Value, session: &config::Session) -> Result<Value
             .all(|key| matches!(key.as_str(), "session_id" | "limit")),
         "task_list accepts only session_id and limit"
     );
-    let mut view = orchestration::task_list(args, session).await?;
+    let packet = crate::mcp_tasks::TaskPacket::new(
+        orchestration::Backend::Codex,
+        orchestration::Operation::TaskList,
+        args,
+        session,
+        public,
+    )?;
+    let mut view = match crate::session_control::mcp_task(packet).await? {
+        Some(result) => result,
+        None => orchestration::task_list(args, session).await?,
+    };
     compact_task_list_view(&mut view);
     text_result(serde_json::to_string_pretty(&view)?)
 }

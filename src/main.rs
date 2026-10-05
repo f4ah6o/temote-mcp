@@ -39,6 +39,7 @@ mod local_oauth;
 mod local_tasks;
 mod managed_worktree;
 mod mcp;
+mod mcp_tasks;
 mod named_roots;
 mod observation;
 #[cfg(feature = "network")]
