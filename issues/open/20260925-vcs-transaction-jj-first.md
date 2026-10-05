@@ -1,11 +1,123 @@
 # V0: VCS transaction layer / jj-first managed workspace design
 
-Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3 remainder / V4 open  
+Status: open
+Model: unknown
+Created: 2026-09-25
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Complete jj-first managed VCS transaction reconciliation, task-boundary snapshots, and delivery integration.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+A snapshot primitive alone does not bind agent edits to task lifecycle, durable observations, or delivery.
+
+## 目標
+
+Complete jj-first managed VCS transaction reconciliation, task-boundary snapshots, and delivery integration.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+`jj` auto selection must report an unsupported capability with an actionable reason when the repository cannot use jj; it must never silently switch to the Git compatibility backend. Git use requires an explicit compatibility choice. Keep accepted snapshot/reconcile receipts and the no-local-main rule intact.
+
+### Fixed design from source
+
+**4. Decision direction**
+
+**新規 Temote-managed workspace の target architecture は jj-first を優先して検証する。**
+
+2026-09-29 session-first correction:
+
+- Jujutsu backend の normal path は `bare Git RepositoryStore -> jj workspace -> logical jj change` とする。
+- Session start 時に Git branch を先に作らない。
+- Session start 時に Git worktree を先に作らない。
+- Git bookmark/branch は verified revision の delivery boundary で materialize する。
+- `bare store -> branch -> git worktree` は `VcsBackend::Git` compatibility semantics として残す。
+- physical workspace path は Session identity ではなく host-local projection とする。
+
+Top-level provisioning/order は `issues/open/20260929-session-first-managed-provisioning.md` を authoritative target とする。
+
+ただし即座に F1 を破棄しない。
+
+最初に Temote core へ `VcsBackend` / `WorkspaceVcs` boundary を入れ、Git worktree と jj workspace の両方を表現できる contract にする。
+
+初期 target:
+
+```text
+RepositoryStore
+    |
+    +-- VcsBackend::Jujutsu     # new managed default candidate
+    |      +-- jj workspace
+    |
+    +-- VcsBackend::Git        # legacy / compatibility
+           +-- git worktree
+```
+
+V1 acceptance を満たしたら、新規 managed workspace の default を Jujutsu とする。
+満たせない repository capability (例: unsupported feature) は Git backend に明示 fallback し、silent fallback はしない。
+
+## 受け入れ条件
+
+Complete source criteria from “17. Acceptance criteria” (unchecked items remain unverified):
+
+- [ ] agent が explicit commit を実行しなくても、Temote は task workspace の変更を recoverable VCS state として捕捉できる（internal snapshot primitive は実装済み。task lifecycle 自動接続は未実装）
+- [ ] task/execution と before/after revision を correlation できる
+- [ ] head/backend を切り替えても同じ logical work を引き継げる
+- [ ] concurrent task が同じ mutable working copy を共有しない
+- [ ] snapshot と GitHub delivery commit/PR を分離できる
+- [ ] crash後の未commit filesystem changes を黙って破棄しない
+- [ ] existing dirty/ahead/diverged Git checkout を migration のために reset/clean/stash しない
+- [ ] jj unsupported repository は reason を明示し、silent fallback しない
+- [ ] GitHub remains Git-compatible at delivery boundary
+- [ ] agent に memory/commit/handoff maintenance prompt を要求しない
+- [ ] Observation Plane が instruction → execution → VCS revision → verification を相関できる
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve dirty/ahead/diverged checkouts and operation receipts; ambiguous side effects require reconciliation rather than a blind retry.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`vcs-reconcile-task-snapshots`](../polished/20261005-vcs-reconcile-task-snapshots.md)
+- [`change-allocation-writer-handoff`](../polished/20261005-change-allocation-writer-handoff.md)
+- [`change-delivery-planner`](../polished/20261005-change-delivery-planner.md)
+- [`change-delivery-adapter`](../polished/20261005-change-delivery-adapter.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3 remainder / V4 open
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/done/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
 Delivery graph child: `issues/open/20260926-task-change-orchestration-stacked-pr.md`  
-Created: 2026-09-25 (Asia/Tokyo)
+> Historical Created: 2026-09-25 (Asia/Tokyo)
 
 ## 1. Problem
 

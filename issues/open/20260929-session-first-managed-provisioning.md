@@ -1,9 +1,166 @@
 # S1: session-first managed repository provisioning
 
-Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/polished/20260929-s0a-contract-conformance.md`)
+Status: open
+Model: unknown
+Created: 2026-09-29
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Start managed sessions from typed repository identity with idempotent provisioning, retaining explicit existing-workspace compatibility.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Path-first creation exposes host layout and cannot safely reconcile lost provisioning responses.
+
+## 目標
+
+Start managed sessions from typed repository identity with idempotent provisioning, retaining explicit existing-workspace compatibility.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+For `session_start`, the repository-managed `source` form and existing named-root `path` form are mutually exclusive; reject requests containing both or neither. The managed form requires a caller-supplied `operation_id` before any session-owned side effect and persists an Accepted receipt before provisioning. Retain the path form as explicit `ExistingWorkspace` compatibility. S0a's initial implementation merged in PR #86; the grammar and checked-entry-point conformance packet remains unfinished.
+
+### Preserved fixed contract: 2. Decision
+
+### 2.1 Session is primary
+
+新規 managed flow の product-level model は以下とする。
+
+```text
+Session
+  |
+  +-- RepositorySource
+  +-- WorkspaceBinding
+  |     |
+  |     +-- host-managed workspace
+  |     |      +-- WorkspaceVcs
+  |     |
+  |     +-- hosted workspace
+  |
+  +-- Task(s)
+  +-- Execution(s)
+  +-- Observation / Context
+  +-- Verification
+  +-- Delivery
+```
+
+repository / physical directory は Session が確保する resource であり、Session identity ではない。
+
+### 2.2 Normal host-local path
+
+新規 Temote-managed repository の normal path:
+
+```text
+session request
+  -> normalize repository identity
+  -> ensure / fetch bare Git RepositoryStore
+  -> pin base revision
+  -> allocate Temote workspace id
+  -> create jj workspace
+  -> create / bind logical jj change
+  -> start agent execution
+```
+
+**Jujutsu backend では session start 時に Git branch を作らない。**
+**Jujutsu backend では session start 時に Git worktree を作らない。**
+
+Git bookmark / branch は delivery boundary で materialize する。
+
+```text
+jj logical change
+  -> verified materialized revision
+  -> delivery bookmark / Git ref
+  -> push
+  -> PR / stack
+```
+
+### 2.3 Git is compatibility backend
+
+Git backend を削除しない。
+
+```text
+VcsBackend::Jujutsu
+  -> bare Git store + jj workspace        # managed default
+
+VcsBackend::Git
+  -> bare Git store + Git branch/worktree # explicit compatibility
+```
+
+Git backend への fallback は capability / caller policy による明示的な state とし、silent fallback は禁止する。
+
+## 受け入れ条件
+
+Complete source criteria from “15. Acceptance for the architecture” (unchecked items remain unverified):
+
+- [ ] A new repository with no normal local checkout can be named by repository identity and started as a managed Session.
+- [ ] Temote creates/reuses a bare RepositoryStore without creating local `main`.
+- [ ] Jujutsu managed default creates a jj workspace directly; no Git branch/worktree is created at session start.
+- [ ] Agent edits are captured through Temote/jj snapshot boundaries without requiring agent-authored commits.
+- [ ] Session/Workspace/Change survive executor replacement.
+- [ ] Delivery creates/materializes Git ref only after verification.
+- [ ] Git backend still supports explicit compatibility worktree semantics.
+- [ ] caller does not need host-local physical paths for managed repository start.
+- [ ] named roots remain enforced as host filesystem admission, not durable workspace identity.
+- [ ] Existing dirty/unmanaged checkout is never silently migrated or modified.
+- [ ] managed `session_start` requires a caller-supplied `operation_id` and never double-creates Session / Workspace across lost responses, retries, crashes, or concurrent resends (§5.3).
+
+### Provisioning retry scenarios (受入 test 仕様)
+
+以下は S1〜S3a 実装 packet が automated test として実装する受入仕様であり、実行済み test の報告ではない。
+
+- 初回成功後に応答だけ喪失 → 同じ key の再送は同じ SessionId / WorkspaceId / result を返す
+- 同じ key の同時到着 → provisioning は二重化しない
+- 同じ key + 異なる request → `operation_conflict`、追加副作用なし
+- Accepted receipt 確立後の crash → 同じ operation として再開・照合
+- workspace 作成後・Completed receipt 保存前の crash → 根拠なく再作成せず、安全に照合または `reconciliation_required` で fail closed
+- remote base 更新後の retry → 初回に pin した revision を維持する
+- 異なる authenticated caller から同じ key → 他者の receipt / Session を取得できない
+- 明示的に新しい key → policy の範囲内で別 Session を作成可能
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve dirty/ahead/diverged checkouts and operation receipts; ambiguous side effects require reconciliation rather than a blind retry.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+- 2026-10-05: The selected contract is `source` XOR `path`, with `operation_id` required for managed repository creation. Do not describe the S0a initial merge as its strengthened conformance being complete.
+
+## 2026-10-05 実行パケット
+
+- [`repository-store-idempotent-ensure`](../polished/20261005-repository-store-idempotent-ensure.md)
+- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
+- [`managed-session-source-start`](../polished/20261005-managed-session-source-start.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/polished/20260929-s0a-contract-conformance.md`)
 
 Repository: `f4ah6o/temote-mcp`  
-Created: 2026-09-29 (Asia/Tokyo)
+> Historical Created: 2026-09-29 (Asia/Tokyo)
 
 Revision note (2026-09-29, PR #85 review follow-up): added the §5.3 provisioning retry contract — required caller-supplied `operation_id`, durable Accepted receipt before the first session-owned side effect, replay / `operation_conflict` / `reconciliation_required` semantics. The inherited F1 `RepositoryId` component grammar lives on the S0a packet side.
 

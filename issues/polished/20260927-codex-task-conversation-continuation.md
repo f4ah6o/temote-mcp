@@ -1,6 +1,144 @@
 # CC1: explicit Codex conversation continuation for a new task
 
-Status: ready (revised 2026-09-27 per PR #73 review: conversation fencing +
+Status: polished
+Model: unknown
+Created: 2026-09-27
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Continue a Codex conversation in a new Temote task with independent task identity and atomic successor ownership.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+The preserved design records a concrete remaining contract or defect; its implementation and verification have not been completed in this normalization pass.
+
+## 目標
+
+Continue a Codex conversation in a new Temote task with independent task identity and atomic successor ownership.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: 2. Fixed decisions
+
+- New typed option on `codex_task_start`: e.g. `continuation` with
+  `{"type": "new"}` (default, unchanged) or `{"type": "previous_task",
+  "task_id": <uuid>}`. No free-form backend command and no caller-supplied
+  Codex `thread_id` (parent §3.2).
+- Resolution rules (parent §4): same authorized session/scope only; backend
+  must be Codex; take the retained `thread_id` from task A's record
+  (`TaskRecord.thread_id`, `src/codex_app_server.rs:366`) — never from caller
+  input; `thread/resume` then a fresh `turn/start` for task B.
+- Fail closed: non-resumable/absent conversation is an explicit error or an
+  `unsupported` capability result — never a silent fresh thread.
+- Conversation fencing + explicit handoff: continuation is only legal when
+  the source task is quiescent — `record.status.is_terminal()` AND no
+  in-flight turn/control operation on A's record (terminal status implies no
+  in-flight turn). Runtime leases are keyed by `task_id`
+  (`runtime-locks/<task_id>.lock`, `src/codex_app_server.rs:516`), so task B
+  gets a different lock file from A.
+  - Terminal does NOT imply lease-free: `insert_runtime_unchecked`
+    (`src/codex_app_server.rs:1819`) keeps the `RuntimeHandle` (holding its
+    `_lease`) in `runtimes()` until `CHILD_LIFETIME` (line 42, 2h) or session
+    stop; reconciliation marking A `completed` does not remove it.
+  - Atomic conversation claim: A's record gains a `continued_by_task_id` (or
+    handoff-generation) field claimed under `store_lock` in the same locked
+    load-validate-save mutation as the owner/scope/quiescence check —
+    continuing sets it to B's `task_id` only when unset. A second concurrent
+    successor (C) sees the claim held and fails closed; a replay of B's own
+    `operation_id`/`task_id` against the held claim is idempotent (no second
+    turn). This is the store-level serialization point for successor claims —
+    retiring A's runtime alone does not stop two successors resolving a
+    terminal A simultaneously.
+  - Two-phase retirement: while holding the claim under `store_lock`, detach
+    A's `RuntimeHandle` from `runtimes()` and *retain* its
+    `Arc<TaskRuntimeLease>`; release the lock; `await client.shutdown()`; only
+    then drop the lease (fd close → flock release). Releasing the lease before
+    shutdown would permit a cross-process reacquisition mid-handoff.
+  - After the handoff, B spawns its own runtime, `thread/resume`s A's retained
+    `thread_id`, and opens a new `turn/start`. If A is non-terminal, already
+    claimed by another task, or its runtime cannot be retired cleanly, B's
+    start fails closed with an explicit error — two task runtimes can never
+    drive the same Codex thread concurrently.
+  - (rejected alternatives: refusing while the terminal runtime is still
+    registered — blocks the primary implement→follow-up flow for up to 2h; or
+    a thread/conversation-level lease serializing turn ownership across tasks
+    — more machinery, revisit only if concurrent multi-task threads become a
+    goal.)
+- Task B gets its own `task_id`, record, receipts, and bounded lineage metadata
+  (`continued_from_task_id` on the record; see parent §6). No inheritance of
+  A's status / verification / delivery state.
+- Idempotent `operation_id` semantics are preserved for the continued start.
+
+## 受け入れ条件
+
+Complete source criteria from “5. Acceptance” (unchecked items remain unverified):
+
+- [ ] Default start (no `continuation`) still calls `thread/start`.
+- [ ] Continued start issues no `thread/start`; it resumes A's thread and opens
+      a new turn for B.
+- [ ] A completing/failing does not move B's status; B inherits no
+      verification or delivery state.
+- [ ] Idempotent replay of a continued start does not duplicate the turn.
+- [ ] Cross-session / wrong-backend / non-resumable continuations fail closed
+      with explicit errors.
+- [ ] Continuation while the source task is non-terminal or has an in-flight
+      turn/control fails closed — two task runtimes can never drive the same
+      Codex thread concurrently.
+- [ ] A just became completed while its runtime is still registered → B can
+      safely continue immediately: the handoff retires A's runtime/lease and
+      B's fresh runtime resumes the thread.
+- [ ] Race: two concurrent continuations B and C of the same terminal A —
+      exactly one acquires the conversation (persisted `continued_by_task_id`
+      == winner's task_id); the loser fails closed with an explicit error and
+      no `thread/resume` is issued twice.
+- [ ] Same-task runtime reconstruction via `thread/resume` is unchanged.
+- [ ] Gateway contract/fingerprint regenerated; tool count updated.
+- [ ] Old task records without lineage fields still load.
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+### Source test details: 6. Validation commands
+
+- `cargo test --bin temote-mcp --all-features --locked codex`
+- `cargo test --bin temote-mcp --all-features --locked orchestration`
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
+- `cargo check --no-default-features --all-targets`
+- `TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --all-features --locked gateway`
+- `(cd gateway && npm test)`
+- `just sandboxed-check`
+- Live: continuation against a real `codex app-server` — live-matrix row;
+  NOT RUN here.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 既存設計・履歴
+
+> Historical Status: ready (revised 2026-09-27 per PR #73 review: conversation fencing +
 explicit terminal-runtime handoff + atomic successor claim — the handoff
 alone does not serialize two concurrent continuations of the same task).
 Repository: `f4ah6o/temote-mcp`

@@ -1,9 +1,149 @@
 # Temote を local / remote agentic development harness へ再構成する
 
-Status: open / umbrella tracker (implementation underway)
+Status: open
+Model: unknown
+Created: 2026-09-24
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Track the remaining local and remote development-harness phases as one dependency-aware integration workstream.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+The umbrella mixes completed slices with remaining orchestration, repository, environment, and delivery phases.
+
+## 目標
+
+Track the remaining local and remote development-harness phases as one dependency-aware integration workstream.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: Non-goals
+
+- 現在の実装を最初から作り直すこと
+- Codex / OpenCode / Devin の Git 操作を Temote が command ごとに proxy すること
+- gh-git を Temote 専用 CLI にすること
+- gh-stack を fork / vendor して独自 stacked PR implementation を持つこと
+- sibling worktree の `node_modules` / Cargo `target` を雑に共有すること
+- `--local` を unrestricted / yolo / sessionless mode にすること
+- rename のためだけに compatibility を壊すこと
+- 初期 scope での Windows named pipe transport
+- Devin Cloud hosted session に host-local workspace / environment preparation を適用すること
+- 自律的なタスク分解、実装方針の決定、backend / model の自動選択 (初期 scope)
+- 大きな workflow engine を先に作ること
+- gh-git に言語別の環境準備を持たせること
+- 通常の agent mode を成立させるために yolo を要求すること
+- 指示役が cloud / local であることだけを理由に機能・権限・承認回数を変えること
+- 新規 managed repository の local main を作業・統合 branch として維持すること
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: Top-level requirements (user-confirmed)
+
+以下の 4 要件を設計・実装順序・受入判定の最上位に置く。ここで定めるのは target contract であり、下記 current baseline の実装済み事実とは区別する。
+
+1. **yolo を使わず、極力 approve-free な agent mode。** repository / workspace / network / 操作範囲について既に与えられた許可を task に引き継ぎ、その範囲内の準備・実装・テスト・許可済み commit / push / PR 作成では操作ごとの再承認を要求しない。delivery という分類だけで毎回承認にしない。権限拡張や未許可の破壊的操作は明示的に扱い、sandbox・秘密情報保護・他作業の保護を維持する。
+2. **指示役が cloud / local のどちらでも同じように使える。** authenticated caller が同じ権限を持つ場合、transport によって task の操作能力・承認方針・状態参照が変わらない。cloud から開始した task を local から追跡・制御でき、その逆もできる。指示役の場所と agent の実行場所 (host-local / hosted) は別の軸として扱う。
+3. **独立して遅れ・未統合 commit の蓄積・分岐が生じる local main を持たない。** 新規 managed repository は bare RepositoryStore + Temote-managed VCS workspace を標準とする。Jujutsu backend の normal path は bare store から jj workspace を直接割り当て、Session start 時に Git branch / git worktree を作らない。Git worktree は explicit compatibility backend。基準は fetch で確認した `origin/main` とその commit。既存 checkout は勝手に移動・削除・reset せず、明示的な移行契約で保全する。
+4. **指示役を替えても context / knowledge を失わない。** coding agent に memory 管理を要求せず、Temote の共通 orchestration 境界で instruction / execution / evidence を自動観測する。raw observation と derived knowledge を分離し、専用 worker が非同期に整理する。次の head は authorized Context Resolver から provenance 付きの relevant context を取得する。hidden chain-of-thought や Temote 外の全 transcript を収集する設計にはしない。
+
+### Agent-mode authorization contract
+
+- Temote core は許可の scope / operation class / 有効性を共通に検証する。許可済み操作を client 接続・transport 切替・子操作への分割だけを理由に再承認しない。失効や scope 変更時は再評価する。
+- `agent` は上記の範囲で prompt-free、`ask` は既存の対話承認方針を維持する。通常フローの成立に `yolo` を要求しない。
+- repository / workspace 管理、environment preparation、delivery へ operation class を拡張する際も同じ方針を適用し、対応する child issue で AGENTS.md と policy tests を更新する。
+- backend 自身の承認要件や外部サービスの認可は無効化しない。対応 backend では許可範囲を保つ設定へ写像し、残る入力待ち・承認待ちは capability / state として可視化する。Temote の prompt 削減と backend の制約を区別する。
+
+## 受け入れ条件
+
+Complete source criteria from “Acceptance criteria” (unchecked items remain unverified):
+
+- [ ] yolo なしの agent mode で、既存許可内の workspace 準備・実装・テスト・許可済み commit / push / PR 作成を Temote の操作ごとの再承認なしに進められる
+- [ ] 同じ権限を持つ cloud / local caller 間で task の開始・追跡・制御・再試行を引き継げ、指示役の場所による追加承認や機能差がない
+- [ ] 新規 managed repository は bare store + task worktrees が標準で、local main の checkout / commit / merge / pull を必要としない
+- [ ] task 開始時と提出前に確認した origin/main の commit / 時刻を記録し、fetch 失敗を最新確認済みと扱わない
+- [ ] 既存の dirty / ahead / diverged な checkout は保全し、新規 no-local-main 標準とは区別して移行状態を報告する
+- [ ] MCP を通さず local client / CLI から同じ agent task lifecycle を操作できる
+- [ ] MCP / local / HTTP / Temote Fabric remote frontend が同じ orchestration core を利用する
+- [ ] Codex / OpenCode / Devin ACP が task ごとの isolated workspace で動作する
+- [ ] coding agent が workspace path を勝手に決めない
+- [ ] GitHub identity が repository-scoped で、linked worktree を含め global `gh auth switch` を必要としない
+- [ ] concurrent task が sibling worktree / metadata / caches を破壊しない
+- [ ] JS/TS worktree が vp + pnpm cache reuse で agent-ready になる
+- [ ] Rust worktree が shared Cargo source/sccache + isolated target で agent-ready になる
+- [ ] task graph から明示選択した delivery branch 依存を stacked PR (または単独 PR) として提出できる
+- [ ] execution 完了・検証合格・提出完了が別状態として記録され、未検証を PASS と扱わない
+- [ ] 応答消失・切断・再起動後も二重起動せず、状態不明を成功・失敗に読み替えない
+- [ ] gh-stack integration が existing worktree ownership を壊さない
+- [ ] workspace / task cleanup が uncommitted work を勝手に破棄しない
+- [ ] agent が explicit commit を実行しなくても、managed workspace の変更を recoverable VCS state として Temote が捕捉できる
+- [ ] task/execution と VCS before/after revision を相関し、head/backend 切替後も同じ logical work を引き継げる
+- [ ] current server-backed delegation behavior (4 backend) の regression がない
+- [ ] head を切り替えても、authorized scope 内で過去の instruction・verified task/execution state・relevant current knowledge を Context Resolver から取得できる
+- [ ] coding agent に memory 保存・要約・knowledge 更新の追加 prompt/tool call を要求しない
+- [ ] caller/agent の claim と Temote が evidence/state から確認した事実を区別し、worker failure / stale knowledge を task success/failure に読み替えない
+- [ ] core/frontend separation 後、`temote` への rename migration が実行可能な状態になる
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+### Source test details: 6. Validation commands
+
+<実在するコマンドと必要環境。未実行のhost gateも明記>
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+### 2026-10-05 disposition of historical open questions
+
+- Concrete Rust module placement is a bounded implementation choice for A core dispatch; preserve the public contract and avoid a new independent task authority.
+- Keep retained backend stores authoritative for backend tasks and reconcile their bounded projections; a new shared index must not silently override their ownership or receipt state.
+- Apply the existing centralized operation-class × PermissionMode policy to new repository, workspace, environment and delivery operations. Provider-side approval remains independent.
+- A failed or uncertain fetch cannot be reported as a current base; reconcile it before starting a new managed session or delivery from that base.
+- Repository identity includes host, owner and name, so same-named repositories under different owners remain distinct.
+- V1 managed sessions use one assigned workspace with one active writer; a multi-workspace session would require a later explicit scope and ownership contract.
+- Devin Cloud hosted branches have no assumed stack adapter. Mark hosted delivery capability unsupported until the provider exposes a verified branch/revision handoff with authorization and reconciliation evidence.
+
+## 2026-10-05 実行パケット
+
+- [`core-backend-dispatch`](../polished/20261005-core-backend-dispatch.md)
+- [`gh-git-common-dir-identity`](../polished/20261005-gh-git-common-dir-identity.md)
+- [`local-task-frontend-reconciliation`](../polished/20261005-local-task-frontend-reconciliation.md)
+- [`environment-preparation`](../polished/20261005-environment-preparation.md)
+- [`repository-store-idempotent-ensure`](../polished/20261005-repository-store-idempotent-ensure.md)
+- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
+- [`managed-session-source-start`](../polished/20261005-managed-session-source-start.md)
+- [`fabric-naming-deployment-migration`](../polished/20261005-fabric-naming-deployment-migration.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: open / umbrella tracker (implementation underway)
 Execution unit: one bounded child packet per run (small-model implementation guide below)
-Created: 2026-09-24 (Asia/Tokyo)
-Updated: 2026-09-29 (Asia/Tokyo) — session-first provisioning target added; Phase O O1/O2 implementation and earlier PR #47 scope boundaries retained
+> Historical Created: 2026-09-24 (Asia/Tokyo)
+> Historical Updated: 2026-09-29 (Asia/Tokyo) — session-first provisioning target added; Phase O O1/O2 implementation and earlier PR #47 scope boundaries retained
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
@@ -908,7 +1048,7 @@ gateway / shared protocol を変更する場合は gateway directory で `npm te
 ```markdown
 # <packet ID>: <今回完成する動作>
 
-Status: ready | contract-needed
+> Historical Status: ready | contract-needed
 Repository:
 Branch / observed HEAD:
 Parent issue:

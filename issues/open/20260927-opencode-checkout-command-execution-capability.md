@@ -1,8 +1,144 @@
 # OpenCode implementation tasks need checkout + command execution
 
-Status: open — confirmed task-provisioning gap  
+Status: open
+Model: unknown
+Created: 2026-09-27
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Bind OpenCode implementation tasks to a safe writable workspace and scoped command capability.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+A task can be accepted without a usable checkout or safe command capability, then fail after spending a model turn.
+
+## 目標
+
+Bind OpenCode implementation tasks to a safe writable workspace and scoped command capability.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: Non-goals
+
+- OpenCode のモデル性能評価
+- OpenCode 自体への新しい coding capability 実装
+- task ごとに独自 clone / workspace 実装を増やすこと
+- 既存 workspace / VCS contract を迂回する別系統の checkout 管理
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: Requirements
+
+### 1. Checkout provisioning
+
+- task が対象とする repository / ref / workspace identity を解決する
+- OpenCode task 開始前に実 working checkout が存在することを保証する
+- checkout path を backend に明示的に渡す
+- checkout がない場合、必要なら Temote が既存 repository-store / workspace contract を使って用意する
+- 既存の未コミット変更を勝手に reset / checkout / stash / clean しない
+
+### 2. Command execution capability
+
+OpenCode implementation task には、少なくとも対象 checkout 内で以下を実行できる capability を提供する。
+
+- repository inspection
+- build
+- test
+- lint / check
+- diff inspection
+- `git status` または対応する VCS status
+
+単に source tree を read/write できるだけでは implementation task の完了条件を満たさない。
+
+### 3. Explicit task contract
+
+OpenCode task metadata / runtime context には少なくとも次を含める。
+
+- repository identity
+- requested ref / base
+- resolved checkout path
+- effective cwd
+- available execution capability
+
+backend adapter がこれらを暗黙推測する設計にしない。
+
+### 4. Preflight / fail-fast
+
+implementation task 開始時に preflight を行い、最低限以下を区別する。
+
+- repository を解決できない
+- checkout を provision / locate できない
+- checkout はあるが read/write できない
+- command execution capability がない
+- command execution はあるが cwd が checkout と一致しない
+
+不足がある場合は、モデル実行を続けて「実装不能」という結果にするのではなく、capability / workspace blocker として明示する。
+
+### 5. Error classification
+
+checkout / command-execution 不足を、OpenCode のモデル能力不足として分類・表示しない。
+
+エラーには少なくとも以下を含める。
+
+- backend: OpenCode
+- target repository
+- target ref if known
+- resolved / attempted checkout path if known
+- missing capability
+- recovery hint
+
+## 受け入れ条件
+
+Complete source criteria from “Acceptance criteria” (unchecked items remain unverified):
+
+1. `f4ah6o/workflows.mbt` を対象に OpenCode implementation task を開始すると、OpenCode から対象 checkout を読み書きできる。
+2. 同じ task context から repository 内で build / test / lint 等の command を実行できる。
+3. 実装後に diff と VCS status を同じ checkout で確認できる。
+4. checkout がないケースは、backend/model 実行前または開始直後に capability blocker として検出できる。
+5. command execution capability がないケースを checkout 不足とは別に識別できる。
+6. regression test が「checkout あり + execution あり」の成功ケースと、少なくとも各不足ケースを覆う。
+7. 既存の未コミット変更を破壊しない。
+8. ユーザー向け / agent 向け status で「OpenCode に実装能力がない」と誤分類しない。
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`opencode-scoped-command-workspace`](../polished/20261005-opencode-scoped-command-workspace.md)
+- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: open — confirmed task-provisioning gap
 Repository: `f4ah6o/temote-mcp`  
-Created: 2026-09-27 (Asia/Tokyo)  
+> Historical Created: 2026-09-27 (Asia/Tokyo)
 Related: `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260925-v2-vcs-workspace-contract.md`
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.

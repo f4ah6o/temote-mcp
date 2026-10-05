@@ -1,13 +1,140 @@
 # Fabric: standard MCP core + OpenAI MCP Extensions adapter
 
-Status: active design umbrella — initial read-only adapter landed via PR #90; later phases remain open
+Status: open
+Model: unknown
+Created: 2026-10-01
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Extend the existing Fabric MCP protocol adapter with optional OpenAI extension metadata and bounded user surfaces.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+The read-only app exists, while optional extension metadata, mentions, and interaction UI remain unimplemented.
+
+## 目標
+
+Extend the existing Fabric MCP protocol adapter with optional OpenAI extension metadata and bounded user surfaces.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: 13. Non-goals
+
+This issue does not by itself authorize:
+
+- replacing Fabric with an OpenAI-only service
+- removing standard MCP support
+- removing the existing web dashboard
+- deleting legacy protocol support without its normal migration decision
+- changing Task/Execution authority
+- moving approval authority into ChatGPT
+- replacing the Devin ACP execution backend
+- renaming `gateway/` to `fabric/` ahead of the existing Fabric migration plan
+- destructive Durable Object/D1 migration
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+Add optional OpenAI extension capability and metadata handling to the current Fabric protocol adapter (`gateway/src/protocol.js` and its contract tests). PR #90 already merged the initial read-only MCP App. Retain standard MCP and legacy clients, authenticate all resource and interaction paths, and version contract fingerprints deliberately. SDK replacement is not part of this workstream; any future replacement would require separate parity evidence and a new decision.
+
+## 受け入れ条件
+
+Complete source criteria from “12. Acceptance criteria” (unchecked items remain unverified):
+
+This issue is complete when:
+
+- [ ] Fabric exposes the same provider-neutral standard MCP functionality as before
+- [ ] OpenAI-specific capabilities are optional and capability-negotiated
+- [ ] ChatGPT/Codex can use at least one native OpenAI extension surface backed by Fabric
+- [ ] a non-OpenAI MCP client can use Fabric without understanding OpenAI extensions
+- [ ] Devin caller interoperability is documented and live-tested where the current Devin client supports the required MCP transport/auth flow
+- [ ] existing Devin ACP backend behavior is preserved
+- [ ] no OpenAI extension becomes execution authority
+- [ ] current auth/routing/fail-closed guarantees remain intact
+- [ ] dashboard/resource surfaces preserve existing bounded/sanitized disclosure policy
+- [ ] protocol/contract parity evidence is recorded before deleting existing custom protocol code
+- [ ] CI is green
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+### Source test details: 11. Tests
+
+Add or extend tests covering:
+
+### Contract
+
+- [ ] generated routed tool contract unchanged unless intentionally updated
+- [ ] fingerprint deterministic
+- [ ] extension metadata deterministic where included
+- [ ] unsupported capability path
+
+### Protocol
+
+- [ ] modern `server/discover`
+- [ ] legacy `initialize`
+- [ ] `tools/list`
+- [ ] `tools/call`
+- [ ] OpenAI-capable client
+- [ ] standard-only client
+- [ ] unknown extension fields
+- [ ] malformed extension requests fail clearly
+
+### Routing/security
+
+- [ ] Host selection remains fail-closed
+- [ ] duplicate session IDs remain ambiguous without explicit Host
+- [ ] caller cannot select another owner
+- [ ] named-root path stays logical/root-relative
+- [ ] OpenAI UI metadata cannot bypass Host authorization/approval
+- [ ] extension resources do not disclose secrets or absolute Host paths
+
+### Client compatibility
+
+- [ ] ChatGPT/Codex extension-capable path
+- [ ] standard MCP client path
+- [ ] Devin MCP caller path where supported by the current Devin client
+- [ ] existing Devin ACP execution backend remains unaffected
+
+## リスク
+
+- Preserve authenticated routing, owner isolation, bounded disclosure, and durable-state migration; reject unsafe egress or ambiguous ownership.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`fabric-extension-metadata-interactions`](../polished/20261005-fabric-extension-metadata-interactions.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: active design umbrella — initial read-only adapter landed via PR #90; later phases remain open
 Repository: `f4ah6o/temote-mcp`
 Related:
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 - `issues/open/20260924-temote-development-harness-restructure.md`
 - `issues/open/20260925-observation-context-memory-plane.md`
 - `issues/done/20260926-cloud-observation-knowledge-plane.md`
-Created: 2026-10-01 (Asia/Tokyo)
+> Historical Created: 2026-10-01 (Asia/Tokyo)
 
 ## 0. Current implementation boundary (2026-10-02)
 

@@ -1,12 +1,133 @@
 # Fabric: support MCP Events for Temote job/session state changes
 
 Status: open
+Model: unknown
+Created: 2026-10-05
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Add durable MCP Events subscriptions and signed webhooks for initial job and session state changes.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Clients must poll for job and session transitions; durable subscriptions and safe egress do not yet exist.
+
+## 目標
+
+Add durable MCP Events subscriptions and signed webhooks for initial job and session state changes.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: 11. Explicit non-goals for v1
+
+ChatGPT currently does not require these delivery forms, so leave them out of the first implementation:
+
+- polling delivery;
+- streaming delivery;
+- draft MCP Events `gap` control notification;
+- draft MCP Events `terminated` control notification;
+- embedding full logs/artifacts/results in event payloads;
+- changing the legacy MCP protocol surface.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+V1 catalog is exactly `job.state.changed` and `session.state.changed`; delivery is webhook only and all response/event cursors are `null` (no replay claim). Subscription lifetime defaults to 24 hours, finite requests are capped at 7 days, and `ttlMs: null` grants a finite 24 hours with finite `refreshBefore`. Secret replacement uses a 5-minute dual-signature rotation window. Fabric stores durable subscriptions and outbox entries, and pauses delivery while the owning Host is offline until the entry or subscription expires. A dedicated Host HTTPS sender receives egress requests through an Access-protected Tunnel; it resolves and pins a validated public IP for each verification/delivery connection, retains the original hostname for TLS/SNI, and rejects redirects. No generic Worker `fetch` is accepted as proof of that connection-level SSRF boundary.
+
+## 受け入れ条件
+
+Complete source criteria from “13. Acceptance criteria” (unchecked items remain unverified):
+
+### Protocol
+
+- [ ] Supported modern MCP discovery advertises `capabilities.events = {}`.
+- [ ] Unsupported/non-durable paths do not advertise Events.
+- [ ] `events/list` returns schema-valid initial Temote event definitions.
+- [ ] `events/subscribe` and `events/unsubscribe` are available on the same authenticated endpoint.
+- [ ] Legacy MCP contract remains unchanged.
+
+### Lifecycle
+
+- [ ] Subscribe validates auth, event name, filter schema, secret format, callback URL, and callback challenge.
+- [ ] Repeating an equivalent subscription is idempotent.
+- [ ] Canonical JSON prevents key-order duplicates.
+- [ ] Finite subscriptions return `refreshBefore`.
+- [ ] Refresh after process/worker restart updates the existing subscription rather than creating another one.
+- [ ] Secret replacement supports bounded rotation.
+- [ ] Unsubscribe is authorized and idempotent.
+
+### Security
+
+- [ ] HTTPS is required.
+- [ ] Private/loopback/link-local/metadata/local callback destinations are rejected.
+- [ ] Redirects are rejected.
+- [ ] DNS/address validation is performed for verification and delivery connections.
+- [ ] Verification challenge comparison is constant-time.
+- [ ] Revoked access stops future delivery.
+
+### Delivery
+
+- [ ] Matching job/session transitions produce schema-valid signed events.
+- [ ] Non-matching transitions are not delivered.
+- [ ] Each request contains one event and is <= 256 KiB.
+- [ ] Event IDs remain stable across retries.
+- [ ] Retry signatures/timestamps are fresh.
+- [ ] HTTP 410 and 413 are not retried.
+- [ ] Duplicate/out-of-order deliveries do not create duplicate Temote mutations.
+
+### Tests
+
+- [ ] Unit tests cover event schemas, canonical subscription identity, secret validation, filtering, expiry, retry classification, and payload size.
+- [ ] Security tests cover callback SSRF cases, redirect rejection, challenge mismatch, timeout, and secret rotation.
+- [ ] Restart test proves durable subscription refresh and delivery across process/worker restart.
+- [ ] Existing modern/legacy MCP tests remain green.
+- [ ] Live ChatGPT Work E2E confirms: discover -> list -> subscribe -> callback verification -> matching event -> ChatGPT task reaction -> unsubscribe.
+- [ ] Live E2E also verifies a non-matching event is not delivered.
+- [ ] Event-triggered actions are checked for feedback loops.
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve authenticated routing, owner isolation, bounded disclosure, and durable-state migration; reject unsafe egress or ambiguous ownership.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+- 2026-10-05: V1 defaults and egress architecture were selected. Fabric remains the subscription/outbox owner; the Host sender is a constrained transport, not a subscription or task authority. Remote live ChatGPT and credentialed Access gates remain NOT RUN until executed.
+
+## 2026-10-05 実行パケット
+
+- [`fabric-events-subscription-store`](../polished/20261005-fabric-events-subscription-store.md)
+- [`fabric-events-host-sender`](../polished/20261005-fabric-events-host-sender.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: open
 Repository: `f4ah6o/temote-mcp`
 Related:
 - `issues/open/20261001-fabric-openai-mcp-extensions.md`
-- `issues/open/20260927-bounded-wait-for-delegated-tasks.md`
+- `issues/polished/20260927-bounded-wait-for-delegated-tasks.md`
 - `issues/open/20260926-temote-fabric-product-boundary.md`
-Created: 2026-10-05 (Asia/Tokyo)
+> Historical Created: 2026-10-05 (Asia/Tokyo)
 
 ## 1. Goal
 
@@ -141,14 +262,14 @@ Equivalent argument objects with different key order must not create duplicate s
 
 Repeated subscribe requests for the same identity refresh/update the existing subscription.
 
-Support `ttlMs` semantics:
+Support `ttlMs` semantics (Temote V1 policy):
 
-- omitted: server default lifetime;
-- finite value: grant no more than the requested duration, except for a documented minimum if needed to prevent pathological refresh;
-- `null`: request a non-expiring subscription;
-- return `refreshBefore: null` only if a non-expiring subscription is actually granted.
+- omitted: 24-hour lifetime;
+- finite value: grant no more than the requested duration and never more than 7 days;
+- `null`: request a non-expiring subscription, but grant a finite 24-hour lifetime in V1;
+- always return a finite `refreshBefore` in V1.
 
-On refresh with a replacement secret, replace the stored key and support a short bounded rotation window where old and new Standard Webhooks signatures are both accepted/sent as required.
+On refresh with a replacement secret, replace the stored key and dual-sign with old and new Standard Webhooks keys for 5 minutes, then retire the old key.
 
 `events/unsubscribe` must be authorized and idempotent.
 
@@ -172,7 +293,7 @@ Persist at least:
 
 Do not use process memory as the durable source of truth.
 
-The exact backend should follow the Fabric persistence direction rather than introducing an isolated one-off store solely for MCP Events.
+Fabric owns subscription and outbox persistence in its existing durable storage direction. The dedicated Host sender never becomes the subscription store. Hold queued delivery while its Host is offline, then resume only after the Host is authenticated and authorization/freshness is rechecked; drop at the entry or subscription expiry.
 
 ## 7. Callback verification and SSRF boundary
 
@@ -197,14 +318,14 @@ Requirements:
 
 On verification failure, return JSON-RPC error `-32015` (`CallbackEndpointError`) with a categorized reason such as `challenge_failed` or `timeout`.
 
-Callback networking must be fail-closed:
+Callback networking must be fail-closed through Fabric -> Access-protected Tunnel -> dedicated Host HTTPS sender:
 
 - HTTPS only;
 - resolve and validate destination addresses at connection time;
 - block loopback, private, link-local, local-network, metadata-service, and otherwise non-public destinations;
-- connect to the validated address while preserving the original hostname for TLS verification;
+- pin the validated public IP for the connection while preserving the original hostname for TLS/SNI and certificate verification;
 - never follow redirects;
-- repeat address validation for verification and every event delivery.
+- repeat address validation and IP pinning for verification and every event delivery.
 
 Successful verification may be cached by authenticated principal + callback URL only for a bounded period.
 

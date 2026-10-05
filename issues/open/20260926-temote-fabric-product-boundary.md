@@ -1,12 +1,109 @@
 # Temote Fabric: product name / responsibility boundary / gateway migration
 
-Status: implementation in progress / FBR1 complete  
+Status: open
+Model: unknown
+Created: 2026-09-26
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Migrate Gateway terminology and deployment identity to Temote Fabric with backward-compatible paths and durable-state protection.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Gateway names remain in commands, deployment, and source paths while durable state and existing clients depend on them.
+
+## 目標
+
+Migrate Gateway terminology and deployment identity to Temote Fabric with backward-compatible paths and durable-state protection.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+Use `temote` and Temote Fabric as forward-facing names while retaining `temote-mcp`, the current environment prefix, Gateway commands/routes, and existing state as backward-compatible migration surfaces. One integration PR coordinates the remaining phases. Host runtime updates and `cf` CLI deployment to `temote.f12o.com` are selected execution steps after implementation and available-environment checks; this issue preparation does not report them as performed. Protect credentials and DO/D1 state through coexistence and rollback.
+
+### Preserved fixed contract: 1. Naming decision
+
+The shared remote substrate currently implemented under `gateway/` is named **Temote Fabric**.
+
+The name extends the product idea of **Temote = 手元 + remote**.
+
+Temote should let a caller use work happening "at hand" and remotely without changing the execution model merely because the caller or executor moved.
+
+Temote Fabric is the connective side of that idea:
+
+```text
+Temote
+  手元 × remote
+  "where the caller/executor is should not change the work model"
+
+Temote Fabric
+  local × remote × hosts × heads × context
+  "where the work happened should not break routing or continuity"
+```
+
+Fabric is not a new execution authority.
+It is the authenticated shared substrate connecting Temote Hosts and callers.
+
+## 受け入れ条件
+
+Complete source criteria from “17. Acceptance” (unchecked items remain unverified):
+
+The naming/migration is complete when:
+
+- [ ] a new user can understand Temote Host vs Temote Fabric without learning the old Gateway architecture
+- [ ] Fabric is not described as Task/Execution authority
+- [ ] local execution works with Fabric unavailable
+- [ ] a Host can reconnect and catch observation sync up idempotently
+- [ ] remote callers can route to Hosts through Fabric
+- [ ] repository context can be read through Fabric up to the last synced revision while Hosts are offline
+- [ ] current gateway users have a non-destructive migration path
+- [ ] no DO/D1 state is silently lost because of the rename
+- [ ] public contract changes are intentional and versioned
+- [ ] code separates routing, observation, context, and memory responsibilities
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve existing `temote-mcp`/Gateway names as compatibility aliases during migration and protect DO/D1 state and authenticated Host identity.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`fabric-naming-deployment-migration`](../polished/20261005-fabric-naming-deployment-migration.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: implementation in progress / FBR1 complete
 Repository: `f4ah6o/temote-mcp`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related:
 - `issues/open/20260925-observation-context-memory-plane.md`
 - `issues/done/20260926-cloud-observation-knowledge-plane.md`
-Created: 2026-09-26 (Asia/Tokyo)
+> Historical Created: 2026-09-26 (Asia/Tokyo)
 
 ## 1. Naming decision
 

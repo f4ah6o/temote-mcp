@@ -1,11 +1,170 @@
 # O1P: agent-side user prompt observation ingress
 
-Status: open / design parent — P0+P1 polished as `issues/polished/20261001-agent-prompt-local-ingress-contract.md`; P2-P7 remain
+Status: open
+Model: unknown
+Created: 2026-10-01
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Observe supported direct-agent user prompts and steering through local durable ingress without collecting hidden prompts.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Some direct user-agent turns occur outside Temote’s current observable task boundary.
+
+## 目標
+
+Observe supported direct-agent user prompts and steering through local durable ingress without collecting hidden prompts.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: 15. Non-goals
+
+Initial scope excludes:
+
+- replacing Codex/Devin chat UIs
+- forcing all user prompts through Temote
+- generic chat archive/search
+- planner or autonomous agent routing
+- automatic task creation from every prompt
+- hidden reasoning capture
+- Shuttle integration
+- multi-host raw prompt synchronization
+- cloud prompt-body storage by default
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+P0/P1 are a prepared local-ingress packet, not completed implementation. For P2/P3, inspect each installed agent's actual prompt-hook surface before implementing an adapter. If a native hook cannot observe direct user turns, record `coverage=unavailable` or `partial` with its reason; never synthesize prompt observations from task metadata. Correlation and context projection follow durable ingress.
+
+### Preserved fixed contract: 2. Decision
+
+Keep Temote as the canonical local observation/context store, but add a **small agent-side prompt observation ingress**.
+
+Codex / Devin integrations should emit a bounded user-instruction lifecycle event to Temote when a user-visible prompt or steer is accepted by that agent.
+
+Do not require the user to route all prompts through Temote.
+
+Do not move agent execution ownership into the observation layer.
+
+Target shape:
+
+```text
+User
+  |----------------------+
+  v                      v
+Codex                  Devin
+  | prompt hook           | prompt hook
+  +-----------+-----------+
+              |
+              v
+      Temote local observer
+              |
+      +-------+--------+
+      |                |
+      v                v
+ raw local events   derived context
+      |                |
+      +-------> memory worker
+```
+
+The hook exists only to close the causal gap between direct agent conversation and Temote-observed execution.
+
+## 受け入れ条件
+
+Complete source criteria from “16. Acceptance” (unchecked items remain unverified):
+
+- [ ] Before attempting each direct-agent acceptance flow, record the installed Codex/Devin hook capability. If no supported hook exists, record `coverage=unavailable` or `partial` and an explicit unsupported gap; never mark a fabricated prompt event as PASS.
+
+### A. Codex direct prompt
+
+1. user sends a prompt directly to Codex
+2. prompt does not pass through an ordinary Temote task API
+3. Codex integration emits one `user_prompt_accepted`
+4. Temote stores it locally with stable conversation/source identity
+5. later Temote task/execution can be correlated to the prompt
+6. `context_resolve` exposes the direct observed user intent with provenance
+
+### B. Devin direct prompt
+
+Same acceptance as A using Devin ACP or Devin Cloud.
+
+### C. Cross-agent continuation
+
+1. user instructs Codex
+2. Codex performs work through Temote
+3. Codex conversation stops
+4. Devin later asks Temote for context
+5. Devin can obtain:
+   - latest observed user intent
+   - completed/in-progress Temote state
+   - relevant evidence/test state
+   - unresolved work
+   - provenance showing which facts came from direct prompt vs execution observation
+
+No manual handoff message from Codex is required.
+
+### D. Sensitive prompt
+
+1. user prompt contains credential-like/private content
+2. raw body is retained only in owner-only local storage
+3. normal remote context/status does not expose the raw body
+4. Fabric/cloud replication contains no prompt body by default
+5. worker input follows local content policy
+
+### E. Restart/idempotency
+
+1. hook emits an event
+2. delivery response is lost
+3. integration retries the same source event
+4. only one durable observation exists
+5. observer/Temote restart preserves cursor and coverage state
+
+### F. Missing hook
+
+If a direct prompt surface cannot be observed, context reports `coverage=unavailable` or `partial`; it does not synthesize a prompt.
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`agent-prompt-hook-capabilities`](../polished/20261005-agent-prompt-hook-capabilities.md)
+- [`agent-prompt-correlation-context`](../polished/20261005-agent-prompt-correlation-context.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: open / design parent — P0+P1 polished as `issues/polished/20261001-agent-prompt-local-ingress-contract.md`; P2-P7 remain
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Related: `issues/closed/20260925-agent-conversation-continuation.md`
-Created: 2026-10-01 (Asia/Tokyo)
+> Historical Created: 2026-10-01 (Asia/Tokyo)
 
 ## 0. Triage / next packet
 

@@ -1,6 +1,97 @@
 # NR1: physical cwd → named-root reverse resolution for local session start
 
-Status: ready (revised 2026-09-27 per PR #73 review: duplicate-canonical-root
+Status: polished
+Model: unknown
+Created: 2026-09-27
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Reverse-resolve local cwd to a named-root logical path with deterministic overlap handling.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+The preserved design records a concrete remaining contract or defect; its implementation and verification have not been completed in this normalization pass.
+
+## 目標
+
+Reverse-resolve local cwd to a named-root logical path with deterministic overlap handling.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: 2. Fixed decisions
+
+- Logical identity = `root_name` + `relative_path` (parent §5); the canonical
+  physical path remains host-local execution/diagnostic data.
+- Nested/overlapping roots resolve deterministically (parent §6.4): pick the
+  longest matching canonical root path.
+- Equal-length ambiguity is eliminated at config load, not resolved at lookup:
+  `NamedRoots::parse` (`src/named_roots.rs`) rejects a `TEMOTE_MCP_ROOTS`
+  config where two distinct names canonicalize to the same physical directory
+  — startup config error naming both roots. The logical root name is durable
+  identity, so a same-directory duplicate must never resolve by map/iteration
+  order (parent forbids that fallback). `reverse_resolve` additionally fails
+  (never picks) if more than one root matches at equal depth — unreachable
+  once parse rejects, kept as defense-in-depth.
+- Symlinked cwd is canonicalized before matching (reuse
+  `config::canonical_directory`), so a symlink cannot escape into a root
+  (parent §13 "Symlink escape").
+- Outside-all-roots cwd keeps working in this slice but emits a recorded
+  deprecation warning and marks the session metadata (Phase B); hard fail is
+  deferred to NR3.
+- Sessions started by explicit logical path (`roots.resolve` at
+  `src/supervisor.rs:446`) are unchanged.
+
+## 受け入れ条件
+
+Complete source criteria from “5. Acceptance” (unchecked items remain unverified):
+
+- [ ] A compat `start` whose cwd sits inside a named root records the logical root-relative identity.
+- [ ] Nested/overlapping roots resolve deterministically (longest match), and equal-length ambiguity is impossible: duplicate canonical roots are rejected at parse, and `reverse_resolve` errors rather than picks on any residual equal-depth match.
+- [ ] A symlinked path inside a root resolves; a symlink escaping all roots is treated as outside-roots (warn), never mis-bound.
+- [ ] Outside-roots cwd still starts (Phase B warn only) — no behavior break.
+- [ ] Existing explicit-logical-path start is untouched.
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+### Source test details: 6. Validation commands
+
+- `cargo test --bin temote-mcp --all-features --locked named_roots`
+- `cargo test --bin temote-mcp --all-features --locked supervisor`
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
+- `cargo check --no-default-features --all-targets`
+- `just sandboxed-check`
+- macOS path-canonicalization differences: host gate, NOT RUN here.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 既存設計・履歴
+
+> Historical Status: ready (revised 2026-09-27 per PR #73 review: duplicate-canonical-root
 tie policy fixed at parse time).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`

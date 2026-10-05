@@ -1,11 +1,10 @@
 # Bound delegated-task waiting and avoid unchanged polling responses
 
-Status: open — measured P1 friction; BW1 semantic-revision prerequisite is polished
-Model: gpt-6-sol
+Status: polished
+Model: unknown
 Created: 2026-09-27
-Updated: 2026-09-27
-Branch: feat/20260927-bounded-wait-for-delegated-tasks
-Polished prerequisite: `issues/polished/20261001-task-get-semantic-revision-stability.md` (BW1, ready)
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
 
 ## 概要
 
@@ -29,10 +28,11 @@ Do not add executable command inputs, relax session ownership, inline transcript
 
 ## 提案する方針
 
-Measure semantic changes separately from each reconciliation attempt. Evaluate a bounded `wait_ms` on `*_task_get` against one shared `task_wait` operation, accounting for MCP transport timeouts and each backend's poll cost. Keep a cursor/revision contract and return retryable transport diagnostics without changing `operation_id` semantics for starts or controls.
+After BW1 stabilizes semantic revisions, add optional `wait_ms` to each existing backend-specific `*_task_get`: omitted defaults to `0` (current nonblocking behavior), and accepted values are integers from `0` through `30000`. The read returns as soon as a meaningful revision or terminal state appears, otherwise a compact unchanged/timeout result at the deadline. Do not add a shared `task_wait` API. Bound backend probe cost, cancel on session stop or generation replacement, and preserve the existing `after_revision` and scoped-evidence contracts.
 
 ## 受け入れ条件
 
+- [ ] With `wait_ms` omitted or `0`, each `*_task_get` retains its current nonblocking response contract; negative, noninteger, and values over `30000` are rejected.
 - [ ] A live OpenCode and Devin task can be tracked to terminal with fewer MCP calls than repeated short-interval `task_get` polling, with measured counts.
 - [ ] An unchanged wait returns a compact, explicit timeout/unchanged response without advancing a semantic revision.
 - [ ] Waiting across a transient backend or transport failure cannot start or replay a task.
@@ -42,7 +42,7 @@ Measure semantic changes separately from each reconciliation attempt. Evaluate a
 
 ## テスト計画
 
-- Add deterministic long-running, unchanged, terminal, transient-error, and session-replacement tests for the chosen API.
+- Add deterministic default-zero, `30000` boundary, invalid-value, unchanged, terminal, transient-error, and session-replacement tests for each backend-specific API.
 - Run the repository format, Rust test/clippy/no-default, gateway, and diff checks.
 - Dogfood the candidate MCP server against the same long-running agent flow and record actual calls and response sizes.
 
@@ -60,4 +60,5 @@ A server-side loop that polls a backend too often could reduce client calls with
 
 ## 注記
 
-This is measured P1 friction. Implement BW1 first. The exact bounded-wait API shape remains intentionally open until the semantic cursor is stable and transport/backend behavior can be measured without revision churn.
+This is measured P1 friction. Implement BW1 first. The API shape and numeric bound were selected on 2026-10-05; performance measurements remain to be run.
+- 2026-10-05: The wait_ms contract is fixed; BW1 remains a prerequisite and implementation/tests remain pending.

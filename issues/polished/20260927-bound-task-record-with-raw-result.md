@@ -1,10 +1,10 @@
 # Keep completed task records within the storage limit when retaining raw results
 
-Status: ready
-Model: gpt-6-sol
+Status: polished
+Model: unknown
 Created: 2026-09-27
-Updated: 2026-09-27
-Branch: fix/20260927-bound-task-record-with-raw-result
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
 
 ## 概要
 

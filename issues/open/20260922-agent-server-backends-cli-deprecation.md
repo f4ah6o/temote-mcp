@@ -1,11 +1,90 @@
 # Agent backends: server-primary (Codex app-server / OpenCode serve + Rust SDK) with staged CLI deprecation
 
+Status: open
+Model: unknown
+Created: 2026-09-22
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Finish the measured server-backend parity work and retire legacy one-shot argv paths only after equivalent behavior is demonstrated.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Server backends are present, but credentialed parity and legacy one-shot cleanup remain separate unfinished work.
+
+## 目標
+
+Finish the measured server-backend parity work and retire legacy one-shot argv paths only after equivalent behavior is demonstrated.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: Non-goals
+
+- `codex` / `opencode` binary の廃止 (serve / app-server も同一 binary 経由)。
+- parity 未実測での CLI 経路削除。
+- ~~`local_agent_run` の sandboxed one-shot tier の即時廃止 (別途判断)。~~ → 2026-09-24 に削除済み (Progress 参照)。
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: Decision
+
+Codex および OpenCode の delegation / local-agent 経路を、長期的に server 系インターフェース優先とする。
+
+- Codex: `codex app-server --stdio` (実装済み `codex_status` / `codex_task_start` / `codex_task_get` / `codex_task_control`)
+- OpenCode: `opencode serve` HTTP + SSE。クライアントは `f4ah6o/unofficial-opencode-sdk-rs` (V1/current を primary、V2 preview は opt-in)
+
+`codex exec` / `opencode run` の argv 統合面は、live parity 実測後に段階的に legacy 化 → 削除する。serve / app-server も同一 vendor binary 経由なので、廃止対象は binary ではなく one-shot subcommand 経路である。
+
+## 受け入れ条件
+
+Complete source criteria from “Acceptance” (unchecked items remain unverified):
+
+- server backend が `codex_task_*` と同等の idempotent / typed-control / scoped-evidence 契約で動作する。
+- parity matrix の各項目が PASS、または棄却理由が記録されている。
+- CLI 経路の legacy 化・削除が docs と code で一致している。
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`server-backend-legacy-cli-cleanup`](../polished/20261005-server-backend-legacy-cli-cleanup.md)
+- [`native-report-capability-adapters`](../polished/20261005-native-report-capability-adapters.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
 ## Status
 
 open — server-primary backends implemented; residual live parity and legacy CLI cleanup tracked here
 
-Model: coordinator decision (f4ah6o)
-Created: 2026-09-22 (Asia/Tokyo)
+> Historical Model: coordinator decision (f4ah6o)
+> Historical Created: 2026-09-22 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Triage (2026-09-27): keep open for credentialed parity residuals and final legacy one-shot argv cleanup; do not treat already-landed server backends as unfinished.
 
