@@ -1473,20 +1473,7 @@ impl SessionSupervisor {
                 .get("models")
                 .and_then(Value::as_array)
                 .context("Codex provisioning model inventory is unavailable")?;
-            let selected = models
-                .iter()
-                .filter_map(|entry| {
-                    let model = entry.get("model")?.as_str()?;
-                    let efforts = entry.get("efforts")?.as_array()?;
-                    let effort = if efforts.iter().any(|item| item.as_str() == Some("medium")) {
-                        "medium"
-                    } else {
-                        efforts.first()?.as_str()?
-                    };
-                    Some((model.to_owned(), effort.to_owned()))
-                })
-                .min_by(|left, right| left.0.cmp(&right.0))
-                .context("unsupported: Codex advertises no provisioning model and effort")?;
+            let selected = provisioning_model(models)?;
             receipt = store
                 .update(operation_id, |record| {
                     record.preparation_model = Some(selected.0);
@@ -3057,12 +3044,125 @@ impl SessionSupervisor {
     }
 }
 
+fn provisioning_model(models: &[Value]) -> Result<(String, String)> {
+    let visible = models
+        .iter()
+        .filter(|entry| entry.get("hidden").and_then(Value::as_bool) != Some(true))
+        .collect::<Vec<_>>();
+    let defaults = visible
+        .iter()
+        .filter(|entry| entry.get("is_default").and_then(Value::as_bool) == Some(true))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        defaults.len() <= 1,
+        "unsupported: Codex advertises ambiguous provisioning defaults"
+    );
+    let candidate = |entry: &Value| {
+        let model = entry
+            .get("model")?
+            .as_str()
+            .filter(|value| !value.is_empty())?;
+        let efforts = entry.get("efforts")?.as_array()?;
+        let advertised = |effort: &str| {
+            !effort.is_empty() && efforts.iter().any(|item| item.as_str() == Some(effort))
+        };
+        let effort = entry
+            .get("default_effort")
+            .and_then(Value::as_str)
+            .filter(|effort| advertised(effort))
+            .or_else(|| advertised("medium").then_some("medium"))
+            .or_else(|| {
+                efforts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|e| !e.is_empty())
+            })?;
+        Some((model.to_owned(), effort.to_owned()))
+    };
+    // Preserve catalog order for legacy inventories without a default. Never let a
+    // hidden auxiliary model win merely because its name sorts before user models.
+    if let Some(default) = defaults.first() {
+        candidate(default)
+            .context("unsupported: Codex default has no provisioning model and effort")
+    } else {
+        visible
+            .into_iter()
+            .find_map(candidate)
+            .context("unsupported: Codex advertises no visible provisioning model and effort")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn provisioning_model_uses_visible_catalog_default_and_advertised_effort() {
+        let models = vec![
+            json!({"model":"auxiliary", "hidden":true, "is_default":true, "efforts":["high"]}),
+            json!({"model":"first", "efforts":["medium"]}),
+            json!({"model":"default", "is_default":true, "default_effort":"high", "efforts":["medium","high"]}),
+        ];
+        assert_eq!(
+            provisioning_model(&models).unwrap(),
+            ("default".into(), "high".into())
+        );
+        let legacy = vec![
+            json!({"model":"z-first", "efforts":["high","medium"]}),
+            json!({"model":"a-second", "efforts":["low"]}),
+        ];
+        assert_eq!(
+            provisioning_model(&legacy).unwrap(),
+            ("z-first".into(), "medium".into())
+        );
+        assert!(provisioning_model(&[models[2].clone(), models[2].clone()]).is_err());
+        assert!(provisioning_model(&[models[0].clone()]).is_err());
+        assert!(
+            provisioning_model(&[
+                json!({"model":"invalid-default", "is_default":true, "efforts":[]}),
+                models[1].clone()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provisioning_model_generated_catalog_never_selects_hidden_or_unadvertised_values()
+    -> noprop::TestResult {
+        test_support::run(0x5052_4f56_4d4f_444c, 64, |ctx| {
+            let valid_model = noprop::sample_usize_in(ctx, 0..=1) == 1;
+            let has_effort = noprop::sample_usize_in(ctx, 0..=1) == 1;
+            let default_effort = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => "",
+                1 => "high",
+                _ => "unadvertised",
+            };
+            let expected_model = format!("catalog-{:x}", noprop::sample_u64(ctx));
+            let model = if valid_model {
+                expected_model.as_str()
+            } else {
+                ""
+            };
+            let default = json!({"model":model, "is_default":true, "default_effort":default_effort, "efforts":if has_effort {vec!["", "high"]} else {vec![""]}});
+            let hidden = json!({"model":"auxiliary", "hidden":true, "is_default":true, "efforts":["medium"]});
+            let fallback = json!({"model":"visible-other", "efforts":["medium"]});
+            let mut models = vec![hidden, default, fallback];
+            models.rotate_left(noprop::sample_usize_in(ctx, 0..=2));
+            let selected = provisioning_model(&models);
+            if valid_model && has_effort {
+                assert_eq!(selected.unwrap(), (expected_model, "high".to_owned()));
+            } else {
+                assert!(
+                    selected.is_err(),
+                    "invalid default must not choose another catalog entry"
+                );
+            }
+            Ok(())
+        })
+    }
 
     async fn cleanup_session(id: &str) {
         let _ = tokio::fs::remove_file(config::socket_path(id).unwrap()).await;

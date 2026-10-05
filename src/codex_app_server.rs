@@ -3808,6 +3808,30 @@ fn advertised_effort_name(entry: &Value) -> Option<&str> {
         .or_else(|| entry.as_str())
 }
 
+fn advertised_model(entry: &Value) -> Option<Value> {
+    let model = entry.get("model")?.as_str()?;
+    let efforts = entry
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| advertised_effort_name(item).map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut advertised = json!({"model": model, "efforts": efforts});
+    for (native, public) in [("hidden", "hidden"), ("isDefault", "is_default")] {
+        if let Some(value) = entry.get(native).and_then(Value::as_bool) {
+            advertised[public] = json!(value);
+        }
+    }
+    if let Some(effort) = entry.get("defaultReasoningEffort").and_then(Value::as_str) {
+        advertised["default_effort"] = json!(effort);
+    }
+    Some(advertised)
+}
+
 fn validate_model_request(models: &Value, model: &str, effort: &str) -> Result<()> {
     let data = models
         .get("data")
@@ -3853,23 +3877,7 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
         .get("data")
         .and_then(Value::as_array)
         .context("Codex model/list response is missing data")?;
-    let advertised = data
-        .iter()
-        .filter_map(|entry| {
-            let model = entry.get("model")?.as_str()?;
-            let efforts = entry
-                .get("supportedReasoningEfforts")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| advertised_effort_name(item).map(str::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Some(json!({"model": model, "efforts": efforts}))
-        })
-        .collect::<Vec<_>>();
+    let advertised = data.iter().filter_map(advertised_model).collect::<Vec<_>>();
     let app_server_version = app_server_version_from_initialize_response(&initialized);
     Ok(json!({
         "compatible": true,
@@ -9224,6 +9232,23 @@ for raw in sys.stdin:
             Some("high")
         );
         assert_eq!(advertised_effort_name(&json!("medium")), Some("medium"));
+    }
+
+    #[test]
+    fn model_inventory_preserves_native_selection_metadata_without_inventing_legacy_defaults() {
+        let legacy = json!({"model":"legacy", "supportedReasoningEfforts":["medium"]});
+        assert_eq!(
+            advertised_model(&legacy).unwrap(),
+            json!({"model":"legacy", "efforts":["medium"]})
+        );
+        let mut current = legacy;
+        current["hidden"] = json!(false);
+        current["isDefault"] = json!(true);
+        current["defaultReasoningEffort"] = json!("medium");
+        assert_eq!(
+            advertised_model(&current).unwrap(),
+            json!({"model":"legacy", "efforts":["medium"], "hidden":false, "is_default":true, "default_effort":"medium"})
+        );
     }
 
     fn initialize_response(user_agent: &str) -> Value {
