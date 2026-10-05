@@ -88,7 +88,7 @@ impl CapturedStartEnvironment {
         let values = CAPTURED_START_ENV_NAMES
             .iter()
             .filter_map(|name| {
-                let value = std::env::var(name).ok();
+                let value = temote_mcp::environment::var(name).ok();
                 value
                     .filter(|value| !value.is_empty())
                     .map(|value| ((*name).to_owned(), value))

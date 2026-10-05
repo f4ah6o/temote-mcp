@@ -416,7 +416,8 @@ fn audience_matches(value: Option<&Value>, expected: &str) -> bool {
 }
 
 fn required_env(name: &str) -> Result<String> {
-    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
+    let value =
+        temote_mcp::environment::var(name).with_context(|| format!("{name} is required"))?;
     anyhow::ensure!(!value.trim().is_empty(), "{name} must not be empty");
     Ok(value)
 }

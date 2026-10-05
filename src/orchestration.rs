@@ -14,10 +14,93 @@
 
 pub(crate) mod outcome;
 mod requests;
+mod wait;
+
+/// Begin a Change delivery through the ordinary typed Codex task boundary.
+/// The durable intent is written first. An accepted retry only returns its
+/// receipt; remote state must be reconciled before another task is started.
+// Keep each typed authority and request component explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn change_delivery_start(
+    store: &crate::change::ChangeStore,
+    change_id: &str,
+    expected_revision: u64,
+    plan: &crate::delivery::DeliveryPlan,
+    operation_id: uuid::Uuid,
+    session: &crate::config::Session,
+    actor: &crate::observation::ActorRef,
+    model: &str,
+    effort: &str,
+) -> anyhow::Result<crate::delivery::DeliveryReceipt> {
+    let (receipt, claimed) =
+        crate::delivery::accept_once(store, change_id, expected_revision, plan, operation_id)?;
+    let step = plan
+        .steps
+        .iter()
+        .find(|step| step.change_id == change_id)
+        .ok_or_else(|| anyhow::anyhow!("Change absent from delivery plan"))?;
+    let args = serde_json::json!({
+        "operation_id": operation_id.to_string(),
+        "task": crate::delivery::delegated_instruction(step),
+        "model": model,
+        "effort": effort,
+    });
+    let view = if claimed {
+        invoke_codex_task_start_with_admission(
+            &args,
+            session,
+            &crate::codex_app_server::TaskStartOrigin::Generic,
+            actor,
+            None,
+            || {
+                let current = store.get(change_id)?;
+                crate::change_cli::bound_delivery_admitted(session, &current)?;
+                anyhow::ensure!(
+                    current
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|accepted| accepted.operation_id == operation_id
+                            && accepted.plan_fingerprint == plan.fingerprint
+                            && accepted.state == crate::delivery::DeliveryState::Accepted)
+                        && current.writer.is_none(),
+                    "delivery admission changed before delegated startup"
+                );
+                Ok(())
+            },
+        )
+        .await?
+    } else if receipt.delegated_task_id.is_some() {
+        return Ok(receipt);
+    } else {
+        crate::codex_app_server::task_start_receipt_if_retained(
+            &args,
+            session,
+            &crate::codex_app_server::TaskStartOrigin::Generic,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "delivery reconciliation_required: accepted start has no retained task receipt"
+            )
+        })?
+    };
+    let task_id = view
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("delivery task accepted without task_id; reconciliation required")
+        })?;
+    crate::delivery::record_delegation(
+        store,
+        change_id,
+        store.get(change_id)?.revision,
+        operation_id,
+        task_id,
+    )
+}
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use temote_mcp::activity::contract::{ActivityErrorKind, ActivitySummary};
@@ -202,6 +285,11 @@ impl Backend {
     }
 
     async fn task_control(self, args: &Value, session: &config::Session) -> Result<Value> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .context("task control action missing at backend admission")?;
+        crate::change_cli::authorize_bound_control(session, action).await?;
         #[cfg(test)]
         tests::note_backend_dispatch();
         match self {
@@ -237,6 +325,30 @@ pub(crate) async fn invoke(
     // Typed request boundary: malformed input and unsupported actions are
     // rejected before any approval prompt or backend side effect.
     let request = TaskRequest::parse(backend, operation, args)?;
+    // Keep a bound task's observed revision stable until the VCS Accepted
+    // receipt is durable. Helpers have distinct task IDs and do not recurse.
+    let _bound_admission = if actor.transport != "change-cli"
+        && matches!(operation, Operation::TaskGet | Operation::TaskControl)
+    {
+        args.get("task_id")
+            .and_then(Value::as_str)
+            .map(|id| crate::change_cli::bound_task_admission(session, id))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if matches!(operation, Operation::TaskStart | Operation::TaskControl) {
+        anyhow::ensure!(
+            crate::repository_store::RepositoryStore::new()?
+                .find_by_preparation_session_id(&session.id)?
+                .is_none(),
+            "managed preparation sessions require their accepted typed operation"
+        );
+    }
+    if operation == Operation::TaskStart {
+        crate::change_cli::authorize_bound_start(session).await?;
+    }
     // The instruction is observed before approval: a denied or failed
     // dispatch still leaves the caller's ask in the journal, while
     // acceptance and outcomes are separate observations.
@@ -252,15 +364,57 @@ pub(crate) async fn invoke(
             authorize(backend, operation, session, detail, metadata, activity).await?;
             backend.task_start(args, session).await
         }
-        TaskRequest::Get(_) => backend.task_get(args, session).await,
+        TaskRequest::Get(request) if request.wait_ms == 0 => backend.task_get(args, session).await,
+        TaskRequest::Get(request) => {
+            let mut probe_args = args.clone();
+            if let Some(args) = probe_args.as_object_mut() {
+                args.remove("after_revision");
+                args.remove("wait_ms");
+            }
+            wait::for_update(
+                request.task_id,
+                request.after_revision,
+                request.wait_ms,
+                || async {
+                    let current = config::read_session_metadata(&session.id).await?;
+                    anyhow::ensure!(
+                        serde_json::to_value(&current)? == serde_json::to_value(session)?,
+                        "session instance changed while waiting"
+                    );
+                    anyhow::ensure!(
+                        config::session_is_active(&session.id).await?,
+                        "session stopped while waiting"
+                    );
+                    backend.task_get(&probe_args, session).await
+                },
+            )
+            .await
+        }
         // Read-only projection of retained state: approval-free like
         // task_get; it never reconciles or mutates.
         TaskRequest::List => backend.task_list(args, session).await,
         TaskRequest::Control(request) => {
+            crate::change_cli::authorize_bound_control(session, request.action.as_str()).await?;
             let (detail, metadata) = task_control_approval(backend, request);
             authorize(backend, operation, session, detail, metadata, activity).await?;
             backend.task_control(args, session).await
         }
+    };
+    let result = match result {
+        Ok(view)
+            if actor.transport != "change-cli"
+                && matches!(
+                    operation,
+                    Operation::TaskStart | Operation::TaskGet | Operation::TaskControl
+                ) =>
+        {
+            Box::pin(crate::change_cli::observe_bound_task_view(
+                session, backend, &view,
+            ))
+            .await
+            .map(|()| view)
+        }
+        other => other,
     };
     observation::record_outcome(session, actor, backend, operation, &request, &result);
     result
@@ -284,14 +438,30 @@ where
     let backend = Backend::Codex;
     let operation = Operation::TaskStart;
     let request = TaskRequest::parse(backend, operation, args)?;
+    if let Some(receipt) = crate::repository_store::RepositoryStore::new()?
+        .find_by_preparation_session_id(&session.id)?
+    {
+        crate::repository_store::RepositoryStore::authorize_preparation_task(
+            &receipt, session, args,
+        )?;
+    }
     observation::record_instruction(session, actor, backend, operation, &request, args);
     let TaskRequest::Start(start) = &request else {
         unreachable!("Codex task-start parser returned a different operation")
     };
     let (detail, metadata) = task_start_approval(start);
     authorize(backend, operation, session, detail, metadata, activity).await?;
-    let result =
-        codex_app_server::task_start_with_admission(args, session, origin, admission).await;
+    let result = codex_app_server::task_start_with_admission(args, session, origin, || {
+        if let Some(receipt) = crate::repository_store::RepositoryStore::new()?
+            .find_by_preparation_session_id(&session.id)?
+        {
+            crate::repository_store::RepositoryStore::authorize_preparation_task(
+                &receipt, session, args,
+            )?;
+        }
+        admission()
+    })
+    .await;
     observation::record_outcome(session, actor, backend, operation, &request, &result);
     result
 }
@@ -398,6 +568,14 @@ fn codex_task_start_approval(
     metadata.insert("operation_id".to_owned(), operation_id.clone());
     metadata.insert("model".to_owned(), model.clone());
     metadata.insert("effort".to_owned(), effort.clone());
+    metadata.insert(
+        "continuation".to_owned(),
+        match options.continuation {
+            codex_app_server::CodexContinuation::New => "new",
+            codex_app_server::CodexContinuation::PreviousTask { .. } => "previous_task",
+        }
+        .to_owned(),
+    );
     metadata.insert("task_input".to_owned(), "omitted".to_owned());
     (
         format!(
@@ -447,6 +625,7 @@ fn opencode_task_start_approval(
     let model = render_optional_approval_argument(options.model);
     let agent = render_optional_approval_argument(options.agent);
     let variant = render_optional_approval_argument(options.variant);
+    let workspace_requirement = render_optional_approval_argument(options.workspace_requirement);
     let mut metadata = approval_metadata(
         Backend::OpenCode,
         "opencode_task_start",
@@ -458,10 +637,14 @@ fn opencode_task_start_approval(
     metadata.insert("model".to_owned(), model.clone());
     metadata.insert("agent".to_owned(), agent.clone());
     metadata.insert("variant".to_owned(), variant.clone());
+    metadata.insert(
+        "workspace_requirement".to_owned(),
+        workspace_requirement.clone(),
+    );
     metadata.insert("task_input".to_owned(), "omitted".to_owned());
     (
         format!(
-            "OpenCode delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\nagent: {agent}\nvariant: {variant}\noperation_id: {operation_id}\ntask input: omitted"
+            "OpenCode delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\nagent: {agent}\nvariant: {variant}\nworkspace requirement: {workspace_requirement}\noperation_id: {operation_id}\ntask input: omitted"
         ),
         metadata,
     )

@@ -416,6 +416,10 @@ pub struct SessionLifecycle {
     pub exit_reason: Option<String>,
     pub last_error: Option<String>,
     pub logical_path: Option<String>,
+    #[serde(default)]
+    pub root_name: Option<String>,
+    #[serde(default)]
+    pub root_relative_path: Option<String>,
     pub restart_policy: String,
     #[serde(default)]
     pub restart_count: u32,
@@ -429,6 +433,13 @@ pub struct SessionLifecycle {
 
 impl SessionLifecycle {
     pub fn starting(started_at: u64, logical_path: Option<String>) -> Self {
+        let (root_name, root_relative_path) = logical_path
+            .as_deref()
+            .map(|path| {
+                let (name, relative) = path.split_once('/').unwrap_or((path, ""));
+                (Some(name.to_owned()), Some(relative.to_owned()))
+            })
+            .unwrap_or((None, None));
         Self {
             status: LifecycleStatus::Starting,
             started_at,
@@ -436,6 +447,8 @@ impl SessionLifecycle {
             exit_reason: None,
             last_error: None,
             logical_path,
+            root_name,
+            root_relative_path,
             restart_policy: "never".to_owned(),
             restart_count: 0,
             last_restart_at: None,
@@ -556,7 +569,7 @@ fn socket_dir() -> Result<PathBuf> {
     // optional namespace exists for isolated process-boundary tests or
     // deliberately parallel supervisors owned by the same user.
     let euid = unsafe { libc::geteuid() };
-    let namespace = std::env::var("TEMOTE_MCP_SOCKET_NAMESPACE")
+    let namespace = temote_mcp::environment::var("TEMOTE_MCP_SOCKET_NAMESPACE")
         .ok()
         .filter(|value| !value.is_empty());
     default_socket_dir(euid, namespace.as_deref())
@@ -583,13 +596,13 @@ fn socket_dir_for(euid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf>
 fn validate_socket_namespace(namespace: &str) -> Result<()> {
     anyhow::ensure!(
         !namespace.is_empty() && namespace.len() <= 12,
-        "TEMOTE_MCP_SOCKET_NAMESPACE must contain 1..=12 ASCII characters"
+        "TEMOTE_SOCKET_NAMESPACE must contain 1..=12 ASCII characters"
     );
     anyhow::ensure!(
         namespace
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
-        "TEMOTE_MCP_SOCKET_NAMESPACE accepts only ASCII letters, digits, '-' and '_'"
+        "TEMOTE_SOCKET_NAMESPACE accepts only ASCII letters, digits, '-' and '_'"
     );
     Ok(())
 }

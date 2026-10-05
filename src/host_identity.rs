@@ -4,7 +4,7 @@ pub const HOST_ID_ENV: &str = "TEMOTE_MCP_HOST_ID";
 const MAX_HOST_ID_BYTES: usize = 128;
 
 pub fn resolve() -> Result<String> {
-    match std::env::var(HOST_ID_ENV) {
+    match temote_mcp::environment::var(HOST_ID_ENV) {
         Ok(value) if !value.trim().is_empty() => validate(&value),
         Ok(_) => anyhow::bail!("{HOST_ID_ENV} must not be empty"),
         Err(std::env::VarError::NotPresent) => validate(&os_hostname()?),
@@ -49,8 +49,8 @@ fn os_hostname() -> Result<String> {
 
 #[cfg(not(unix))]
 fn os_hostname() -> Result<String> {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
+    temote_mcp::environment::var("COMPUTERNAME")
+        .or_else(|_| temote_mcp::environment::var("HOSTNAME"))
         .context("failed to determine OS hostname")
 }
 

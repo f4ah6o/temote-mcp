@@ -41,7 +41,7 @@ pub async fn resolve_public_url(
     match profile {
         Profile::Cloudflare => {
             let value = explicit
-                .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
+                .or_else(|| temote_mcp::environment::var("TEMOTE_MCP_PUBLIC_URL").ok())
                 .context(
                     "TEMOTE_MCP_PUBLIC_URL is required for the cloudflare profile; pass --public-url or create ~/.config/temote-mcp/public.env",
                 )?;
@@ -68,7 +68,7 @@ pub async fn resolve_public_url(
                     PublicEndpoint::parse(&tailscale_origin(&hostname, port))
                 }
                 Err(derive_error) => {
-                    let value = std::env::var("TEMOTE_MCP_PUBLIC_URL").with_context(|| {
+                    let value = temote_mcp::environment::var("TEMOTE_MCP_PUBLIC_URL").with_context(|| {
                         format!(
                             "could not derive the Tailscale public endpoint ({derive_error:#}); set TEMOTE_MCP_PUBLIC_URL explicitly"
                         )

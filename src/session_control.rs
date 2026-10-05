@@ -22,6 +22,7 @@ use crate::approvals::{
 };
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::host_identity;
+use crate::local_tasks::{self, SessionInstance, TaskPacket};
 use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
 use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
@@ -107,6 +108,14 @@ enum ControlRequest {
         #[serde(default)]
         public: bool,
     },
+    StartManaged {
+        operation_id: Uuid,
+        request: crate::repository_store::ManagedRequest,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
+        #[serde(default)]
+        public: bool,
+    },
     StartLocal {
         cwd: PathBuf,
         session_id: Option<String>,
@@ -118,6 +127,7 @@ enum ControlRequest {
     Info {
         session_id: String,
     },
+    Task(Box<TaskPacket>),
     RepositoryCloneAdmission {
         session_id: String,
         root: String,
@@ -434,6 +444,45 @@ impl SessionBackend {
                 }))
             }
         }
+    }
+
+    pub async fn start_managed(
+        &self,
+        operation_id: Uuid,
+        managed_request: crate::repository_store::ManagedRequest,
+    ) -> Result<Value> {
+        let result = match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor
+                    .start_managed_repository(
+                        operation_id,
+                        managed_request,
+                        true,
+                        CapturedStartEnvironment::default(),
+                    )
+                    .await
+            }
+            Self::LocalControl => {
+                request(ControlRequest::StartManaged {
+                    operation_id,
+                    request: managed_request,
+                    environment: CapturedStartEnvironment::default(),
+                    public: true,
+                })
+                .await
+            }
+        };
+        result.map_err(|error| {
+            let message = format!("{error:#}");
+            if message.contains("operation_conflict") {
+                anyhow::anyhow!("operation_conflict: operation_id was accepted with different inputs")
+            } else if message.contains("reconciliation_required") {
+                anyhow::anyhow!("reconciliation_required: managed provisioning ownership cannot be proven")
+            } else {
+                anyhow::anyhow!("managed provisioning failed; retry with the same operation_id to inspect its receipt")
+            }
+        })
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<()> {
@@ -947,6 +996,33 @@ pub async fn start_named(session_id: String, path: String) -> Result<()> {
     print_json(&result)
 }
 
+pub async fn start_managed_named(
+    source: String,
+    operation_id: String,
+    base: Option<String>,
+    vcs: String,
+) -> Result<()> {
+    let operation_id = Uuid::parse_str(&operation_id).context("operation_id must be a UUID")?;
+    let repository = crate::session_source::RepositoryId::parse(&source, "github.com")?;
+    let vcs =
+        serde_json::from_value(Value::String(vcs)).context("vcs must be auto, jujutsu, or git")?;
+    let managed_request = crate::repository_store::ManagedRequest {
+        repository,
+        base,
+        vcs,
+    };
+    managed_request.validate()?;
+    ensure_supervisor_for_start().await?;
+    let result = request(ControlRequest::StartManaged {
+        operation_id,
+        request: managed_request,
+        environment: CapturedStartEnvironment::capture(),
+        public: false,
+    })
+    .await?;
+    print_json(&result)
+}
+
 pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     ensure_supervisor_for_start().await?;
@@ -983,6 +1059,52 @@ pub async fn list() -> Result<()> {
 
 pub async fn info(session_id: String) -> Result<()> {
     let result = request(ControlRequest::Info { session_id }).await?;
+    print_json(&result)
+}
+
+#[cfg(feature = "network")]
+pub(crate) async fn event_session_view(session_id: &str) -> Result<SessionView> {
+    serde_json::from_value(
+        request(ControlRequest::Info {
+            session_id: session_id.to_owned(),
+        })
+        .await?,
+    )
+    .context("invalid authoritative session view")
+}
+
+pub async fn task(invocation: crate::task_cli::TaskInvocation) -> Result<()> {
+    let ping = request(ControlRequest::Ping).await?;
+    anyhow::ensure!(
+        ping.get("local_task_protocol").and_then(Value::as_u64)
+            == Some(local_tasks::PROTOCOL_VERSION),
+        "running supervisor does not support local task protocol v{}; use MCP task tools or update the supervisor before using `task --local`",
+        local_tasks::PROTOCOL_VERSION
+    );
+    let view: SessionView = serde_json::from_value(
+        request(ControlRequest::Info {
+            session_id: invocation.session_id.clone(),
+        })
+        .await?,
+    )?;
+    anyhow::ensure!(view.status == "active", "session is not active");
+    let packet = TaskPacket {
+        schema_version: local_tasks::PROTOCOL_VERSION,
+        session_id: invocation.session_id,
+        instance: SessionInstance {
+            cwd: view.cwd,
+            started_at: view.started_at,
+            process_id: view.process_id,
+            permission_mode: view.permission_mode,
+            permitted_directories: view.permitted_directories,
+            grants: view.grants,
+        },
+        action: invocation.action,
+    };
+    packet.validate()?;
+    let result = request(ControlRequest::Task(Box::new(packet))).await.context(
+        "reconciliation_required: local task response uncertain; reconcile with `task list/get --local` or MCP, and never retry with a fresh operation ID"
+    )?;
     print_json(&result)
 }
 
@@ -1217,6 +1339,7 @@ async fn dispatch_request(
             "boot_generation": crate::boot_identity::generation(),
             "pid": std::process::id(),
             "control_protocol": CONTROL_PROTOCOL_VERSION,
+            "local_task_protocol": local_tasks::PROTOCOL_VERSION,
             "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
             "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
             "roots_configured": supervisor.roots_configured(),
@@ -1250,6 +1373,17 @@ async fn dispatch_request(
             }
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::StartManaged {
+            operation_id,
+            request,
+            environment,
+            public,
+        } => {
+            environment.validate()?;
+            supervisor
+                .start_managed_repository(operation_id, request, public, environment)
+                .await
+        }
         ControlRequest::StartLocal {
             cwd,
             session_id,
@@ -1268,6 +1402,7 @@ async fn dispatch_request(
         ControlRequest::Info { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::Task(packet) => local_tasks::dispatch(*packet).await,
         ControlRequest::RepositoryCloneAdmission {
             session_id,
             root,
@@ -3051,6 +3186,40 @@ pub(crate) async fn activity_replay(
     activity_replay_on_stream(stream, session_id, tail).await
 }
 
+/// Follow the supervisor's actual lifecycle activity seam. A gap is fatal:
+/// event delivery must never infer missing transitions from a later snapshot.
+#[cfg(feature = "network")]
+pub(crate) async fn follow_lifecycle_activity(
+    sender: tokio::sync::mpsc::Sender<ActivityEvent>,
+) -> Result<()> {
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    let mut connection = ActivityClientConnection::attach(stream, None, 0, true).await?;
+    loop {
+        match connection.next_frame().await? {
+            Some(ActivityClientFrame::Event(event)) => {
+                if matches!(
+                    event.operation(),
+                    temote_mcp::activity::contract::ActivityOperation::SessionStart
+                        | temote_mcp::activity::contract::ActivityOperation::SessionStop
+                        | temote_mcp::activity::contract::ActivityOperation::SessionRestart
+                        | temote_mcp::activity::contract::ActivityOperation::SessionCrash
+                        | temote_mcp::activity::contract::ActivityOperation::SessionAutoRestart
+                ) {
+                    sender
+                        .send(event)
+                        .await
+                        .context("lifecycle event receiver closed")?;
+                }
+            }
+            Some(ActivityClientFrame::End) => {}
+            Some(ActivityClientFrame::Gap { .. }) => anyhow::bail!("lifecycle activity stream gap"),
+            None => anyhow::bail!("lifecycle activity stream closed"),
+        }
+    }
+}
+
 pub async fn run_activity_command(
     session_id: Option<String>,
     tail: usize,
@@ -3885,6 +4054,8 @@ async fn persist_crash(
 /// relabeling them as stopped, crashed, or active.
 const SESSION_STATUS_DEGRADED: &str = "degraded";
 const SESSION_WORKSPACE_DEGRADED: &str = "session workspace is missing or not resolvable";
+const SESSION_METADATA_DEGRADED: &str =
+    "supervisor-owned session metadata is missing or unreadable";
 const SESSION_LIVENESS_UNKNOWN: &str = "session liveness could not be determined safely";
 
 pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
@@ -4021,14 +4192,18 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
 }
 
 async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<SessionView>> {
-    let owned_ids = supervisor.owned_session_ids().await;
-    let owned = owned_ids.iter().cloned().collect::<HashSet<_>>();
+    let snapshots = supervisor.owned_session_snapshots().await;
+    let owned = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect::<HashSet<_>>();
     let mut sessions = Vec::new();
 
-    for id in owned_ids {
-        let session = inspect_session_read_only(&id)
-            .await
-            .with_context(|| format!("failed to inspect supervisor-owned session {id}"))?;
+    for snapshot in snapshots {
+        let session = match inspect_session_read_only(&snapshot.id).await {
+            Ok(session) => session,
+            Err(_) => degraded_owned_session_view(snapshot).await?,
+        };
         push_control_session_view(&mut sessions, session, true)?;
     }
 
@@ -4052,6 +4227,52 @@ async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<Sessio
         }
     }
     Ok(sessions)
+}
+
+async fn degraded_owned_session_view(snapshot: config::Session) -> Result<SessionView> {
+    let id = snapshot.id.clone();
+    let yolo = snapshot.yolo();
+    // The lifecycle file is a separate durable record and the same session ID
+    // can be reused. Only copy facts from the incarnation held by this runtime
+    // snapshot. Lifecycle records currently have no full instance UUID.
+    let lifecycle = config::read_session_lifecycle(&id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.started_at == snapshot.started_at);
+    Ok(SessionView {
+        host_id: host_identity::resolve()?,
+        id: id.clone(),
+        session_id: id,
+        status: SESSION_STATUS_DEGRADED.to_owned(),
+        // A socket probe alone cannot bind liveness to this retained runtime
+        // instance when durable metadata is unavailable.
+        pid: None,
+        process_id: snapshot.process_id,
+        cwd: snapshot.cwd,
+        permitted_directories: snapshot.permitted_directories,
+        started_at: snapshot.started_at,
+        stopped_at: lifecycle.as_ref().and_then(|state| state.stopped_at),
+        exit_reason: lifecycle
+            .as_ref()
+            .and_then(|state| state.exit_reason.clone()),
+        last_error: Some(SESSION_METADATA_DEGRADED.to_owned()),
+        permission_mode: snapshot.permission_mode,
+        yolo,
+        grants: snapshot.grants,
+        logical_path: lifecycle
+            .as_ref()
+            .and_then(|state| state.logical_path.clone()),
+        workspace: None,
+        restart_policy: lifecycle.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |state| state.restart_policy.clone(),
+        ),
+        restart_count: lifecycle.as_ref().map_or(0, |state| state.restart_count),
+        last_restart_at: lifecycle.as_ref().and_then(|state| state.last_restart_at),
+        next_restart_at: lifecycle.as_ref().and_then(|state| state.next_restart_at),
+        restart_limit_reason: lifecycle.and_then(|state| state.restart_limit_reason),
+    })
 }
 
 pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
@@ -5845,6 +6066,151 @@ mod tests {
         supervisor.shutdown().await.unwrap();
         cleanup(&healthy_id).await;
         cleanup(&stale_id).await;
+    }
+
+    #[tokio::test]
+    async fn session_list_degrades_missing_and_corrupt_owned_metadata_without_repair() {
+        let (_temp, roots, _) = named_root_fixture(&["healthy", "damaged"]);
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let healthy_id = format!("list-healthy-{}", uuid::Uuid::new_v4());
+        let damaged_id = format!("list-damaged-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start("src/healthy", Some(&healthy_id))
+            .await
+            .unwrap();
+        supervisor
+            .start("src/damaged", Some(&damaged_id))
+            .await
+            .unwrap();
+        let path = config::session_path(&damaged_id).unwrap();
+        let lifecycle_path = config::session_lifecycle_path(&damaged_id).unwrap();
+        let lifecycle_before = tokio::fs::read(&lifecycle_path).await.unwrap();
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        let missing = list_session_views(&supervisor).await.unwrap();
+        assert!(
+            !path.exists(),
+            "read-only listing must not recreate missing metadata"
+        );
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+        assert_eq!(
+            missing
+                .iter()
+                .find(|view| view.session_id == healthy_id)
+                .unwrap()
+                .status,
+            "active"
+        );
+        let damaged = missing
+            .iter()
+            .find(|view| view.session_id == damaged_id)
+            .unwrap();
+        assert_eq!(damaged.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(
+            damaged.last_error.as_deref(),
+            Some(SESSION_METADATA_DEGRADED)
+        );
+        assert!(damaged.workspace.is_none());
+        assert_ne!(damaged.status, "active");
+
+        let corrupt = b"{invalid metadata";
+        tokio::fs::write(&path, corrupt).await.unwrap();
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), corrupt);
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|view| view.session_id == healthy_id)
+                .unwrap()
+                .status,
+            "active"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|view| view.session_id == damaged_id)
+                .unwrap()
+                .status,
+            SESSION_STATUS_DEGRADED
+        );
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&healthy_id).await;
+        cleanup(&damaged_id).await;
+    }
+
+    #[tokio::test]
+    async fn degraded_owned_snapshot_never_claims_active_pid() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = format!("snapshot-degraded-{}", uuid::Uuid::new_v4());
+        let snapshot = config::Session {
+            id: id.clone(),
+            cwd: fixture.path().to_path_buf(),
+            permitted_directories: Vec::new(),
+            started_at: 42,
+            process_id: 1234,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let view = degraded_owned_session_view(snapshot).await.unwrap();
+        assert_eq!(view.session_id, id);
+        assert_eq!(view.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(view.process_id, 1234);
+        assert_eq!(view.pid, None);
+        assert_eq!(view.last_error.as_deref(), Some(SESSION_METADATA_DEGRADED));
+        assert!(view.workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn degraded_owned_snapshot_ignores_lifecycle_from_reused_id() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = format!("snapshot-reused-{}", uuid::Uuid::new_v4());
+        let snapshot = config::Session {
+            id: id.clone(),
+            cwd: fixture.path().to_path_buf(),
+            permitted_directories: Vec::new(),
+            started_at: 42,
+            process_id: 1234,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let mut stale = config::SessionLifecycle::starting(41, Some("old/repo".to_owned()));
+        stale.stopped_at = Some(50);
+        stale.exit_reason = Some("old incarnation".to_owned());
+        stale.restart_policy = "old policy".to_owned();
+        stale.restart_count = 7;
+        config::save_session_lifecycle(&id, &stale).await.unwrap();
+
+        let view = degraded_owned_session_view(snapshot.clone()).await.unwrap();
+        assert_eq!(view.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(view.started_at, 42);
+        assert_eq!(view.stopped_at, None);
+        assert_eq!(view.exit_reason, None);
+        assert_eq!(view.logical_path, None);
+        assert_eq!(view.restart_policy, "unknown");
+        assert_eq!(view.restart_count, 0);
+
+        stale.started_at = snapshot.started_at;
+        stale.exit_reason = Some("matching incarnation".to_owned());
+        stale.logical_path = Some("current/repo".to_owned());
+        config::save_session_lifecycle(&id, &stale).await.unwrap();
+        let matching = degraded_owned_session_view(snapshot).await.unwrap();
+        assert_eq!(matching.stopped_at, Some(50));
+        assert_eq!(
+            matching.exit_reason.as_deref(),
+            Some("matching incarnation")
+        );
+        assert_eq!(matching.logical_path.as_deref(), Some("current/repo"));
+        tokio::fs::remove_file(config::session_lifecycle_path(&id).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

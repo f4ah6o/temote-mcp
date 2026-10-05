@@ -8,6 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 #[cfg(feature = "network")]
 use tokio::sync::watch;
@@ -45,6 +46,36 @@ use temote_mcp::activity::scope::{ActivityEmitError, ActivityEmitter, ActivitySc
 const MAX_MANAGED_SESSIONS: usize = 64;
 const MAX_AUTOMATIC_RESTARTS: u32 = 5;
 const MAX_RESTART_BACKOFF_SECONDS: u64 = 30;
+
+async fn reconcile_pinned_repository_claim(
+    store: &crate::repository_store::RepositoryStore,
+    root: &Path,
+    receipt: &crate::repository_store::ProvisioningReceipt,
+    preparation: &config::Session,
+) -> Result<()> {
+    let owner = receipt
+        .preparation_owner
+        .as_ref()
+        .context("managed preparation owner is missing")?;
+    anyhow::ensure!(
+        owner.activity_instance_id == receipt.task_operation_id && owner.matches(preparation),
+        "managed preparation owner changed before repository claim reconciliation"
+    );
+    let pinned_base = receipt
+        .pinned_base
+        .as_deref()
+        .context("managed pinned base is missing")?;
+    anyhow::ensure!(
+        crate::workspace_provisioning::inspect_ready(root, receipt)? == pinned_base,
+        "managed ready marker and pinned base differ"
+    );
+    // The store checks repository and operation under its lifecycle lock. In
+    // particular, a later Ready claim owned by another operation is never
+    // claimed or changed by this recovery path.
+    store
+        .mark_repository_ready(&receipt.request.repository, receipt.operation_id)
+        .await
+}
 
 fn activity_now_ms() -> u64 {
     SystemTime::now()
@@ -267,14 +298,105 @@ fn begin_agent_session_shutdown(session: &config::Session) {
     crate::devin_acp::begin_session_shutdown(session);
 }
 
-/// Remove this session's tasks and owned runtimes across every agent-task
-/// backend, returning the first failure while still attempting each backend.
+type AgentCleanupFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+struct AgentCleanupErrors(Vec<(&'static str, anyhow::Error)>);
+
+impl std::fmt::Display for AgentCleanupErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "agent session cleanup failed for ")?;
+        for (index, (provider, _)) in self.0.iter().enumerate() {
+            if index != 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{provider}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for AgentCleanupErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for AgentCleanupErrors {}
+
+async fn collect_agent_cleanup_results(
+    cleanups: Vec<(&'static str, AgentCleanupFuture<'_>)>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for (provider, cleanup) in cleanups {
+        if let Err(error) = cleanup.await {
+            failures.push((provider, error));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AgentCleanupErrors(failures).into())
+    }
+}
+
+/// Remove this session's owned local children. Devin Cloud tasks run remotely;
+/// the supervisor releases its local CloudPendingObserver separately during
+/// session stop/restart and retains the remote task records for reconciliation.
 async fn remove_agent_sessions(session: &config::Session) -> Result<()> {
-    crate::codex_app_server::remove_session(session).await?;
+    let mut cleanups: Vec<(&'static str, AgentCleanupFuture<'_>)> = vec![(
+        "Codex",
+        Box::pin(crate::codex_app_server::remove_session(session)),
+    )];
     #[cfg(feature = "network")]
-    crate::opencode_server::remove_session(session).await?;
-    crate::devin_acp::remove_session(session).await?;
-    Ok(())
+    cleanups.push((
+        "OpenCode",
+        Box::pin(crate::opencode_server::remove_session(session)),
+    ));
+    cleanups.push((
+        "Devin ACP",
+        Box::pin(crate::devin_acp::remove_session(session)),
+    ));
+    collect_agent_cleanup_results(cleanups).await
+}
+
+#[cfg(test)]
+mod agent_cleanup_aggregation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_failure_does_not_skip_later_providers_or_leak_backend_payload() {
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cleanups = ["Codex", "OpenCode", "Devin ACP"]
+            .into_iter()
+            .map(|provider| {
+                let attempts = attempts.clone();
+                let cleanup: AgentCleanupFuture<'_> = Box::pin(async move {
+                    attempts.lock().unwrap().push(provider);
+                    if provider == "Devin ACP" {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("secret-child-output-sentinel")
+                    }
+                });
+                (provider, cleanup)
+            })
+            .collect();
+        let error = collect_agent_cleanup_results(cleanups).await.unwrap_err();
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            ["Codex", "OpenCode", "Devin ACP"]
+        );
+        assert_eq!(
+            error.downcast_ref::<AgentCleanupErrors>().unwrap().0.len(),
+            2
+        );
+        assert_eq!(
+            error.to_string(),
+            "agent session cleanup failed for Codex, OpenCode"
+        );
+        assert!(!format!("{error:?}").contains("secret-child-output-sentinel"));
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -333,6 +455,91 @@ pub struct ManagedSessionInfo {
     pub status: &'static str,
     pub permission_mode: config::PermissionMode,
     pub yolo: bool,
+}
+
+pub(crate) fn managed_provisioning_view(
+    receipt: &crate::repository_store::ProvisioningReceipt,
+) -> Value {
+    let status = match receipt.phase {
+        crate::repository_store::ProvisioningPhase::WorkspaceReady => "workspace_ready",
+        crate::repository_store::ProvisioningPhase::Failed => "failed",
+        crate::repository_store::ProvisioningPhase::EnvironmentRetryable => "environment_retryable",
+        crate::repository_store::ProvisioningPhase::EnvironmentUnsupported => {
+            "environment_unsupported"
+        }
+        crate::repository_store::ProvisioningPhase::ReconciliationRequired => {
+            "reconciliation_required"
+        }
+        _ => "pending",
+    };
+    json!({
+        "session_id": receipt.session_id,
+        "status": status,
+        "provisioning": receipt.phase,
+        "repository_id": receipt.request.repository.logical_name(),
+        "workspace_id": receipt.workspace_id,
+        "change_id": receipt.change_id,
+        "task_id": receipt.task_id,
+        "preparation_session_id": receipt.preparation_session_id,
+        "pinned_base": receipt.pinned_base,
+        "environment": receipt.environment_attempt.as_ref().map(|attempt| json!({
+            "phase": attempt.phase,
+            "adapter": attempt.plan.adapter,
+            "operation_id": attempt.plan.operation_id,
+            "task_id": attempt.task_id,
+            "inputs_sha256": attempt.plan.inputs_sha256,
+        })),
+        "detail": receipt.detail,
+        "retryable": receipt.phase == crate::repository_store::ProvisioningPhase::EnvironmentRetryable,
+        "yolo": false,
+    })
+}
+
+pub(crate) async fn reconciled_managed_view(
+    receipt: &crate::repository_store::ProvisioningReceipt,
+    supervisor: Option<&SessionSupervisor>,
+) -> Value {
+    let mut view = managed_provisioning_view(receipt);
+    if receipt.phase != crate::repository_store::ProvisioningPhase::WorkspaceReady {
+        return view;
+    }
+    let Some(owner) = &receipt.activated_owner else {
+        view["status"] = json!("unknown");
+        return view;
+    };
+    if supervisor.is_none_or(|supervisor| {
+        supervisor.roots.canonical_root(&receipt.root_name) != receipt.canonical_root.as_deref()
+    }) {
+        view["status"] = json!("unknown");
+        return view;
+    }
+    let Ok(session) = config::read_session_metadata(&receipt.session_id).await else {
+        view["status"] = json!("unknown");
+        return view;
+    };
+    if !owner.matches(&session) {
+        view["status"] = json!("unknown");
+        return view;
+    }
+    let matching_runtime = if let Some(supervisor) = supervisor {
+        supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&receipt.session_id)
+            .is_some_and(|handle| {
+                handle.activity_session_instance() == Some(owner.activity_instance_id)
+            })
+    } else {
+        false
+    };
+    view["status"] = match config::session_is_active(&receipt.session_id).await {
+        Ok(true) if matching_runtime => json!("active"),
+        Ok(true) => json!("unknown"),
+        Ok(false) => json!("stopped"),
+        Err(_) => json!("unknown"),
+    };
+    view
 }
 
 pub struct SessionSupervisor {
@@ -524,6 +731,22 @@ impl SessionSupervisor {
         ids
     }
 
+    /// Retained runtime metadata for read-only enumeration when an owned
+    /// session's durable metadata cannot be read. Ownership is established by
+    /// the supervisor map, never inferred from the damaged metadata file.
+    pub(crate) async fn owned_session_snapshots(&self) -> Vec<config::Session> {
+        let _transition = self.transitions.lock().await;
+        let mut snapshots = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(RuntimeHandle::session_metadata)
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+        snapshots
+    }
+
     /// Authoritatively admit a repository clone at one configured named root.
     ///
     /// The transition lock keeps ownership/spec inspection coherent with
@@ -559,6 +782,762 @@ impl SessionSupervisor {
             "repository clone requires an active managed session"
         );
         Ok(snapshot)
+    }
+
+    async fn activate_managed_receipt(
+        &self,
+        store: &crate::repository_store::RepositoryStore,
+        mut receipt: crate::repository_store::ProvisioningReceipt,
+        public: bool,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<Value> {
+        if receipt.activated_owner.is_some() {
+            return Ok(reconciled_managed_view(&receipt, Some(self)).await);
+        }
+        let allocation = crate::workspace_provisioning::ready_allocation(&self.roots, &receipt)?;
+        let root = self
+            .roots
+            .canonical_root(&receipt.root_name)
+            .context("managed allocation root is unavailable")?;
+        let inspected_base = crate::workspace_provisioning::inspect_ready(root, &receipt)
+            .context("managed workspace readiness must be reconciled")?;
+        anyhow::ensure!(
+            receipt.pinned_base.as_deref() == Some(inspected_base.as_str()),
+            "reconciliation_required: managed workspace base differs from receipt"
+        );
+        let attempt = receipt
+            .environment_attempt
+            .as_ref()
+            .context("reconciliation_required: managed environment attempt is missing")?;
+        anyhow::ensure!(
+            attempt.phase == crate::environment_preparation::PreparationPhase::Ready,
+            "reconciliation_required: managed environment is not ready"
+        );
+        let preparation = config::read_session_metadata(&receipt.preparation_session_id).await?;
+        anyhow::ensure!(
+            receipt
+                .preparation_owner
+                .as_ref()
+                .is_some_and(|owner| owner.matches(&preparation))
+                && attempt.plan.session.matches(&preparation)
+                && attempt.plan.workspace == allocation.canonical_path
+                && attempt.plan.workspace_id == receipt.workspace_id
+                && attempt.plan.repository_id == receipt.request.repository,
+            "reconciliation_required: environment preparation owner or allocation changed"
+        );
+        attempt.plan.inspect_ready(&preparation)?;
+        let metadata = if receipt.runtime_start_attempted {
+            let sessions = self.sessions.lock().await;
+            let Some(handle) = sessions.get(&receipt.session_id) else {
+                drop(sessions);
+                receipt = store
+                    .update(receipt.operation_id, |record| {
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                        record.detail =
+                            Some("original runtime start outcome is unknown".to_owned());
+                        Ok(())
+                    })
+                    .await?;
+                return Ok(managed_provisioning_view(&receipt));
+            };
+            anyhow::ensure!(
+                handle.activity_session_instance() == Some(receipt.runtime_instance_id),
+                "reconciliation_required: managed runtime identity differs from accepted operation"
+            );
+            let metadata = handle.session_metadata();
+            anyhow::ensure!(
+                metadata.cwd == allocation.canonical_path,
+                "reconciliation_required: managed runtime workspace differs from allocation"
+            );
+            metadata
+        } else {
+            // A stopped or replaced session with the generated ID is never
+            // overwritten to satisfy a provisioning retry.
+            let metadata_path = config::session_path(&receipt.session_id)?;
+            match std::fs::symlink_metadata(&metadata_path) {
+                Ok(_) => anyhow::bail!(
+                    "reconciliation_required: managed session identity already exists"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => anyhow::bail!(
+                    "reconciliation_required: managed session identity cannot be inspected"
+                ),
+            }
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.runtime_start_attempted = true;
+                    Ok(())
+                })
+                .await?;
+            self.start_resolved_with_instance(
+                allocation.canonical_path,
+                receipt.session_id.clone(),
+                config::PermissionMode::Agent,
+                Some(allocation.logical_path),
+                environment,
+                public,
+                receipt.runtime_instance_id,
+            )
+            .await?;
+            let sessions = self.sessions.lock().await;
+            let handle = sessions
+                .get(&receipt.session_id)
+                .context("managed runtime disappeared during activation")?;
+            anyhow::ensure!(
+                handle.activity_session_instance() == Some(receipt.runtime_instance_id),
+                "reconciliation_required: managed runtime identity changed"
+            );
+            handle.session_metadata()
+        };
+        let owner = crate::repository_store::ActivatedSessionInstance::from_session(
+            &metadata,
+            receipt.runtime_instance_id,
+        );
+        receipt = store
+            .update(receipt.operation_id, |record| {
+                record.activated_owner = Some(owner);
+                record.phase = crate::repository_store::ProvisioningPhase::WorkspaceReady;
+                Ok(())
+            })
+            .await?;
+        Ok(reconciled_managed_view(&receipt, Some(self)).await)
+    }
+
+    async fn prepare_managed_environment(
+        &self,
+        store: &crate::repository_store::RepositoryStore,
+        mut receipt: crate::repository_store::ProvisioningReceipt,
+        preparation: &config::Session,
+        public: bool,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<Value> {
+        use crate::environment_preparation::{
+            DelegatedExecution, PreparationPhase, PreparationPlan, PreparationReceipt,
+        };
+        let root = self
+            .roots
+            .canonical_root(&receipt.root_name)
+            .context("managed preparation root is unavailable")?;
+        let base = crate::workspace_provisioning::inspect_ready(root, &receipt)?;
+        anyhow::ensure!(
+            receipt.pinned_base.as_deref() == Some(base.as_str()),
+            "reconciliation_required: allocation revision changed"
+        );
+        let allocation = crate::workspace_provisioning::ready_allocation(&self.roots, &receipt)?;
+        anyhow::ensure!(
+            receipt
+                .preparation_owner
+                .as_ref()
+                .is_some_and(|owner| owner.matches(preparation)),
+            "reconciliation_required: preparation owner changed"
+        );
+
+        if receipt
+            .environment_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.phase == PreparationPhase::Ready)
+        {
+            return self
+                .activate_managed_receipt(store, receipt, public, environment)
+                .await;
+        }
+
+        if receipt
+            .environment_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.phase == PreparationPhase::Failed)
+        {
+            // A terminal failed task permits a new, durably distinct attempt on
+            // the next exact managed-request retry.
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.environment_attempt_number = record
+                        .environment_attempt_number
+                        .checked_add(1)
+                        .context("environment attempt count exhausted")?;
+                    record.environment_attempt = None;
+                    record.phase = crate::repository_store::ProvisioningPhase::WorkspaceAllocating;
+                    Ok(())
+                })
+                .await?;
+        }
+
+        let mut created_attempt = false;
+        if receipt.environment_attempt.is_none() {
+            let Some(adapter) =
+                crate::environment_preparation::detect_adapter(&allocation.canonical_path)?
+            else {
+                receipt = store
+                    .update(receipt.operation_id, |record| {
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::EnvironmentUnsupported;
+                        record.detail = Some("unsupported_environment_adapter".to_owned());
+                        Ok(())
+                    })
+                    .await?;
+                return Ok(managed_provisioning_view(&receipt));
+            };
+            let label = format!("environment-attempt-{}", receipt.environment_attempt_number);
+            let operation_id = Uuid::new_v5(&receipt.operation_id, label.as_bytes());
+            let plan = PreparationPlan::new(
+                preparation,
+                receipt.workspace_id,
+                operation_id,
+                receipt.request.repository.clone(),
+                &allocation.canonical_path,
+                adapter,
+            )?;
+            let mut attempt = PreparationReceipt::new(plan);
+            attempt.model = receipt.preparation_model.clone();
+            attempt.effort = receipt.preparation_effort.clone();
+            anyhow::ensure!(
+                attempt.model.is_some() && attempt.effort.is_some(),
+                "managed preparation model selection is missing"
+            );
+            attempt.begin()?;
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.environment_attempt = Some(attempt);
+                    record.phase = crate::repository_store::ProvisioningPhase::EnvironmentPreparing;
+                    record.detail = None;
+                    Ok(())
+                })
+                .await?;
+            created_attempt = true;
+        }
+
+        let mut attempt = receipt
+            .environment_attempt
+            .clone()
+            .context("environment attempt missing")?;
+        anyhow::ensure!(
+            attempt.plan.session.matches(preparation)
+                && attempt.plan.workspace == allocation.canonical_path
+                && attempt.plan.workspace_id == receipt.workspace_id
+                && attempt.plan.repository_id == receipt.request.repository,
+            "reconciliation_required: environment attempt identity changed"
+        );
+        if attempt.plan.validate_scope().is_err() {
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.phase =
+                        crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                    record.detail = Some("environment inputs or scope changed".to_owned());
+                    Ok(())
+                })
+                .await?;
+            return Ok(managed_provisioning_view(&receipt));
+        }
+        let args = json!({
+            "session_id": preparation.id,
+            "operation_id": attempt.plan.operation_id,
+            "task": attempt.plan.delegated_task()?,
+            "model": attempt.model,
+            "effort": attempt.effort,
+        });
+        if attempt.task_id.is_none() && !created_attempt {
+            let recovered = crate::codex_app_server::task_start_replay_if_retained(
+                &args,
+                preparation,
+                &crate::codex_app_server::TaskStartOrigin::Generic,
+            )?;
+            if let Some(task_id) = recovered
+                .as_ref()
+                .and_then(|value| value.get("task_id"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                attempt.record_task(task_id)?;
+                let saved = attempt.clone();
+                receipt = store
+                    .update(receipt.operation_id, |record| {
+                        record.environment_attempt = Some(saved);
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::EnvironmentPreparing;
+                        record.detail = None;
+                        Ok(())
+                    })
+                    .await?;
+            } else {
+                receipt = store
+                    .update(receipt.operation_id, |record| {
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                        record.detail =
+                            Some("original environment task receipt is unavailable".to_owned());
+                        Ok(())
+                    })
+                    .await?;
+                return Ok(managed_provisioning_view(&receipt));
+            }
+        }
+        if let Some(task_id) = attempt.task_id {
+            let task = crate::orchestration::invoke(
+                crate::orchestration::Backend::Codex,
+                crate::orchestration::Operation::TaskGet,
+                &json!({"session_id": preparation.id, "task_id": task_id}),
+                preparation,
+                &crate::observation::ActorRef::mcp(public),
+                None,
+            )
+            .await?;
+            let execution = match task.get("status").and_then(Value::as_str) {
+                Some("completed") => DelegatedExecution::Completed,
+                Some("failed" | "interrupted" | "blocked") => DelegatedExecution::Failed,
+                Some("pending" | "running" | "waiting_approval" | "waiting_input") => {
+                    DelegatedExecution::Running
+                }
+                _ => DelegatedExecution::Unknown,
+            };
+            attempt.reconcile(preparation, execution)?;
+            let phase = attempt.phase;
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.environment_attempt = Some(attempt);
+                    record.phase = match phase {
+                        PreparationPhase::Ready => {
+                            crate::repository_store::ProvisioningPhase::WorkspaceAllocating
+                        }
+                        PreparationPhase::Failed => {
+                            crate::repository_store::ProvisioningPhase::EnvironmentRetryable
+                        }
+                        PreparationPhase::Uncertain => {
+                            crate::repository_store::ProvisioningPhase::ReconciliationRequired
+                        }
+                        _ => crate::repository_store::ProvisioningPhase::EnvironmentPreparing,
+                    };
+                    record.detail = match phase {
+                        PreparationPhase::Failed => Some(
+                            "environment preparation failed; retry with the same managed operation"
+                                .to_owned(),
+                        ),
+                        PreparationPhase::Uncertain => {
+                            Some("environment task outcome requires reconciliation".to_owned())
+                        }
+                        _ => None,
+                    };
+                    Ok(())
+                })
+                .await?;
+            return if phase == PreparationPhase::Ready {
+                self.activate_managed_receipt(store, receipt, public, environment)
+                    .await
+            } else {
+                Ok(managed_provisioning_view(&receipt))
+            };
+        }
+
+        // The attempt, complete input hash and model selection are durable
+        // before crossing the coding-agent boundary.
+        let plan = attempt.plan.clone();
+        let task = crate::orchestration::invoke_codex_task_start_with_admission(
+            &args,
+            preparation,
+            &crate::codex_app_server::TaskStartOrigin::Generic,
+            &crate::observation::ActorRef::mcp(public),
+            None,
+            || {
+                plan.validate_scope()?;
+                anyhow::ensure!(
+                    crate::workspace_provisioning::inspect_ready(root, &receipt)?
+                        == receipt.pinned_base.as_deref().unwrap_or_default(),
+                    "allocation revision changed before environment delegation"
+                );
+                Ok(())
+            },
+        )
+        .await;
+        let task_id = match task {
+            Ok(value) => value
+                .get("task_id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok()),
+            Err(_) => None,
+        };
+        let Some(task_id) = task_id else {
+            receipt = store
+                .update(receipt.operation_id, |record| {
+                    record.phase =
+                        crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                    record.detail =
+                        Some("environment start receipt is unavailable or uncertain".to_owned());
+                    Ok(())
+                })
+                .await?;
+            return Ok(managed_provisioning_view(&receipt));
+        };
+        attempt.record_task(task_id)?;
+        receipt = store
+            .update(receipt.operation_id, |record| {
+                record.environment_attempt = Some(attempt);
+                record.phase = crate::repository_store::ProvisioningPhase::EnvironmentPreparing;
+                Ok(())
+            })
+            .await?;
+        Ok(managed_provisioning_view(&receipt))
+    }
+
+    /// Accept or reconcile one managed repository request. The preparation
+    /// agent owns every repository and workspace mutation; the supervisor only
+    /// persists identity and starts a runtime after a checked ready marker.
+    pub(crate) async fn start_managed_repository(
+        &self,
+        operation_id: Uuid,
+        request: crate::repository_store::ManagedRequest,
+        public: bool,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<Value> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        let store = crate::repository_store::RepositoryStore::new()?;
+        let root_name = match store.read(operation_id)? {
+            Some(existing) => existing.root_name,
+            None => crate::workspace_provisioning::select_root(&self.roots)?,
+        };
+        let root = self
+            .roots
+            .canonical_root(&root_name)
+            .context("managed workspace root is unavailable")?
+            .to_path_buf();
+        let mut receipt = store
+            .accept(operation_id, request, &root_name, &root)
+            .await?;
+        if receipt.canonical_root.as_deref() != Some(root.as_path()) {
+            receipt = store
+                .update(operation_id, |record| {
+                    record.phase =
+                        crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                    record.detail = Some("accepted named-root scope cannot be proven".to_owned());
+                    Ok(())
+                })
+                .await?;
+            return Ok(managed_provisioning_view(&receipt));
+        }
+        if receipt.phase == crate::repository_store::ProvisioningPhase::WorkspaceReady {
+            return Ok(reconciled_managed_view(&receipt, Some(self)).await);
+        }
+        if receipt.phase == crate::repository_store::ProvisioningPhase::Failed
+            || (receipt.phase == crate::repository_store::ProvisioningPhase::ReconciliationRequired
+                && !(receipt.task_start_attempted
+                    && receipt.task_id.is_none()
+                    && receipt.preparation_owner.is_some())
+                && receipt.environment_attempt.is_none())
+        {
+            return Ok(managed_provisioning_view(&receipt));
+        }
+        if receipt.pinned_base.is_none()
+            && store
+                .claim_repository(&receipt.request.repository, operation_id)
+                .await?
+                == crate::repository_store::EnsureAdmission::Busy
+        {
+            receipt = store
+                .update(operation_id, |record| {
+                    record.phase = crate::repository_store::ProvisioningPhase::RepositoryPreparing;
+                    record.detail =
+                        Some("repository ensure is owned by another accepted operation".to_owned());
+                    Ok(())
+                })
+                .await?;
+            return Ok(managed_provisioning_view(&receipt));
+        }
+
+        if !self
+            .sessions
+            .lock()
+            .await
+            .contains_key(&receipt.preparation_session_id)
+        {
+            let metadata_path = config::session_path(&receipt.preparation_session_id)?;
+            let identity_exists = match std::fs::symlink_metadata(&metadata_path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            };
+            if receipt.preparation_start_attempted
+                || identity_exists
+                || config::session_is_active(&receipt.preparation_session_id).await?
+            {
+                receipt = store.update(operation_id, |record| {
+                    record.phase = crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                    record.detail = Some("original preparation session is unavailable or its identity is uncertain".to_owned());
+                    Ok(())
+                }).await?;
+                return Ok(managed_provisioning_view(&receipt));
+            }
+            receipt = store
+                .update(operation_id, |record| {
+                    record.preparation_start_attempted = true;
+                    Ok(())
+                })
+                .await?;
+            self.start_resolved_with_instance(
+                root.clone(),
+                receipt.preparation_session_id.clone(),
+                config::PermissionMode::Agent,
+                Some(root_name.clone()),
+                environment.clone(),
+                false,
+                receipt.task_operation_id,
+            )
+            .await?;
+        }
+        let preparation_handle = self.sessions.lock().await;
+        let handle = preparation_handle
+            .get(&receipt.preparation_session_id)
+            .context("preparation runtime disappeared")?;
+        anyhow::ensure!(
+            handle.activity_session_instance() == Some(receipt.task_operation_id),
+            "reconciliation_required: preparation runtime identity changed"
+        );
+        let preparation_owner = crate::repository_store::ActivatedSessionInstance::from_session(
+            &handle.session_metadata(),
+            receipt.task_operation_id,
+        );
+        drop(preparation_handle);
+        if let Some(owner) = &receipt.preparation_owner {
+            anyhow::ensure!(
+                owner == &preparation_owner,
+                "reconciliation_required: preparation session was replaced"
+            );
+        } else {
+            receipt = store
+                .update(operation_id, |record| {
+                    record.preparation_owner = Some(preparation_owner);
+                    Ok(())
+                })
+                .await?;
+        }
+        let preparation = config::read_session_metadata(&receipt.preparation_session_id).await?;
+        anyhow::ensure!(
+            preparation.cwd == root && !preparation.permission_mode.is_yolo(),
+            "preparation session scope changed"
+        );
+
+        if receipt.pinned_base.is_some() {
+            if receipt.phase == crate::repository_store::ProvisioningPhase::WorkspaceAllocating {
+                reconcile_pinned_repository_claim(&store, &root, &receipt, &preparation).await?;
+            }
+            return self
+                .prepare_managed_environment(&store, receipt, &preparation, public, environment)
+                .await;
+        }
+
+        if receipt.task_start_attempted && receipt.task_id.is_none() {
+            let replay = match (&receipt.preparation_model, &receipt.preparation_effort) {
+                (Some(model), Some(effort)) => {
+                    let args = json!({
+                        "session_id": receipt.preparation_session_id,
+                        "operation_id": receipt.task_operation_id,
+                        "task": crate::workspace_provisioning::delegated_task(&receipt)?,
+                        "model": model,
+                        "effort": effort,
+                    });
+                    crate::codex_app_server::task_start_replay_if_retained(
+                        &args,
+                        &preparation,
+                        &crate::codex_app_server::TaskStartOrigin::Generic,
+                    )?
+                }
+                _ => None,
+            };
+            if let Some(task_id) = replay
+                .as_ref()
+                .and_then(|value| value.get("task_id"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                receipt = store
+                    .update(operation_id, |record| {
+                        record.task_id = Some(task_id);
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::RepositoryPreparing;
+                        record.detail = None;
+                        Ok(())
+                    })
+                    .await?;
+            } else {
+                receipt = store
+                    .update(operation_id, |record| {
+                        record.phase =
+                            crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                        record.detail = Some(
+                            "delegated task start receipt is unavailable or uncertain".to_owned(),
+                        );
+                        Ok(())
+                    })
+                    .await?;
+                store
+                    .mark_repository_uncertain(&receipt.request.repository, operation_id)
+                    .await?;
+                return Ok(managed_provisioning_view(&receipt));
+            }
+        }
+
+        if let Some(task_id) = receipt.task_id {
+            let task = crate::orchestration::invoke(
+                crate::orchestration::Backend::Codex,
+                crate::orchestration::Operation::TaskGet,
+                &json!({"session_id": preparation.id, "task_id": task_id}),
+                &preparation,
+                &crate::observation::ActorRef::mcp(public),
+                None,
+            )
+            .await?;
+            match task.get("status").and_then(Value::as_str) {
+                Some("completed") => {
+                    let base = match crate::workspace_provisioning::inspect_ready(&root, &receipt) {
+                        Ok(base) => base,
+                        Err(_error) => {
+                            receipt = store
+                                .update(operation_id, |record| {
+                                    record.phase =
+                                        crate::repository_store::ProvisioningPhase::Failed;
+                                    record.detail = Some("workspace_readiness_invalid".to_owned());
+                                    Ok(())
+                                })
+                                .await?;
+                            store
+                                .mark_repository_uncertain(
+                                    &receipt.request.repository,
+                                    operation_id,
+                                )
+                                .await?;
+                            return Ok(managed_provisioning_view(&receipt));
+                        }
+                    };
+                    receipt = store
+                        .update(operation_id, |record| {
+                            record.pinned_base = Some(base);
+                            record.phase =
+                                crate::repository_store::ProvisioningPhase::WorkspaceAllocating;
+                            Ok(())
+                        })
+                        .await?;
+                    reconcile_pinned_repository_claim(&store, &root, &receipt, &preparation)
+                        .await?;
+                }
+                Some("failed" | "interrupted") => {
+                    receipt = store
+                        .update(operation_id, |record| {
+                            record.phase = crate::repository_store::ProvisioningPhase::Failed;
+                            record.detail =
+                                Some("delegated preparation did not complete".to_owned());
+                            Ok(())
+                        })
+                        .await?;
+                    store
+                        .mark_repository_uncertain(&receipt.request.repository, operation_id)
+                        .await?;
+                    return Ok(managed_provisioning_view(&receipt));
+                }
+                Some("reconciliation_required" | "unknown") => {
+                    receipt = store
+                        .update(operation_id, |record| {
+                            record.phase =
+                                crate::repository_store::ProvisioningPhase::ReconciliationRequired;
+                            record.detail =
+                                Some("delegated preparation requires reconciliation".to_owned());
+                            Ok(())
+                        })
+                        .await?;
+                    store
+                        .mark_repository_uncertain(&receipt.request.repository, operation_id)
+                        .await?;
+                    return Ok(managed_provisioning_view(&receipt));
+                }
+                _ => return Ok(managed_provisioning_view(&receipt)),
+            }
+        }
+
+        if receipt.pinned_base.is_some() {
+            return self
+                .prepare_managed_environment(&store, receipt, &preparation, public, environment)
+                .await;
+        }
+
+        let prompt = crate::workspace_provisioning::delegated_task(&receipt)?;
+        if receipt.preparation_model.is_none() || receipt.preparation_effort.is_none() {
+            let status = crate::orchestration::invoke(
+                crate::orchestration::Backend::Codex,
+                crate::orchestration::Operation::Status,
+                &json!({"session_id": preparation.id}),
+                &preparation,
+                &crate::observation::ActorRef::mcp(public),
+                None,
+            )
+            .await?;
+            let models = status
+                .get("models")
+                .and_then(Value::as_array)
+                .context("Codex provisioning model inventory is unavailable")?;
+            let selected = models
+                .iter()
+                .filter_map(|entry| {
+                    let model = entry.get("model")?.as_str()?;
+                    let efforts = entry.get("efforts")?.as_array()?;
+                    let effort = if efforts.iter().any(|item| item.as_str() == Some("medium")) {
+                        "medium"
+                    } else {
+                        efforts.first()?.as_str()?
+                    };
+                    Some((model.to_owned(), effort.to_owned()))
+                })
+                .min_by(|left, right| left.0.cmp(&right.0))
+                .context("unsupported: Codex advertises no provisioning model and effort")?;
+            receipt = store
+                .update(operation_id, |record| {
+                    record.preparation_model = Some(selected.0);
+                    record.preparation_effort = Some(selected.1);
+                    Ok(())
+                })
+                .await?;
+        }
+        let args = json!({
+            "session_id": receipt.preparation_session_id,
+            "operation_id": receipt.task_operation_id,
+            "task": prompt,
+            "model": receipt.preparation_model,
+            "effort": receipt.preparation_effort,
+        });
+        store
+            .update(operation_id, |record| {
+                record.task_start_attempted = true;
+                record.phase = crate::repository_store::ProvisioningPhase::RepositoryPreparing;
+                Ok(())
+            })
+            .await?;
+        let root_for_admission = root.clone();
+        let task = crate::orchestration::invoke_codex_task_start_with_admission(
+            &args,
+            &preparation,
+            &crate::codex_app_server::TaskStartOrigin::Generic,
+            &crate::observation::ActorRef::mcp(public),
+            None,
+            move || {
+                anyhow::ensure!(
+                    std::fs::canonicalize(&root_for_admission)? == root_for_admission,
+                    "managed named root changed before delegation"
+                );
+                Ok(())
+            },
+        )
+        .await?;
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .context("delegated provisioning did not return task_id")?;
+        let task_id = Uuid::parse_str(task_id)?;
+        receipt = store
+            .update(operation_id, |record| {
+                record.task_id = Some(task_id);
+                record.phase = crate::repository_store::ProvisioningPhase::RepositoryPreparing;
+                Ok(())
+            })
+            .await?;
+        Ok(managed_provisioning_view(&receipt))
     }
 
     #[cfg(test)]
@@ -655,14 +1634,17 @@ impl SessionSupervisor {
         let result = async {
             anyhow::ensure!(
                 self.roots_configured(),
-                "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
+                "named roots are not configured; set TEMOTE_MCP_ROOTS on the host before starting a session"
             );
             let cwd = self.roots.resolve(logical_path)?;
+            let logical_path = self.roots.reverse_resolve(&cwd)?.context(
+                "session path is outside configured named roots; configure TEMOTE_MCP_ROOTS on the host",
+            )?;
             self.start_resolved(
                 cwd,
                 id.clone(),
                 permission_mode,
-                Some(logical_path.to_owned()),
+                Some(logical_path),
                 environment,
                 public,
             )
@@ -703,7 +1685,21 @@ impl SessionSupervisor {
         let activity = self.activity_scope(ActivityOperation::SessionStart, id.clone());
         let result = async {
             let cwd = config::canonical_directory(cwd)?;
-            self.start_resolved(cwd, id, permission_mode, None, environment, false)
+            let logical_path = if permission_mode.is_yolo() {
+                self.roots.reverse_resolve(&cwd)?
+            } else {
+                Some(self.roots.reverse_resolve(&cwd)?.with_context(|| {
+                    if self.roots.is_empty() {
+                        "named roots are not configured; set TEMOTE_MCP_ROOTS on the host before starting a normal session".to_owned()
+                    } else {
+                        format!(
+                            "session cwd {} is outside configured named roots; configure TEMOTE_MCP_ROOTS on the host or start from an admitted root",
+                            cwd.display()
+                        )
+                    }
+                })?)
+            };
+            self.start_resolved(cwd, id, permission_mode, logical_path, environment, false)
                 .await
         }
         .await;
@@ -719,6 +1715,30 @@ impl SessionSupervisor {
         logical_path: Option<String>,
         environment: approvals::CapturedStartEnvironment,
         public: bool,
+    ) -> Result<ManagedSessionInfo> {
+        self.start_resolved_with_instance(
+            cwd,
+            id,
+            permission_mode,
+            logical_path,
+            environment,
+            public,
+            Uuid::new_v4(),
+        )
+        .await
+    }
+
+    // Keep each typed authority and request component explicit at this boundary.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_resolved_with_instance(
+        &self,
+        cwd: std::path::PathBuf,
+        id: String,
+        permission_mode: config::PermissionMode,
+        logical_path: Option<String>,
+        environment: approvals::CapturedStartEnvironment,
+        public: bool,
+        activity_instance_id: Uuid,
     ) -> Result<ManagedSessionInfo> {
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
@@ -741,6 +1761,49 @@ impl SessionSupervisor {
             "session {id} is already running"
         );
 
+        let metadata_path = config::session_path(&id)?;
+        let existing = match std::fs::symlink_metadata(&metadata_path) {
+            Ok(_) => Some(config::read_session_metadata(&id).await?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("cannot inspect existing session identity"),
+        };
+        let logical_path = if let Some(existing) = existing {
+            anyhow::ensure!(
+                existing.cwd == cwd && config::canonical_directory(&existing.cwd)? == cwd,
+                "session {id} stored cwd differs from the requested restart scope"
+            );
+            let stored = config::read_session_lifecycle(&id)
+                .await?
+                .and_then(|lifecycle| lifecycle.logical_path);
+            if let Some(path) = stored {
+                anyhow::ensure!(
+                    logical_path.as_deref() == Some(path.as_str())
+                        && self.roots.resolve(&path)? == cwd,
+                    "session {id} named root changed from its stored cwd"
+                );
+                Some(path)
+            } else {
+                // Old metadata had no logical root. Keep its proven physical
+                // scope for restart/restore without adopting today's mapping.
+                None
+            }
+        } else if permission_mode.is_yolo() {
+            logical_path
+        } else {
+            anyhow::ensure!(
+                !self.roots.is_empty(),
+                "named roots are not configured; set TEMOTE_MCP_ROOTS on the host before starting a normal session"
+            );
+            let path = logical_path.context(
+                "normal session is outside configured named roots; configure TEMOTE_MCP_ROOTS on the host",
+            )?;
+            anyhow::ensure!(
+                self.roots.resolve(&path)? == cwd,
+                "normal session named root no longer resolves to its cwd"
+            );
+            Some(path)
+        };
+
         // Serialize session admission with managed-worktree cleanup.  The
         // shared guard is held across cwd/worktree revalidation, runtime
         // metadata visibility and supervisor insertion; a cleanup that wins
@@ -753,6 +1816,12 @@ impl SessionSupervisor {
         .await
         .with_context(|| format!("cannot admit session {id}"))?;
         let cwd = admission.cwd.clone();
+        if let Some(path) = logical_path.as_deref() {
+            anyhow::ensure!(
+                self.roots.resolve(path)? == cwd,
+                "session named root changed during admission"
+            );
+        }
 
         let spec = RestartSpec {
             cwd: cwd.clone(),
@@ -768,7 +1837,10 @@ impl SessionSupervisor {
             self.approval_sender.clone(),
             logical_path,
             environment,
-            approvals::RuntimeActivity::new(Arc::clone(&self.activity_broker), Uuid::new_v4()),
+            approvals::RuntimeActivity::new(
+                Arc::clone(&self.activity_broker),
+                activity_instance_id,
+            ),
         )
         .await
         .with_context(|| format!("failed to start managed session {id}"))?;
@@ -826,6 +1898,21 @@ impl SessionSupervisor {
                     "public managed session has no named-root path"
                 );
             }
+            let cwd = if let Some(path) = logical_path.as_deref() {
+                let resolved = self.roots.resolve(path)?;
+                anyhow::ensure!(
+                    resolved == session.cwd,
+                    "session {session_id} named root changed from its stored cwd"
+                );
+                resolved
+            } else {
+                let resolved = config::canonical_directory(&session.cwd)?;
+                anyhow::ensure!(
+                    resolved == session.cwd,
+                    "session {session_id} stored cwd changed before restart"
+                );
+                resolved
+            };
             begin_agent_session_shutdown(&session);
             if config::session_is_active(session_id).await? {
                 self.stop_owned_validated(session_id, public).await?;
@@ -833,7 +1920,6 @@ impl SessionSupervisor {
                 remove_agent_sessions(&session).await?;
             }
             if let Some(path) = logical_path {
-                let cwd = self.roots.resolve(&path)?;
                 self.start_resolved(
                     cwd,
                     session_id.to_owned(),
@@ -844,7 +1930,6 @@ impl SessionSupervisor {
                 )
                 .await?;
             } else {
-                let cwd = config::canonical_directory(&session.cwd)?;
                 self.start_resolved(
                     cwd,
                     session_id.to_owned(),
@@ -2028,6 +3113,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_claim_recovery_checks_marker_base_owner_and_existing_claim() {
+        use crate::repository_store::{
+            ActivatedSessionInstance, EnsureAdmission, ManagedRequest, ProvisioningPhase,
+            RepositoryStore,
+        };
+        use crate::session_source::{RepositoryId, VcsPreference};
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let store = RepositoryStore::new().unwrap();
+        let operation_id = Uuid::new_v4();
+        let repository =
+            RepositoryId::new("github.com", "temote-recovery", &operation_id.to_string()).unwrap();
+        let request = ManagedRequest {
+            repository: repository.clone(),
+            base: None,
+            vcs: VcsPreference::Git,
+        };
+        let mut receipt = store
+            .accept(operation_id, request, "src", &root_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_repository(&repository, operation_id)
+                .await
+                .unwrap(),
+            EnsureAdmission::Owned
+        );
+        let preparation = config::Session {
+            id: receipt.preparation_session_id.clone(),
+            cwd: root_path.clone(),
+            permitted_directories: vec![root_path.clone()],
+            started_at: 11,
+            process_id: 12,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let base = "a".repeat(40);
+        receipt = store
+            .update(operation_id, |record| {
+                record.preparation_owner = Some(ActivatedSessionInstance::from_session(
+                    &preparation,
+                    record.task_operation_id,
+                ));
+                record.pinned_base = Some(base.clone());
+                record.phase = ProvisioningPhase::WorkspaceAllocating;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let workspace = root_path.join(crate::workspace_provisioning::workspace_relative(&receipt));
+        std::fs::create_dir_all(workspace.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(workspace.join(".git/refs")).unwrap();
+        let marker = root_path
+            .join(".temote-mcp/provisioning")
+            .join(format!("{operation_id}.json"));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            json!({
+                "status": "ready",
+                "operation_id": operation_id,
+                "repository_id": repository.logical_name(),
+                "pinned_base": base,
+                "workspace_id": receipt.workspace_id,
+                "change_id": receipt.change_id,
+                "backend": "git",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut wrong_base = receipt.clone();
+        wrong_base.pinned_base = Some("b".repeat(40));
+        assert!(
+            reconcile_pinned_repository_claim(&store, &root_path, &wrong_base, &preparation)
+                .await
+                .is_err()
+        );
+        let mut wrong_owner = receipt.clone();
+        wrong_owner.preparation_owner.as_mut().unwrap().started_at += 1;
+        assert!(
+            reconcile_pinned_repository_claim(&store, &root_path, &wrong_owner, &preparation)
+                .await
+                .is_err()
+        );
+        let mut wrong_marker: Value =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        wrong_marker["operation_id"] = json!(Uuid::new_v4());
+        std::fs::write(&marker, wrong_marker.to_string()).unwrap();
+        assert!(
+            reconcile_pinned_repository_claim(&store, &root_path, &receipt, &preparation)
+                .await
+                .is_err()
+        );
+        wrong_marker["operation_id"] = json!(operation_id);
+        std::fs::write(&marker, wrong_marker.to_string()).unwrap();
+        assert_eq!(
+            store
+                .claim_repository(&repository, Uuid::new_v4())
+                .await
+                .unwrap(),
+            EnsureAdmission::Busy
+        );
+
+        reconcile_pinned_repository_claim(&store, &root_path, &receipt, &preparation)
+            .await
+            .unwrap();
+        let replacement = Uuid::new_v4();
+        assert_eq!(
+            store
+                .claim_repository(&repository, replacement)
+                .await
+                .unwrap(),
+            EnsureAdmission::Owned
+        );
+        assert!(
+            reconcile_pinned_repository_claim(&store, &root_path, &receipt, &preparation)
+                .await
+                .is_err()
+        );
+        store
+            .mark_repository_ready(&repository, replacement)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn starts_multiple_sessions_rejects_duplicate_and_cleans_up() {
         let (_temp, roots) = fixture();
         let (supervisor, _approvals) = SessionSupervisor::new(roots);
@@ -2427,6 +3641,16 @@ mod tests {
         assert_eq!(stored.permission_mode, config::PermissionMode::Agent);
         let stored_local = config::read_session_metadata(&local_id).await.unwrap();
         assert_eq!(stored_local.permission_mode, config::PermissionMode::Agent);
+        let local_lifecycle = config::read_session_lifecycle(&local_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_lifecycle.logical_path.as_deref(), Some("src/repo-a"));
+        assert_eq!(local_lifecycle.root_name.as_deref(), Some("src"));
+        assert_eq!(
+            local_lifecycle.root_relative_path.as_deref(),
+            Some("repo-a")
+        );
         let stored_yolo = config::read_session_metadata(&yolo_id).await.unwrap();
         assert_eq!(stored_yolo.permission_mode, config::PermissionMode::Yolo);
 
@@ -2434,6 +3658,85 @@ mod tests {
         for id in [&default_id, &public_id, &ask_id, &local_id, &yolo_id] {
             cleanup_session(id).await;
         }
+    }
+
+    #[tokio::test]
+    async fn local_normal_start_outside_named_roots_fails_closed() {
+        let (temp, roots) = fixture();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("local-outside-{}", uuid::Uuid::new_v4());
+        let error = supervisor
+            .start_local_with_environment(
+                &outside,
+                Some(&id),
+                false,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside configured named roots"));
+        assert!(!config::session_path(&id).unwrap().exists());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_start_without_roots_or_logical_path_fails_closed() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (supervisor, _approvals) = SessionSupervisor::new(NamedRoots::default());
+        let id = format!("normal-no-roots-{}", Uuid::new_v4());
+        let error = supervisor
+            .start_local_with_environment(
+                cwd.path(),
+                Some(&id),
+                false,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TEMOTE_MCP_ROOTS"));
+        assert!(!config::session_path(&id).unwrap().exists());
+        let error = supervisor
+            .start_resolved(
+                cwd.path().to_path_buf(),
+                id.clone(),
+                config::PermissionMode::Agent,
+                None,
+                approvals::CapturedStartEnvironment::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TEMOTE_MCP_ROOTS"));
+        assert!(!config::session_path(&id).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_restart_keeps_stored_cwd_without_adopting_a_root() {
+        let (temp, roots) = fixture();
+        let cwd = std::fs::canonicalize(temp.path().join("volume/repo-a")).unwrap();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("legacy-restart-{}", Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        let mut lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        lifecycle.logical_path = None;
+        lifecycle.root_name = None;
+        lifecycle.root_relative_path = None;
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+        supervisor
+            .restart_with_environment(&id, approvals::CapturedStartEnvironment::default(), false)
+            .await
+            .unwrap();
+        let restarted = config::read_session_metadata(&id).await.unwrap();
+        assert_eq!(restarted.cwd, cwd);
+        let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert!(lifecycle.logical_path.is_none());
+        assert!(lifecycle.root_name.is_none());
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
     }
 
     #[tokio::test]
@@ -2634,6 +3937,7 @@ mod tests {
                 let (supervisor, _approvals) =
                     SessionSupervisor::with_limit(roots, max_sessions);
                 let mut active = HashSet::new();
+                let mut stored_scope = HashMap::<String, String>::new();
                 let mut failure = None::<String>;
 
                 for (operation, index) in steps {
@@ -2642,7 +3946,8 @@ mod tests {
                         0 | 1 => {
                             let logical = if operation == 0 { "src/repo-a" } else { "src/repo-b" };
                             let expected =
-                                !active.contains(id) && active.len() < max_sessions;
+                                !active.contains(id) && active.len() < max_sessions
+                                    && stored_scope.get(id).is_none_or(|scope| scope == logical);
                             let result = supervisor.start(logical, Some(id)).await;
                             if result.is_ok() != expected {
                                 failure = Some(format!(
@@ -2652,6 +3957,7 @@ mod tests {
                             }
                             if result.is_ok() {
                                 active.insert(id.clone());
+                                stored_scope.entry(id.clone()).or_insert_with(|| logical.to_owned());
                             }
                         }
                         2 => {

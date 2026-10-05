@@ -206,10 +206,10 @@ pub async fn run(options: Options) -> Result<()> {
 
     match options.profile {
         Some(Profile::Cloudflare) => {
-            let public_endpoint = std::env::var("TEMOTE_MCP_PUBLIC_URL")
+            let public_endpoint = temote_mcp::environment::var("TEMOTE_MCP_PUBLIC_URL")
                 .unwrap_or_else(|_| "<not configured>".to_owned());
-            let tunnel_id = std::env::var("TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID")
-                .or_else(|_| std::env::var("CLOUDFLARE_TUNNEL_ID"))
+            let tunnel_id = temote_mcp::environment::var("TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID")
+                .or_else(|_| temote_mcp::environment::var("CLOUDFLARE_TUNNEL_ID"))
                 .unwrap_or_else(|_| "<not configured>".to_owned());
             report.add(Check::pass(
                 "direct ingress identity",
@@ -321,14 +321,14 @@ async fn check_jj_binary(program: &str) -> Check {
 }
 
 fn delegation_binary_on_path(name: &str) -> Option<PathBuf> {
-    let search = std::env::var_os("PATH")?;
+    let search = temote_mcp::environment::var_os("PATH")?;
     std::env::split_paths(&search)
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
 }
 
 fn home_relative_file(env_key: &str, home_suffix: &str, file_suffix: &str) -> Option<PathBuf> {
-    std::env::var_os(env_key)
+    temote_mcp::environment::var_os(env_key)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| crate::platform_paths::home_dir().map(|home| home.join(home_suffix)))
@@ -351,7 +351,7 @@ fn check_delegation_backends(report: &mut Report) {
             let auth_file = home_relative_file("CODEX_HOME", ".codex", "auth.json");
             let auth_file_present = auth_file.is_some_and(|path| path.is_file());
             let api_key_present =
-                std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty());
+                temote_mcp::environment::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty());
             match codex_credential_source(auth_file_present, api_key_present) {
                 Some(source) => report.add(Check::pass(
                     "delegation codex",
@@ -436,10 +436,11 @@ fn check_devin_delegation(report: &mut Report) {
                 ));
                 return;
             };
-            let api_key_present = std::env::var_os("WINDSURF_API_KEY")
+            let api_key_present = temote_mcp::environment::var_os("WINDSURF_API_KEY")
                 .is_some_and(|value| !value.is_empty())
-                || std::env::var_os("DEVIN_API_KEY").is_some_and(|value| !value.is_empty());
-            let auth_config_present = std::env::var_os("XDG_CONFIG_HOME")
+                || temote_mcp::environment::var_os("DEVIN_API_KEY")
+                    .is_some_and(|value| !value.is_empty());
+            let auth_config_present = temote_mcp::environment::var_os("XDG_CONFIG_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| crate::platform_paths::home_dir().map(|home| home.join(".config")))
@@ -663,13 +664,17 @@ struct GatewayLocalConfig {
 
 impl GatewayLocalConfig {
     fn from_env() -> Option<Self> {
-        let host_id = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID").ok()?;
+        let host_id = temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_HOST_ID").ok()?;
         Some(Self {
             host_id: Some(host_id),
-            gateway_url: std::env::var("TEMOTE_MCP_GATEWAY_URL").ok(),
-            host_token: std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").ok(),
-            access_client_id: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID").ok(),
-            access_client_secret: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET").ok(),
+            gateway_url: temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_URL").ok(),
+            host_token: temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").ok(),
+            access_client_id: temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")
+                .ok(),
+            access_client_secret: temote_mcp::environment::var(
+                "TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET",
+            )
+            .ok(),
         })
     }
 
@@ -921,10 +926,11 @@ async fn check_federation_readiness(report: &mut Report) {
 #[cfg(feature = "network")]
 fn gateway_health_identity_ok(success: bool, body: Option<&Value>) -> bool {
     success
-        && body
-            .and_then(|value| value.get("identity"))
-            .and_then(Value::as_str)
-            == Some("temote-mcp-gateway")
+        && matches!(
+            body.and_then(|value| value.get("identity"))
+                .and_then(Value::as_str),
+            Some("temote-fabric" | "temote-mcp-gateway")
+        )
         && body
             .and_then(|value| value.get("readiness"))
             .and_then(Value::as_str)
@@ -1395,7 +1401,7 @@ fn resolve_tunnel_token_file(override_path: Option<&Path>) -> (Option<PathBuf>, 
     if let Some(path) = override_path {
         return (Some(path.to_owned()), true);
     }
-    if let Some(path) = std::env::var_os("TUNNEL_TOKEN_FILE") {
+    if let Some(path) = temote_mcp::environment::var_os("TUNNEL_TOKEN_FILE") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
             return (Some(path), true);
@@ -1746,7 +1752,7 @@ async fn check_cloudflare_api(report: &mut Report) {
 #[cfg(feature = "network")]
 fn first_nonempty_env(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
-        std::env::var(name)
+        temote_mcp::environment::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().to_owned())
@@ -2747,6 +2753,10 @@ mod tests {
     fn gateway_health_identity_requires_explicit_gateway_metadata() {
         let ready = serde_json::json!({"identity": "temote-mcp-gateway", "readiness": "ready"});
         assert!(gateway_health_identity_ok(true, Some(&ready)));
+        assert!(gateway_health_identity_ok(
+            true,
+            Some(&serde_json::json!({"identity":"temote-fabric", "readiness":"ready"}))
+        ));
         assert!(!gateway_health_identity_ok(false, Some(&ready)));
         let direct = serde_json::json!({"status": "ok", "service": "temote-mcp"});
         assert!(!gateway_health_identity_ok(true, Some(&direct)));

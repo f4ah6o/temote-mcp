@@ -12,6 +12,7 @@
 //! Task and control input text is validated but intentionally not
 //! retained on the request: approvals and evidence render it as `omitted`.
 
+use crate::codex_app_server::{CodexContinuation, codex_continuation};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use uuid::Uuid;
@@ -34,9 +35,6 @@ const MAX_TASK_LIST_LIMIT: u64 = 128;
 pub(crate) enum TaskRequest<'a> {
     Status,
     Start(TaskStartRequest<'a>),
-    // Retained fields are consumed by the shared task index planned in a
-    // follow-up packet; dispatch reads them from the raw args for now.
-    #[allow(dead_code)]
     Get(TaskGetRequest<'a>),
     /// A session-scoped read-only projection of the caller's retained
     /// tasks. `limit` is validated at the boundary like every other
@@ -73,6 +71,7 @@ pub(crate) enum StartOptions<'a> {
 pub(crate) struct CodexStartOptions<'a> {
     pub(crate) model: &'a str,
     pub(crate) effort: &'a str,
+    pub(crate) continuation: CodexContinuation,
 }
 
 /// `opencode serve` start options.
@@ -83,6 +82,8 @@ pub(crate) struct OpenCodeStartOptions<'a> {
     pub(crate) model: Option<&'a str>,
     pub(crate) agent: Option<&'a str>,
     pub(crate) variant: Option<&'a str>,
+    /// A typed request for the host's already-authorized managed checkout.
+    pub(crate) workspace_requirement: Option<&'a str>,
 }
 
 /// Devin ACP (`devin acp`) start options. `cloud` selects the hosted
@@ -113,13 +114,9 @@ pub(crate) struct DevinCloudStartOptions<'a> {
 /// A validated `task_get` request.
 #[derive(Debug)]
 pub(crate) struct TaskGetRequest<'a> {
-    // Retained on the typed request for the shared task index planned in
-    // a follow-up packet; the current dispatch reads task ids from the
-    // raw args.
-    #[allow(dead_code)]
     pub(crate) task_id: &'a str,
-    #[allow(dead_code)]
     pub(crate) after_revision: Option<u64>,
+    pub(crate) wait_ms: u64,
 }
 
 /// A typed control action. `steer` requires input text; `resume` and
@@ -483,13 +480,23 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             validate_task_input(task, "task")?;
             validate_argument(model, "model")?;
             validate_argument(effort, "effort")?;
-            StartOptions::Codex(CodexStartOptions { model, effort })
+            let continuation = codex_continuation(args)?;
+            StartOptions::Codex(CodexStartOptions {
+                model,
+                effort,
+                continuation,
+            })
         }
         #[cfg(feature = "network")]
         Backend::OpenCode => {
+            anyhow::ensure!(
+                args.get("continuation").is_none(),
+                "unsupported OpenCode task continuation"
+            );
             let model = optional_string(args, "model")?;
             let agent = optional_string(args, "agent")?;
             let variant = optional_string(args, "variant")?;
+            let workspace_requirement = optional_string(args, "workspace_requirement")?;
             validate_task_input(task, "task")?;
             if let Some(model) = model {
                 validate_argument(model, "model")?;
@@ -504,13 +511,22 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             if let Some(variant) = variant {
                 validate_argument(variant, "variant")?;
             }
+            anyhow::ensure!(
+                workspace_requirement.is_none_or(|value| value == "managed_commands"),
+                "workspace_requirement must be managed_commands"
+            );
             StartOptions::OpenCode(OpenCodeStartOptions {
                 model,
                 agent,
                 variant,
+                workspace_requirement,
             })
         }
         Backend::DevinAcp => {
+            anyhow::ensure!(
+                args.get("continuation").is_none(),
+                "unsupported Devin task continuation"
+            );
             let model = optional_string(args, "model")?;
             let agent = optional_string(args, "agent")?;
             let cloud = args
@@ -539,6 +555,10 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
         }
         #[cfg(feature = "network")]
         Backend::DevinCloud => {
+            anyhow::ensure!(
+                args.get("continuation").is_none(),
+                "unsupported Devin task continuation"
+            );
             let title = optional_string(args, "title")?;
             let devin_mode = optional_string(args, "devin_mode")?;
             let swe_tier = optional_string(args, "swe_tier")?;
@@ -583,7 +603,19 @@ fn parse_task_get<'a>(backend: Backend, args: &'a Value) -> Result<TaskGetReques
     Ok(TaskGetRequest {
         task_id,
         after_revision,
+        wait_ms: task_wait_ms(args)?,
     })
+}
+
+fn task_wait_ms(args: &Value) -> Result<u64> {
+    let wait_ms = match args.get("wait_ms") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .context("wait_ms must be an integer in 0..=30000")?,
+    };
+    anyhow::ensure!(wait_ms <= 30_000, "wait_ms must be an integer in 0..=30000");
+    Ok(wait_ms)
 }
 
 /// The shared task-list `limit`: optional, an integer within `1..=128`,
@@ -675,6 +707,35 @@ mod tests {
     const OP_ID: &str = "0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa";
     const TASK_ID: &str = "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb";
 
+    #[test]
+    fn bounded_wait_validates_every_backend_before_dispatch() {
+        for backend in backends() {
+            for wait_ms in [0, 30_000] {
+                let args = json!({"task_id": TASK_ID, "wait_ms": wait_ms});
+                let TaskRequest::Get(request) = parse_get(backend, &args).unwrap() else {
+                    panic!("get")
+                };
+                assert_eq!(request.wait_ms, wait_ms);
+            }
+            let args = json!({"task_id": TASK_ID});
+            let TaskRequest::Get(request) = parse_get(backend, &args).unwrap() else {
+                panic!("get")
+            };
+            assert_eq!(request.wait_ms, 0);
+            for value in [
+                json!(-1),
+                json!(30_001),
+                json!(1.5),
+                json!("1"),
+                json!(null),
+            ] {
+                assert!(
+                    parse_get(backend, &json!({"task_id": TASK_ID, "wait_ms": value})).is_err()
+                );
+            }
+        }
+    }
+
     fn backends() -> Vec<Backend> {
         vec![
             Backend::Codex,
@@ -756,6 +817,37 @@ mod tests {
             panic!("codex options expected")
         };
         assert_eq!((options.model, options.effort), ("gpt", "high"));
+        assert_eq!(options.continuation, CodexContinuation::New);
+
+        let continued = json!({"operation_id": OP_ID, "task": "work", "model": "gpt", "effort": "high", "continuation": {"type":"previous_task", "task_id": OP_ID}});
+        let TaskRequest::Start(continued) = parse_start(Backend::Codex, &continued).unwrap() else {
+            panic!("start expected")
+        };
+        let StartOptions::Codex(options) = continued.options else {
+            panic!("Codex expected")
+        };
+        assert_eq!(
+            options.continuation,
+            CodexContinuation::PreviousTask {
+                task_id: Uuid::parse_str(OP_ID).unwrap()
+            }
+        );
+        for malformed in [
+            json!(null),
+            json!({"type":"previous_task"}),
+            json!({"type":"new","task_id":OP_ID}),
+            json!({"type":"previous_task","task_id":"nope"}),
+        ] {
+            let args = json!({"operation_id": OP_ID, "task": "work", "model": "gpt", "effort": "high", "continuation": malformed});
+            assert!(parse_start(Backend::Codex, &args).is_err());
+        }
+        let other = json!({"operation_id": OP_ID, "task": "work", "continuation": {"type":"new"}});
+        assert!(
+            parse_start(Backend::DevinAcp, &other)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported Devin task continuation")
+        );
 
         assert_eq!(
             error_of(parse_start(
@@ -794,7 +886,8 @@ mod tests {
             "task": "work",
             "model": "anthropic/claude-sonnet-4",
             "agent": "build",
-            "variant": "fast"
+            "variant": "fast",
+            "workspace_requirement": "managed_commands"
         });
         let TaskRequest::Start(request) = parse_start(Backend::OpenCode, &args).unwrap() else {
             panic!("opencode start should parse")
@@ -810,6 +903,7 @@ mod tests {
                 Some("fast")
             )
         );
+        assert_eq!(options.workspace_requirement, Some("managed_commands"));
 
         // Every option is optional for this backend.
         let minimal = json!({"operation_id": OP_ID, "task": "work"});
@@ -822,6 +916,15 @@ mod tests {
         assert_eq!(
             (options.model, options.agent, options.variant),
             (None, None, None)
+        );
+        assert_eq!(options.workspace_requirement, None);
+
+        assert_eq!(
+            error_of(parse_start(
+                Backend::OpenCode,
+                &json!({"operation_id": OP_ID, "task": "work", "workspace_requirement": "shell"})
+            )),
+            "workspace_requirement must be managed_commands"
         );
 
         assert_eq!(

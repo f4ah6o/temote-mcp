@@ -81,14 +81,60 @@ pub struct AgentOptions {
     pub reconnect_delay: Duration,
 }
 
+/// A bounded diagnostic projection. It never starts a Link or reconciles a task.
+pub async fn fabric_status() -> Result<serde_json::Value> {
+    let host_id = temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_HOST_ID")
+        .ok()
+        .map(|value| host_identity::validate(&value))
+        .transpose()?;
+    let origin = temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_URL")
+        .ok()
+        .map(|value| normalize_gateway_url(&value))
+        .transpose()?;
+    let generation = host_id.as_deref().and_then(read_host_agent_generation);
+    let mut health = serde_json::json!({"status":"not_configured"});
+    if let Some(origin) = &origin {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let mut request = client.get(format!("{origin}/healthz"));
+        if let (Ok(id), Ok(secret)) = (
+            temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID"),
+            temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET"),
+        ) {
+            request = request
+                .header("CF-Access-Client-Id", id)
+                .header("CF-Access-Client-Secret", secret);
+        }
+        // Do not deserialize or copy remote error bodies into diagnostics.
+        health = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                serde_json::json!({"status":"reachable", "http_status":response.status().as_u16()})
+            }
+            Ok(response) => {
+                serde_json::json!({"status":"unavailable", "http_status":response.status().as_u16()})
+            }
+            Err(_) => {
+                serde_json::json!({"status":"unavailable", "error_code":"health_probe_failed"})
+            }
+        };
+    }
+    Ok(
+        serde_json::json!({"service":"temote-fabric", "host_id":host_id, "endpoint":origin,
+        "last_local_generation":generation, "remote_health":health}),
+    )
+}
+
 #[derive(Clone)]
-struct GatewayClient {
-    client: Client,
-    sync_client: Client,
-    base_url: String,
-    host_token: String,
-    access_client_id: Option<String>,
-    access_client_secret: Option<String>,
+pub(crate) struct GatewayClient {
+    pub(crate) client: Client,
+    pub(crate) sync_client: Client,
+    pub(crate) base_url: String,
+    pub(crate) host_token: String,
+    pub(crate) access_client_id: Option<String>,
+    pub(crate) access_client_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -375,6 +421,27 @@ async fn run_host_agent(
     validate_federated_platform(platform)?;
     let host_id = host_identity::validate(host_id)?;
     let sessions = session_control::SessionBackend::local_control().await?;
+    let (activity_sender, mut activity_receiver) = tokio::sync::mpsc::channel(128);
+    let activity_host_id = host_id.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) =
+                session_control::follow_lifecycle_activity(activity_sender.clone()).await
+            {
+                eprintln!("Fabric lifecycle activity reconnecting: {error:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(event) = activity_receiver.recv().await {
+            if let Err(error) =
+                crate::events_host::record_lifecycle(&event, &activity_host_id).await
+            {
+                eprintln!("Fabric lifecycle transition deferred: {error:#}");
+            }
+        }
+    });
 
     eprintln!(
         "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
@@ -761,6 +828,30 @@ async fn run_host_generation(
     let sync_task = tokio::spawn(async move {
         run_host_observation_sync(&gateway_for_sync, &host_id_for_sync).await;
     });
+    let gateway_for_events = gateway.clone();
+    let host_id_for_events = host_id.to_owned();
+    let instance_id_for_events = instance_id.to_owned();
+    let event_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                crate::events_host::deliver_pending(
+                    &gateway_for_events,
+                    &host_id_for_events,
+                    &instance_id_for_events,
+                    generation,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("Fabric event delivery deferred: {error:#}"),
+                Err(_) => eprintln!("Fabric event delivery deferred: batch_timeout"),
+            }
+        }
+    });
     let result = run_host_generation_poll(
         gateway,
         sessions,
@@ -772,6 +863,8 @@ async fn run_host_generation(
     .await;
     sync_task.abort();
     let _ = sync_task.await;
+    event_task.abort();
+    let _ = event_task.await;
     result
 }
 
@@ -1079,11 +1172,16 @@ fn status_named_roots(status: &Value) -> Result<Vec<String>> {
 }
 
 impl GatewayClient {
-    fn request(&self, method: Method, path: &str, host_id: Option<&str>) -> RequestBuilder {
+    pub(crate) fn request(
+        &self,
+        method: Method,
+        path: &str,
+        host_id: Option<&str>,
+    ) -> RequestBuilder {
         self.request_with_client(&self.client, method, path, host_id)
     }
 
-    fn request_with_client(
+    pub(crate) fn request_with_client(
         &self,
         client: &Client,
         method: Method,
@@ -1164,7 +1262,7 @@ async fn require_success(response: Response, operation: &str) -> Result<Response
     anyhow::bail!("{operation} failed with HTTP {status}: {detail}")
 }
 
-async fn read_bounded_body(
+pub(crate) async fn read_bounded_body(
     mut response: Response,
     limit: usize,
     operation: &str,

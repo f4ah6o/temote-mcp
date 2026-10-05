@@ -510,7 +510,7 @@ impl HostReplicator {
 
 fn preview_upload_enabled() -> bool {
     matches!(
-        std::env::var(PREVIEW_ENV)
+        temote_mcp::environment::var(PREVIEW_ENV)
             .ok()
             .as_deref()
             .map(str::trim)

@@ -336,7 +336,9 @@ fn parse_legacy_up_pids(raw: &str) -> Result<LegacyUpPids> {
 fn ensure_process_name(pid: i32, expected: &str, label: &str) -> Result<()> {
     let actual = process_name(pid)?;
     anyhow::ensure!(
-        actual.as_deref() == Some(expected),
+        actual.as_deref().is_some_and(|actual| {
+            actual == expected || (expected == PROCESS_NAME && is_temote_name(actual))
+        }),
         "{label} PID {pid} belongs to an unexpected process ({actual:?}); refusing to signal it"
     );
     Ok(())
@@ -543,7 +545,7 @@ fn openai_restart_context_keys(profile: Profile) -> Vec<String> {
         return Vec::new();
     }
     for name in ["CONTROL_PLANE_API_KEY", "OPENAI_API_KEY"] {
-        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+        if temote_mcp::environment::var_os(name).is_some_and(|value| !value.is_empty()) {
             return vec![name.to_owned()];
         }
     }
@@ -828,7 +830,7 @@ fn validate_restart_recipe(state: &DirectIngressRuntimeState) -> Result<()> {
                     "OpenAI direct ingress state contains an unsupported restart-context key"
                 );
                 anyhow::ensure!(
-                    std::env::var_os(key).is_some_and(|value| !value.is_empty()),
+                    temote_mcp::environment::var_os(key).is_some_and(|value| !value.is_empty()),
                     "OpenAI direct ingress restart context is unavailable for key: {key}"
                 );
             }
@@ -1200,7 +1202,7 @@ fn private_unix_mode(mode: u32) -> bool {
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
+    temote_mcp::environment::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -1270,7 +1272,11 @@ fn parse_pid(raw: &str) -> Result<i32> {
 }
 
 fn is_temote_process(pid: i32) -> Result<bool> {
-    Ok(process_name(pid)?.as_deref() == Some(PROCESS_NAME))
+    Ok(process_name(pid)?.as_deref().is_some_and(is_temote_name))
+}
+
+fn is_temote_name(name: &str) -> bool {
+    matches!(name, "temote" | "temote-mcp")
 }
 
 fn process_name(pid: i32) -> Result<Option<String>> {
