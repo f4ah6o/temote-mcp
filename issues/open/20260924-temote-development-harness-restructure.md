@@ -97,7 +97,7 @@ Complete source criteria from “Acceptance criteria” (unchecked items remain 
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ### Source test details: 6. Validation commands
 
@@ -127,14 +127,14 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`core-backend-dispatch`](../polished/20261005-core-backend-dispatch.md)
-- [`gh-git-common-dir-identity`](../polished/20261005-gh-git-common-dir-identity.md)
-- [`local-task-frontend-reconciliation`](../polished/20261005-local-task-frontend-reconciliation.md)
-- [`environment-preparation`](../polished/20261005-environment-preparation.md)
-- [`repository-store-idempotent-ensure`](../polished/20261005-repository-store-idempotent-ensure.md)
-- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
-- [`managed-session-source-start`](../polished/20261005-managed-session-source-start.md)
-- [`fabric-naming-deployment-migration`](../polished/20261005-fabric-naming-deployment-migration.md)
+- [`core-backend-dispatch`](../done/20261005-core-backend-dispatch.md)
+- [`gh-git-common-dir-identity`](../doing/20261005-gh-git-common-dir-identity.md)
+- [`local-task-frontend-reconciliation`](../done/20261005-local-task-frontend-reconciliation.md)
+- [`environment-preparation`](../doing/20261005-environment-preparation.md)
+- [`repository-store-idempotent-ensure`](../doing/20261005-repository-store-idempotent-ensure.md)
+- [`managed-workspace-allocation`](../doing/20261005-managed-workspace-allocation.md)
+- [`managed-session-source-start`](../doing/20261005-managed-session-source-start.md)
+- [`fabric-naming-deployment-migration`](../doing/20261005-fabric-naming-deployment-migration.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

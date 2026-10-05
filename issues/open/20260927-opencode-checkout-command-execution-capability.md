@@ -113,7 +113,7 @@ Complete source criteria from “Acceptance criteria” (unchecked items remain 
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -129,8 +129,8 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`opencode-scoped-command-workspace`](../polished/20261005-opencode-scoped-command-workspace.md)
-- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
+- [`opencode-scoped-command-workspace`](../doing/20261005-opencode-scoped-command-workspace.md)
+- [`managed-workspace-allocation`](../doing/20261005-managed-workspace-allocation.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
@@ -143,7 +143,7 @@ Related: `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `i
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.
 
-Polished child packet: `issues/polished/20260927-opencode-task-preflight-capability-blockers.md` (OC1, ready)。preflight / blocker 分類のみを先に実装し、実際の checkout provisioning は Phase F/C 側に残す。
+Polished child packet: `issues/done/20260927-opencode-task-preflight-capability-blockers.md` (OC1, ready)。preflight / blocker 分類のみを先に実装し、実際の checkout provisioning は Phase F/C 側に残す。
 
 Current-main evidence (2026-10-02): `src/opencode_server.rs::serve_permission_config` explicitly denies the OpenCode V2 `shell` capability for `*`. A fix must provide workspace-scoped execution with protected-state, cwd, approval, and containment boundaries; simply deleting the deny rule is not sufficient. This preserves the source evidence from PR #74.
 

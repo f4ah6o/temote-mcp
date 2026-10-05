@@ -67,7 +67,7 @@ This issue is complete when:
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ### Source test details: 11. Tests
 
@@ -121,7 +121,7 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`fabric-extension-metadata-interactions`](../polished/20261005-fabric-extension-metadata-interactions.md)
+- [`fabric-extension-metadata-interactions`](../done/20261005-fabric-extension-metadata-interactions.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

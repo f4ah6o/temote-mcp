@@ -155,7 +155,7 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`dogfood-supervisor-metadata-and-link-path`](../polished/20261005-dogfood-supervisor-metadata-and-link-path.md)
+- [`dogfood-supervisor-metadata-and-link-path`](../doing/20261005-dogfood-supervisor-metadata-and-link-path.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

@@ -30,13 +30,13 @@ Fixes applied:
 
 ### F2 (P2) — RepositoryId component grammar not inherited
 
-Review location: `issues/polished/20260929-s0a-typed-session-source-contract.md` §3 (comment id 4128280255).
+Review location: `issues/done/20260929-s0a-typed-session-source-contract.md` §3 (comment id 4128280255).
 
 Finding: S0a's validation rules enumerated empty/absolute/traversal/query/fragment cases but did not inherit the F1 component grammar `^[A-Za-z0-9][A-Za-z0-9._-]*$` for each host/owner/name component, so percent escapes, backslashes, whitespace, and other invalid characters were not clearly rejected at the typed boundary that feeds RepositoryStore path components.
 
 Fixes applied:
 
-- `issues/polished/20260929-s0a-typed-session-source-contract.md`
+- `issues/done/20260929-s0a-typed-session-source-contract.md`
   - §3: explicit grammar inheritance for host/owner/name and the supplied default host; re-validation after the `.git` strip; raw-input forbidden-structure checking before parser folding; allowed normalizations limited to host case, `github.com` owner/name case, and one terminal `.git` strip; no implicit repair (no trim-to-accept, no backslash conversion, no percent-decode).
   - §3 "Checked entry points": `RepositoryId` may only be produced through the validating parser or equivalent checked constructor; serde and other entry paths enforce the same invariants (contract hardening, not a claim of an existing Deserialize bug).
   - §8: negative test specifications 16–23 (encoded separators `%2F` / `%5C` / `%20`, literal backslash, leading/trailing/internal whitespace, tab/newline/NUL/control characters, dot and dot-dot components including inside URL forms, invalid default host, name empty after `.git` strip, malformed serde input) and property specifications 24–27 (notation-variant identity, grammar conformance of successful parses, serde round-trip preservation, no silent conversion to a different identity).
@@ -53,7 +53,7 @@ Fixes applied:
 
 ## 3. Known residual (outside this PR's docs-only scope)
 
-- `src/session_source.rs` (merged via PR #86) predates the strengthened §3 contract: `validate_component()` is a deny-list that does not yet enforce the full F1 grammar (e.g. percent escapes currently parse), and the `Deserialize` derive / public fields leave construction paths that never pass the parser's invariants. Tracked by `issues/polished/20260929-s0a-contract-conformance.md`; that conformance fix must land before S1+ provisioning wires `SessionStartSpec` / `RepositoryId` into managed `session_start`. This PR deliberately contains no runtime changes.
+- `src/session_source.rs` (merged via PR #86) predates the strengthened §3 contract: `validate_component()` is a deny-list that does not yet enforce the full F1 grammar (e.g. percent escapes currently parse), and the `Deserialize` derive / public fields leave construction paths that never pass the parser's invariants. Tracked by `issues/done/20260929-s0a-contract-conformance.md`; that conformance fix must land before S1+ provisioning wires `SessionStartSpec` / `RepositoryId` into managed `session_start`. This PR deliberately contains no runtime changes.
 - The §5.3 retry contract has no runtime implementation yet; it lands with the S1+ provisioning packets.
 
 ## 4. Verification
@@ -75,4 +75,4 @@ Commands and results (`gh git` / gh-git extension is not installed on this machi
 - Prior "`git diff --check`: clean" line: removed. It was read from an empty working-tree diff after committing and never covered the PR diff; it is not carried forward as a verified result.
 - NOT RUN: doc lint / link check (no such tooling in this repo); Rust unit/integration tests, host/macOS gates, provisioning E2E — docs-only change; the added test lists are acceptance specifications for implementation packets, not executed tests.
 
-Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/polished/20260929-s0a-typed-session-source-contract.md`, `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/polished/20260929-s0a-contract-conformance.md` (new conformance packet), this record.
+Changed files: `issues/open/20260929-session-first-managed-provisioning.md`, `issues/done/20260929-s0a-typed-session-source-contract.md`, `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`, `issues/done/20260929-s0a-contract-conformance.md` (new conformance packet), this record.

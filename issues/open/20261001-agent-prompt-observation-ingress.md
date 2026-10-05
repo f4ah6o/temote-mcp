@@ -136,7 +136,7 @@ If a direct prompt surface cannot be observed, context reports `coverage=unavail
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -152,14 +152,14 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`agent-prompt-hook-capabilities`](../polished/20261005-agent-prompt-hook-capabilities.md)
-- [`agent-prompt-correlation-context`](../polished/20261005-agent-prompt-correlation-context.md)
+- [`agent-prompt-hook-capabilities`](../done/20261005-agent-prompt-hook-capabilities.md)
+- [`agent-prompt-correlation-context`](../done/20261005-agent-prompt-correlation-context.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
 ## 既存設計・履歴
 
-> Historical Status: open / design parent — P0+P1 polished as `issues/polished/20261001-agent-prompt-local-ingress-contract.md`; P2-P7 remain
+> Historical Status: open / design parent — P0+P1 polished as `issues/done/20261001-agent-prompt-local-ingress-contract.md`; P2-P7 remain
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
@@ -168,7 +168,7 @@ Related: `issues/closed/20260925-agent-conversation-continuation.md`
 
 ## 0. Triage / next packet
 
-Implement `issues/polished/20261001-agent-prompt-local-ingress-contract.md` first. It establishes the durable local contract without taking a dependency on Codex/Devin hook mechanics. Keep this parent open for P2-P7 only.
+Implement `issues/done/20261001-agent-prompt-local-ingress-contract.md` first. It establishes the durable local contract without taking a dependency on Codex/Devin hook mechanics. Keep this parent open for P2-P7 only.
 
 ## 1. Problem
 

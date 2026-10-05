@@ -14,7 +14,7 @@ Fix confirmed Codex, OpenCode, and Devin ACP child-runtime lifecycle bugs so unc
 
 The Codex and OpenCode server-backed child runtimes use `SessionInstance` ownership, lifecycle closing fences, runtime leases, and durable task stores. A read-only investigation confirmed related cleanup failures in `src/codex_app_server.rs`, `src/opencode_server.rs`, `src/devin_acp.rs`, and `src/supervisor.rs`.
 
-The related issue [`issues/open/20260927-opencode-checkout-command-execution-capability.md`](20260927-opencode-checkout-command-execution-capability.md) owns execution-time checkout/cwd/command capability for OpenCode implementation tasks. Current `opencode serve` task configuration explicitly denies the shell capability, so that provisioning/capability gap is real but separate from the child lifecycle bugs here.
+The related issue [`issues/open/20260927-opencode-checkout-command-execution-capability.md`](../open/20260927-opencode-checkout-command-execution-capability.md) owns execution-time checkout/cwd/command capability for OpenCode implementation tasks. Current `opencode serve` task configuration explicitly denies the shell capability, so that provisioning/capability gap is real but separate from the child lifecycle bugs here.
 
 ## 問題
 
@@ -79,4 +79,4 @@ Treating a failed probe as unknown can delay watcher-driven shutdown during a pr
 
 ## Triage closure (2026-10-02)
 
-Implementation is split into LC1 watcher liveness, LC2 retryable cleanup/provider aggregation, and LC3 durable recovery in `issues/polished/20261001-agent-child-watcher-tristate-liveness.md`, `issues/polished/20261001-agent-child-cleanup-retry-and-provider-aggregation.md`, and `issues/polished/20261001-agent-child-durable-task-recovery.md`. All three cover Codex, OpenCode, and Devin ACP where the matching source defect exists. The historical Devin incident remains causally unverified; source parity does not establish incident attribution. This preserves the source corrections from PR #74.
+Implementation is split into LC1 watcher liveness, LC2 retryable cleanup/provider aggregation, and LC3 durable recovery in `issues/done/20261001-agent-child-watcher-tristate-liveness.md`, `issues/done/20261001-agent-child-cleanup-retry-and-provider-aggregation.md`, and `issues/done/20261001-agent-child-durable-task-recovery.md`. All three cover Codex, OpenCode, and Devin ACP where the matching source defect exists. The historical Devin incident remains causally unverified; source parity does not establish incident attribution. This preserves the source corrections from PR #74.

@@ -132,7 +132,7 @@ Complete source criteria from “15. Acceptance for the architecture” (uncheck
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -149,15 +149,15 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`repository-store-idempotent-ensure`](../polished/20261005-repository-store-idempotent-ensure.md)
-- [`managed-workspace-allocation`](../polished/20261005-managed-workspace-allocation.md)
-- [`managed-session-source-start`](../polished/20261005-managed-session-source-start.md)
+- [`repository-store-idempotent-ensure`](../doing/20261005-repository-store-idempotent-ensure.md)
+- [`managed-workspace-allocation`](../doing/20261005-managed-workspace-allocation.md)
+- [`managed-session-source-start`](../doing/20261005-managed-session-source-start.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
 ## 既存設計・履歴
 
-> Historical Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/polished/20260929-s0a-contract-conformance.md`)
+> Historical Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/done/20260929-s0a-contract-conformance.md`)
 
 Repository: `f4ah6o/temote-mcp`  
 > Historical Created: 2026-09-29 (Asia/Tokyo)
@@ -171,7 +171,7 @@ Related:
 - `issues/open/20260926-named-root-workspace-identity.md`
 - `issues/closed/20260927-instruction-side-bare-repo-provisioning.md`
 - `issues/open/20260926-task-change-orchestration-stacked-pr.md`
-- `issues/polished/20260929-s0a-typed-session-source-contract.md` (first behavior-preserving implementation packet)
+- `issues/done/20260929-s0a-typed-session-source-contract.md` (first behavior-preserving implementation packet)
 
 ## 1. Problem
 
@@ -687,7 +687,7 @@ Acceptance:
 
 This packet creates the seam required before repository provisioning is wired into session start.
 
-S0a landed via PR #86; conformance to the strengthened §3 contract is tracked by `issues/polished/20260929-s0a-contract-conformance.md` and must land before S1+ packets wire `SessionStartSpec` / `RepositoryId` into managed `session_start`.
+S0a landed via PR #86; conformance to the strengthened §3 contract is tracked by `issues/done/20260929-s0a-contract-conformance.md` and must land before S1+ packets wire `SessionStartSpec` / `RepositoryId` into managed `session_start`.
 
 ## 14. Follow-on implementation packets
 

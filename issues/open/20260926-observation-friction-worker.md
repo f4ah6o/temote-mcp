@@ -99,7 +99,7 @@ Only supported `temote_friction` candidates qualify for new publication. Existin
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -115,8 +115,8 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`friction-candidate-consumer`](../polished/20261005-friction-candidate-consumer.md)
-- [`friction-authorized-publisher`](../polished/20261005-friction-authorized-publisher.md)
+- [`friction-candidate-consumer`](../done/20261005-friction-candidate-consumer.md)
+- [`friction-authorized-publisher`](../doing/20261005-friction-authorized-publisher.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

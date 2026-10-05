@@ -71,7 +71,7 @@ Complete source criteria from “18. Acceptance criteria” (unchecked items rem
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -87,21 +87,21 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`change-allocation-writer-handoff`](../polished/20261005-change-allocation-writer-handoff.md)
-- [`change-delivery-planner`](../polished/20261005-change-delivery-planner.md)
-- [`change-delivery-adapter`](../polished/20261005-change-delivery-adapter.md)
+- [`change-allocation-writer-handoff`](../doing/20261005-change-allocation-writer-handoff.md)
+- [`change-delivery-planner`](../done/20261005-change-delivery-planner.md)
+- [`change-delivery-adapter`](../doing/20261005-change-delivery-adapter.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
 ## 既存設計・履歴
 
-> Historical Status: design parent / D1 polished as `issues/polished/20261001-change-record-correlation.md`; D2-D4 remain
+> Historical Status: design parent / D1 polished as `issues/done/20261001-change-record-correlation.md`; D2-D4 remain
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/done/20260925-v2-vcs-workspace-contract.md`  
 > Historical Created: 2026-09-26 (Asia/Tokyo)
-Polished first packet: `issues/polished/20261001-change-record-correlation.md` (D1, ready)
+Polished first packet: `issues/done/20261001-change-record-correlation.md` (D1, ready)
 
 ## 1. Problem
 

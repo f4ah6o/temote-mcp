@@ -87,7 +87,7 @@ Complete source criteria from “17. Acceptance criteria” (unchecked items rem
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -103,10 +103,10 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`vcs-reconcile-task-snapshots`](../polished/20261005-vcs-reconcile-task-snapshots.md)
-- [`change-allocation-writer-handoff`](../polished/20261005-change-allocation-writer-handoff.md)
-- [`change-delivery-planner`](../polished/20261005-change-delivery-planner.md)
-- [`change-delivery-adapter`](../polished/20261005-change-delivery-adapter.md)
+- [`vcs-reconcile-task-snapshots`](../doing/20261005-vcs-reconcile-task-snapshots.md)
+- [`change-allocation-writer-handoff`](../doing/20261005-change-allocation-writer-handoff.md)
+- [`change-delivery-planner`](../done/20261005-change-delivery-planner.md)
+- [`change-delivery-adapter`](../doing/20261005-change-delivery-adapter.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

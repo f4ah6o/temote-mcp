@@ -149,7 +149,7 @@ The checked O1–O4 items below preserve their historical local qualification. T
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -165,8 +165,8 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`agent-prompt-hook-capabilities`](../polished/20261005-agent-prompt-hook-capabilities.md)
-- [`agent-prompt-correlation-context`](../polished/20261005-agent-prompt-correlation-context.md)
+- [`agent-prompt-hook-capabilities`](../done/20261005-agent-prompt-hook-capabilities.md)
+- [`agent-prompt-correlation-context`](../done/20261005-agent-prompt-correlation-context.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 

@@ -164,7 +164,7 @@ Complete source criteria from “Acceptance criteria” (unchecked items remain 
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -180,7 +180,7 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`native-report-capability-adapters`](../polished/20261005-native-report-capability-adapters.md)
+- [`native-report-capability-adapters`](../done/20261005-native-report-capability-adapters.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
@@ -190,7 +190,7 @@ These are planned packets, not completed implementation. The parent remains open
 
 open — implementation required
 
-Polished child packet: `issues/polished/20260927-common-task-report-schema.md` (S1: backend-neutral report schema 単一ソース化, ready)。S2-S4 (Codex app-server / OpenCode serve / Devin ACP の native surface 実測+実装) は S1 の共通 contract に依存するため後続 packet とする。
+Polished child packet: `issues/done/20260927-common-task-report-schema.md` (S1: backend-neutral report schema 単一ソース化, ready)。S2-S4 (Codex app-server / OpenCode serve / Devin ACP の native surface 実測+実装) は S1 の共通 contract に依存するため後続 packet とする。
 
 > Historical Created: 2026-09-27 (Asia/Tokyo)
 

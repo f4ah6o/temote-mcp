@@ -97,7 +97,7 @@ Complete source criteria from “13. Acceptance criteria” (unchecked items rem
 ## テスト計画
 
 - Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
-- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd gateway && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
 
 ## リスク
 
@@ -114,8 +114,8 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 ## 2026-10-05 実行パケット
 
-- [`fabric-events-subscription-store`](../polished/20261005-fabric-events-subscription-store.md)
-- [`fabric-events-host-sender`](../polished/20261005-fabric-events-host-sender.md)
+- [`fabric-events-subscription-store`](../done/20261005-fabric-events-subscription-store.md)
+- [`fabric-events-host-sender`](../done/20261005-fabric-events-host-sender.md)
 
 These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
 
@@ -125,7 +125,7 @@ These are planned packets, not completed implementation. The parent remains open
 Repository: `f4ah6o/temote-mcp`
 Related:
 - `issues/open/20261001-fabric-openai-mcp-extensions.md`
-- `issues/polished/20260927-bounded-wait-for-delegated-tasks.md`
+- `issues/doing/20260927-bounded-wait-for-delegated-tasks.md`
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 > Historical Created: 2026-10-05 (Asia/Tokyo)
 
