@@ -1,0 +1,1387 @@
+{
+  "latestLegacyProtocolVersion": "2025-06-18",
+  "modernProtocolVersion": "2026-07-28",
+  "supportedLegacyProtocolVersions": [
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05"
+  ],
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "host_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "type": "object"
+      },
+      "name": "host_info"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "session_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "source",
+              "operation_id"
+            ]
+          }
+        ],
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "base": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "repository"
+                  },
+                  "repository": {
+                    "type": "string"
+                  },
+                  "vcs": {
+                    "enum": [
+                      "auto",
+                      "jujutsu",
+                      "git"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "repository"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_stop"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_restart"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_info"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "effort": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "root": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "root",
+          "source",
+          "destination",
+          "model",
+          "effort"
+        ],
+        "type": "object"
+      },
+      "name": "repository_clone_bare"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "session_id"
+            ]
+          },
+          {
+            "required": [
+              "repository"
+            ]
+          }
+        ],
+        "properties": {
+          "at_least_cloud_seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "at_least_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "budget_bytes": {
+            "default": 16384,
+            "maximum": 65536,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 16,
+            "maximum": 64,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "repository": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "context_resolve"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "session_id"
+            ]
+          },
+          {
+            "required": [
+              "repository"
+            ]
+          }
+        ],
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "repository": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "context_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 16384,
+            "maximum": 65536,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset_bytes": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "evidence_id"
+        ],
+        "type": "object"
+      },
+      "name": "evidence_read"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "codex_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "continuation": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "const": "new"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "task_id": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "previous_task"
+                  }
+                },
+                "required": [
+                  "type",
+                  "task_id"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "effort": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task",
+          "model",
+          "effort"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "wait_ms": {
+            "default": 0,
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_control"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "opencode_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "variant": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workspace_requirement": {
+            "enum": [
+              "managed_commands"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "opencode_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "wait_ms": {
+            "default": 0,
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "opencode_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt",
+              "answer"
+            ],
+            "type": "string"
+          },
+          "answer": {
+            "additionalProperties": false,
+            "properties": {
+              "answers": {
+                "items": {
+                  "items": {
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "maxItems": 16,
+                  "type": "array"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "message": {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              "reply": {
+                "enum": [
+                  "once",
+                  "always",
+                  "reject"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "interaction_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "opencode_task_control"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cloud": {
+            "type": "boolean"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "wait_ms": {
+            "default": 0,
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_control"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_cloud_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "devin_mode": {
+            "enum": [
+              "normal",
+              "fast",
+              "lite",
+              "ultra",
+              "fusion",
+              "swe-2-medium",
+              "swe-2-high",
+              "swe-2-max"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "max_acu_limit": {
+            "maximum": 100000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "repos": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "swe_tier": {
+            "enum": [
+              "promo",
+              "priority"
+            ],
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "devin_cloud_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "wait_ms": {
+            "default": 0,
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_cloud_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "devin_cloud_task_control"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "output_limit_bytes": {
+            "maximum": 1048576,
+            "minimum": 256,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "name": "poll_job"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 128,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "job_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 128,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "task_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "name": "stop_job"
+    },
+    {
+      "_meta": {
+        "openai/ui": {
+          "entrypoints": [
+            {
+              "type": "global"
+            }
+          ]
+        },
+        "ui": {
+          "resourceUri": "ui://temote-fabric/overview",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "icons": [
+        {
+          "mimeType": "image/svg+xml",
+          "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='3' y='2.5' width='14' height='6' rx='1.5'/%3E%3Crect x='3' y='11.5' width='14' height='6' rx='1.5'/%3E%3Cpath d='M6 5.5h.01M6 14.5h.01M10 5.5h4M10 14.5h4'/%3E%3C/svg%3E"
+        }
+      ],
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "fabric_overview"
+    },
+    {
+      "_meta": {
+        "ui": {
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "type": "object"
+      },
+      "name": "fabric_session_list"
+    },
+    {
+      "_meta": {
+        "ui": {
+          "visibility": [
+            "model",
+            "app"
+          ]
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "fabric_session_read"
+    }
+  ]
+}

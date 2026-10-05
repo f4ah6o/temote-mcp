@@ -28,11 +28,11 @@ sandboxed-check: fmt-check check-generated sandboxed-test clippy sandboxed-no-de
 
 sandboxed-test:
     cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
-    cargo test --bin temote-mcp --all-features --locked activity_job
-    cargo test --bin temote-mcp --all-features --locked activity_coverage
-    cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::
-    cargo test --bin temote-mcp --all-features --locked upgrade_coordinator::tests::
-    cargo test --bin temote-mcp --all-features --locked session_control::tests::session_gc
+    cargo test --bin temote --all-features --locked activity_job
+    cargo test --bin temote --all-features --locked activity_coverage
+    cargo test --bin temote --all-features --locked upgrade_transaction::tests::
+    cargo test --bin temote --all-features --locked upgrade_coordinator::tests::
+    cargo test --bin temote --all-features --locked session_control::tests::session_gc
     @echo "NOT RUN (host/CI gate): session_gc socket liveness acceptance (session_control::tests::host_liveness_tests)"
     @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
     @echo "NOT RUN (host/CI gate): pinned-workspace path-swap bubblewrap acceptance (sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance)"
@@ -49,12 +49,12 @@ sandboxed-no-default:
 # tests. Host/CI only: nested `node` process spawning can fail with EPERM inside
 # a Temote sandbox.
 gateway-test:
-    npm test --prefix gateway
+    npm test --prefix fabric
 
 # Gateway evaluator tests that do not spawn nested processes. Safe for
 # `just sandboxed-check`.
 gateway-sandbox-test:
-    npm run test:sandbox --prefix gateway
+    npm run test:sandbox --prefix fabric
 
 # Host-level Linux acceptance. This requires a production-shaped bubblewrap /
 # AppArmor/userns environment and is expected to fail when invoked from inside
@@ -66,11 +66,11 @@ linux-sandbox-acceptance:
 
 # Regenerate Fabric tool metadata, behavioral contract, and fingerprint from Rust.
 generate-tools:
-    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --locked gateway_generated
+    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote --locked gateway_generated
 
 # Fail when checked-in Fabric metadata differs from the authoritative definitions.
 check-generated:
-    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
+    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote --locked gateway_generated
 
 fmt-check:
     cargo fmt --all -- --check

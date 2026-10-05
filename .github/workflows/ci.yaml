@@ -25,20 +25,20 @@ jobs:
           node-version: 22
 
       - name: Install pinned gateway tooling
-        run: npm ci --prefix gateway
+        run: npm ci --prefix fabric
 
       - name: Install Chromium and system dependencies
-        working-directory: gateway
+        working-directory: fabric
         run: npx playwright install --with-deps chromium
 
       - name: Test gateway contract and runtime
-        run: npm test --prefix gateway
+        run: npm test --prefix fabric
 
       - name: Test D1 schema integrity
-        run: python3 gateway/test/cloud_observation_schema_sqlite.py
+        run: python3 fabric/test/cloud_observation_schema_sqlite.py
 
       - name: Test dashboard projection SQL scope
-        run: python3 gateway/test/dashboard_schema_sqlite.py
+        run: python3 fabric/test/dashboard_schema_sqlite.py
 
   rust:
     strategy:
@@ -70,7 +70,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check generated MCP metadata
-        run: TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
+        run: TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote --locked gateway_generated
 
       - name: Check all targets
         run: cargo check --all-targets --locked
@@ -169,9 +169,9 @@ jobs:
           import tarfile
           import tomllib
 
-          crates = sorted(glob.glob("target/package/temote-mcp-*.crate"))
+          crates = sorted(glob.glob("target/package/temote-*.crate"))
           if not crates:
-              raise SystemExit("cargo package did not produce a temote-mcp crate")
+              raise SystemExit("cargo package did not produce a temote crate")
           crate = pathlib.Path(crates[-1])
           with tarfile.open(crate) as archive:
               manifest_names = [
@@ -233,16 +233,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crate="$(ls -1t target/package/temote-mcp-*.crate | head -n1)"
+          crate="$(ls -1t target/package/temote-*.crate | head -n1)"
           extract_root="$(mktemp -d)"
           install_root="$(mktemp -d)"
           trap 'rm -rf "$extract_root" "$install_root"' EXIT
           tar -xzf "$crate" -C "$extract_root"
-          package_root="$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -name 'temote-mcp-*' -print -quit)"
+          package_root="$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -name 'temote-*' -print -quit)"
           test -n "$package_root"
           cargo install --path "$package_root" --root "$install_root" --locked --force
+          test -x "$install_root/bin/temote"
           test -x "$install_root/bin/temote-mcp"
           test -x "$install_root/bin/temote-linux-sandbox"
+          "$install_root/bin/temote" --version
           "$install_root/bin/temote-mcp" --version
 
       - name: Verify macOS dependency boundary
