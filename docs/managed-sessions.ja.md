@@ -52,6 +52,8 @@ temote-mcp session restart mitsumori
 
 `session info` では non-secret な `host_id`、cwd、permitted directory、permission mode、started/stopped timestamp、exit reason、last error、利用可能な場合は logical named-root path、restart policy、restart count、直近 restart time、pending restart time、restart limit reason を確認できます。
 
+新規の通常 session は、ローカル cwd からの開始も設定済み named root に逆解決します。root 未設定または root 外では runtime 作成前に失敗します。supervisor の起動環境に `TEMOTE_ROOTS`（互換名 `TEMOTE_MCP_ROOTS`）を設定してください。root 名と root 相対 path は host cwd と別に保存します。旧記録に logical root がない場合、再起動と upgrade は検証できた既存 cwd を保持し、現在の root 設定を暗黙に割り当てません。root の再設定で既存 cwd を移動することはできません。
+
 互換用の `temote-mcp start <id>` も残します。runtime をその terminal process が直接所有するのではなく、起動中の local supervisor に current directory の session 作成を依頼します。`--yolo` は local CLI のみで利用可能です。public MCP `session_start` から yolo mode は指定できません。
 
 detached permission 管理は local-only で、同じ owner-only supervisor Unix socket を通します。`permission allow/revoke` は既存の canonical-path / symlink containment rule を維持し、session cwd の revoke は拒否します。`permission ask/yolo` は明示操作であり、これらの mutation は runtime を restart せず runtime state を失いません。同じ session/cwd を明示 restart した場合、persist 済み permitted root は復元されます。
@@ -122,6 +124,8 @@ direct `serve/up` ingress は別 process のままで、control protocol が com
 restart policy の既定値は安全側の `never` です。`temote-mcp session restart-policy <id> on-failure` で、予期しない runtime failure に限って automatic restart を有効化できます。graceful stop は再起動しません。automatic restart は 1, 2, 4, 8, 16 秒の bounded exponential delay を使い、5回で limit に達して `crashed` に確定します。lifecycle state には `restart_count` / `last_restart_at` / `next_restart_at` / `restart_limit_reason` を保存します。start 時に capture した environment は supervisor memory のみに保持して永続化しません。そのため supervisor process 自体が再起動した後は pending な credential-bearing automatic restart を暗黙再開せず、理由を残して `crashed` のままにし、明示的な `session restart` を要求します。
 
 ## HTTP managed session
+
+repository source からの start、replay 契約、生成 workspace の配置は [Managed repository provisioning](managed-provisioning.ja.md) を参照してください。
 
 認証済み direct HTTP MCP client は以下を利用できます。
 

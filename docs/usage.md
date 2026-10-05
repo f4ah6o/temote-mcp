@@ -2,6 +2,14 @@
 
 [日本語](usage.ja.md)
 
+## Current task workflow
+
+The canonical executable is `temote`; existing `temote-mcp` commands and state remain compatible. Configuration lookup prefers `TEMOTE_` and `TEMOTE_FABRIC_` names over their legacy aliases. See [naming migration](naming-migration.md).
+
+All four `*_task_get` tools accept `wait_ms`: omit it or use 0 for an immediate read, or set an unsigned integer up to 30000 to wait for a semantic revision or actionable state. Waiting does not start or control a task. An unchanged timeout returns bounded `not_modified` metadata; an unobserved deadline returns `wait_timeout` without inventing a revision. Preserve the task ID and operation receipts when reconnecting.
+
+For local owner workflows, `temote task ... --local` and modern MCP task/evidence calls execute through the same runtime-owning supervisor with full session-instance fences. Only an explicitly older supervisor without the relay capability uses the compatible direct MCP path. Failed negotiation or uncertain relay responses never move accepted work to a second owner; preserve the original operation ID and reconcile. See [backend capabilities](backend-capabilities.md), [Change delivery](change-delivery.md), [prompt observation](prompt-observation.md), and [friction](friction.md). Fabric's optional client extensions and webhook Events are documented in [extensions](fabric-extensions.md) and [Events](events.md).
+
 ## Sessions
 
 For local work, create the session directly. If the lifecycle supervisor is not already running, the local CLI starts the exact current Temote binary as the supervisor and waits until its control socket is ready. New sessions default to sandboxed, approval-free `agent` mode:
@@ -49,7 +57,7 @@ export TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}'
 temote-mcp supervisor
 ```
 
-The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
+The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. New normal sessions also reverse-resolve local cwd through the same named-root registry. Missing roots and cwd outside the configured roots fail closed with no HOME, `/`, cwd, or repository fallback. Root name and root-relative path are persisted separately from host cwd; a legacy session without that identity can only restart at its unchanged stored cwd.
 
 `session_stop` can stop only sessions marked as HTTP-owned by the lifecycle supervisor; it cannot stop local CLI/yolo sessions even though they share the same supervisor process. HTTP managed sessions are always non-yolo and default to `agent`, so the normal structured development workflow does not need a local approval console; an operator can still request the stricter `ask` mode locally with `session permission`. Public session-bound tools also reject separately started yolo sessions, so remote access cannot inherit their unrestricted local semantics. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. `temote-mcp down` stops only the HTTP origin and its managed ingress child, not the lifecycle supervisor or its sessions. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
@@ -74,7 +82,7 @@ Migration validates the legacy state file and verifies live process names before
 
 A normal session starts with its canonical startup directory as its permitted root. Local named-root selection determines which project directory is used; remote `session_start` can only resolve paths below administrator-configured named roots. Normal sessions reject paths, symlink targets, and command working directories that escape their permitted roots.
 
-Named roots come from `TEMOTE_MCP_ROOTS` on the host before Temote MCP starts. Set a single mapping such as `TEMOTE_MCP_ROOTS='src=~/src'` or a JSON object such as `TEMOTE_MCP_ROOTS='{"src":"~/src","opt":"~/opt"}'`, then restart Temote MCP. When it is unset, `session_start` stays disabled and named-root resolution errors explain how to configure it. A running session's roots can also grow through host-approved `directories` grants (below) without a restart.
+Named roots come from `TEMOTE_MCP_ROOTS` on the host before Temote MCP starts. Set a single mapping such as `TEMOTE_MCP_ROOTS='src=~/src'` or a JSON object such as `TEMOTE_MCP_ROOTS='{"src":"~/src","opt":"~/opt"}'`, then restart Temote MCP. When it is unset, new normal sessions cannot start through either local or remote entry points; resolution errors explain how to configure it. A running session's permitted directories can also grow through host-approved `directories` grants (below) without a restart.
 
 The legacy inline `/permission ...` terminal command UI is not the owner of detached runtimes and is not exposed through the first supervisor control surface. This does not widen permissions: the runtime remains fail-closed with its persisted permitted roots.
 
@@ -154,6 +162,8 @@ Generated turns are requested with Codex `workspaceWrite`, the session's canonic
 For an already accepted runtime, the session monitor retries unknown metadata or probe observations at its existing one-second polling interval. A valid active observation resets the counter; three consecutive unknown observations stop the runtime fail-closed. Verified inactivity or a changed full session instance stops it immediately. This finite monitoring retry does not make unknown state active: new task admission and routing still reject unavailable liveness information.
 
 ### Experimental OpenCode tasks
+
+Implementation work can request `workspace_requirement: "managed_commands"` on `opencode_task_start`. Temote validates the active managed session, provisioning receipt, and canonical checkout before acceptance. OpenCode's native shell remains denied, and this selector currently returns a structured `execution_unavailable` blocker after a valid binding because the private command delegation adapter is not yet available. Ordinary OpenCode tasks keep their existing behavior. See [the scoped workspace assessment](opencode-scoped-workspace.md).
 
 The opt-in `opencode_status`, `opencode_task_start`, `opencode_task_get`, and `opencode_task_control` tools spawn a per-task `opencode serve` child on loopback and talk to it through the `unofficial-opencode-sdk` HTTP client. Each serve child runs on 127.0.0.1 with a dynamically assigned port, a per-instance random Basic-auth password passed only through the child environment, an isolated per-task data directory, and a bounded serve permission configuration injected through `OPENCODE_CONFIG_CONTENT`. It inherits the host OpenCode global configuration (including provider/model definitions). Temote seeds its private task state with legacy `auth.json` and, for OpenCode V2, credentials from the host SQLite database while excluding host sessions and history. Connect the provider in the host CLI with `opencode auth login` first; the child uses credentials as of spawn time, and its token refreshes do not update the host account. The host database must have the supported V2 credential schema; an unsupported database fails closed. Task records, ownership, leases, receipts, retention, and scoped evidence follow the same contract as the Codex app-server tasks above: a task is owned by the complete session instance and its canonical working directory and cannot be resumed from another session, process generation, or scope.
 

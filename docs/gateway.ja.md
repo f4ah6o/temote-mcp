@@ -1,8 +1,8 @@
-# Multi-host Cloudflare gateway
+# Cloudflare 上の Temote Fabric
 
 [English](gateway.md)
 
-任意機能の `gateway/` Worker は、複数の Temote host を1つの MCP endpoint の背後に federation します。macOS、Linux、Windows 11 上の WSL2 で、それぞれ1つの supervisor と1つの host-level gateway agent を動かし、MCP client は host と session を選択できます。マシンごとに MCP server entry を追加する必要はありません。
+任意機能の `fabric/` Worker は、複数の Temote host を1つの MCP endpoint の背後に federation します。macOS、Linux、Windows 11 上の WSL2 で、それぞれ1つの supervisor と1つの host-level gateway agent を動かし、MCP client は host と session を選択できます。マシンごとに MCP server entry を追加する必要はありません。
 
 native Windows 実行は後続 milestone です。現時点の Windows 11 federation は WSL2 内で Temote を動かします。
 
@@ -35,12 +35,40 @@ federated host mode では、Worker secret `HOST_TOKENS_JSON` に host ごとの
 
 ## Deploy
 
-Temote Fabric は現在 `gateway/` に実装されています。repository root にある `just` command は repository root で実行し、npm と Wrangler は pinned package、lockfile、`wrangler.toml` のある `gateway/` で実行します。別々の code block の間で working directory は引き継がれません。
+現在の deploy は pinned `cf` CLI と `cloudflare.config.ts` を使います。
+ignored の `TEMOTE_DEPLOYMENT_CONFIG` profile で Worker、D1、domain と
+non-secret な Access policy を指定します。既存 Gateway は
+[段階的な naming migration](naming-migration.md) に従い、namespace ID、
+D1 ID、source の credential authority を保持します。migration 前に
+D1 Time Travel bookmark を取得し、適用後に外部キーの整合性を確認します。
+
+```sh
+# repository root
+just generate-tools
+just check-generated
+(cd fabric && npm test)
+# Fabric source directory; reviewed non-secret profile を指定
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf build
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf deploy --prebuilt --dry-run
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf deploy --prebuilt
+```
+
+既存 secret は名前で継承します。新規 secret は認可済みの runtime injection
+を使い、profile や command に値をコピーしません。Events と memory は
+依存機能が設定されるまで無効です。upload や dry-run の成功だけでは、
+domain、Access 認証、Host/session の稼働は確認できません。
+
+### Wrangler compatibility deployment
+
+以下は既存 operator 向けの Wrangler 互換手順です。flag は Wrangler に
+適用します。package の deployment script は現在 `cf` を呼び出します。
+
+Temote Fabric は現在 `fabric/` に実装されています。repository root にある `just` command は repository root で実行し、npm と Wrangler は pinned package、lockfile、`wrangler.toml` のある `fabric/` で実行します。別々の code block の間で working directory は引き継がれません。
 
 1. Node.js 22 以降を使い、deploy tooling を lockfile からインストールします。
 
 ```sh
-(cd gateway && npm ci)
+(cd fabric && npm ci)
 ```
 
 Rust の定義を変更した場合は repository root で生成・検証します。
@@ -50,16 +78,16 @@ just generate-tools
 just check-generated
 ```
 
-Worker は生成された `gateway/contract/routed-tool-metadata.json` を直接読みます。
+Worker は生成された `fabric/contract/routed-tool-metadata.json` を直接読みます。
 
 Observation 用に `OBSERVATION_OWNER_ID` と D1 `OBSERVATION_DB` を設定し、sentinel database ID を実際の ID に置き換えます。
-未適用 migration を確認してから、`gateway/` の pinned Wrangler で適用します。
+未適用 migration を確認してから、`fabric/` の pinned Wrangler で適用します。
 `0003_memory_worker.sql` は既存の knowledge table を再構築し、item、support、supersession の行をコピーします。
 対象 database の内容に照らして、この migration を事前に確認してください。
 
 ```sh
-(cd gateway && npx wrangler d1 migrations list temote-observation --remote)
-(cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
+(cd fabric && npx wrangler d1 migrations list temote-observation --remote)
+(cd fabric && npx wrangler d1 migrations apply temote-observation --remote)
 ```
 
 既存 Worker を更新するときは Durable Object の class 名と binding を維持します。
@@ -71,7 +99,7 @@ dry-run の成功は remote secret、認証、公開 endpoint の成功を意味
 5. host ごとの token map を対話入力で保存します。旧 per-session agent が必要とする場合だけ、既存の `HOST_TOKEN` Worker secret も保持します。Access service token と Temote host bearer token は独立した credential です。
 
 ```sh
-(cd gateway && npx wrangler secret put HOST_TOKENS_JSON)
+(cd fabric && npx wrangler secret put HOST_TOKENS_JSON)
 ```
 
 6. metadata、test、dry-run を検証し、remote 設定と secret の存在を確認してから選択した target へ deploy します。
@@ -81,10 +109,10 @@ dry-run の成功は remote secret、認証、公開 endpoint の成功を意味
 just generate-tools
 just check-generated
 
-# gateway/
-(cd gateway && npm test)
-(cd gateway && npm run deploy:dry-run -- --keep-vars)
-(cd gateway && npm run deploy -- --keep-vars)
+# fabric/
+(cd fabric && npm test)
+(cd fabric && npx wrangler deploy --dry-run --keep-vars)
+(cd fabric && npx wrangler deploy --keep-vars)
 ```
 
 7. 下記の health と認証済み MCP 疎通を確認します。target を指定しない deploy は version を upload しても公開されません。
@@ -118,7 +146,7 @@ envelope 超過は `provider_envelope_too_large`、provider が `finish_reason: 
 provider または response budget を修正した後、`MEMORY_PROJECTION_GENERATION` を増加させると retained observation を新しい projection として再処理します。
 
 ```sh
-(cd gateway && npx wrangler secret put MEMORY_API_KEY)
+(cd fabric && npx wrangler secret put MEMORY_API_KEY)
 ```
 
 `wrangler secret put` は直ちに Worker deployment を作成します。
@@ -126,7 +154,7 @@ target と Access policy を確認し、意図した Worker の設定作業と�
 [Wrangler の secret 管理](https://developers.cloudflare.com/workers/configuration/secrets/) を参照してください。
 抽出を止めるときは `MEMORY_ENABLED` を `false` にします。
 有効にするときは `true` にして、確認済みの Worker config を deploy します。
-`temote-memory` Queue と5分ごとの scheduled sweep は `gateway/wrangler.toml` に定義されています。
+`temote-memory` Queue と5分ごとの scheduled sweep は `fabric/wrangler.toml` に定義されています。
 deploy 時も両方の binding を維持してください。
 Queue は at-least-once の起動通知です。
 D1 outbox は未送信または古くなった work を60秒後に再送対象にし、次の5分ごとの scheduled sweep が Queue に再投入します。
@@ -160,10 +188,10 @@ Cloudflare 上でこの経路が動くことは、ローカルの dry-run だけ
 
 `workers_dev = false` では route または custom domain を指定しない deploy が Worker を公開せず、`No targets deployed` を表示することがあります。command が exit 0 でもこの出力は失敗として扱い、次のどちらか一方の target を明示します。
 
-Wrangler を実行する前に、意図した target を `gateway/` から repository-local preflight で確認します。
+Wrangler を実行する前に、意図した target を `fabric/` から repository-local preflight で確認します。
 
 ```sh
-cd gateway
+cd fabric
 npm run deploy:preflight -- --hostname gateway.example.com --route 'gateway.example.com/*'
 ```
 
@@ -171,7 +199,7 @@ preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別�
 
 | Option | 使う条件 | target の設定 | Access | 確認 |
 | --- | --- | --- | --- | --- |
-| A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `gateway/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | Wrangler status は `gateway/` から実行し、下記の Access 認証付き `/healthz` を確認します。 |
+| A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `fabric/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | Wrangler status は `fabric/` から実行し、下記の Access 認証付き `/healthz` を確認します。 |
 | B. Existing DNS + Worker route | 既存 DNS record を削除できない場合。 | deploy 時に exact pattern を渡します。例: `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`。 | hostname 全体を Cloudflare Access application で保護します。 | A と同じ。さらに Cloudflare dashboard で route pattern が `temote-mcp-gateway` を指すことを確認します。 |
 
 どちらの方式でも次を守ります。
@@ -184,17 +212,17 @@ preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別�
 
 ### Deploy の確認（read-only）
 
-Wrangler command は `gateway/` から実行します。hostname 全体を Access で保護しているため、health check には Service Auth policy で許可された service-token credential を渡します。credential 値は保護された environment または secret store に置き、command や log に直接書かないでください。
+Wrangler command は `fabric/` から実行します。hostname 全体を Access で保護しているため、health check には Service Auth policy で許可された service-token credential を渡します。credential 値は保護された environment または secret store に置き、command や log に直接書かないでください。
 
 ```sh
-(cd gateway && npx wrangler deployments status --name temote-mcp-gateway)
+(cd fabric && npx wrangler deployments status --name temote-mcp-gateway)
 curl --silent --show-error --fail \
   --header "CF-Access-Client-Id: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID:?Access service-token client ID を設定してください}" \
   --header "CF-Access-Client-Secret: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET:?Access service-token client secret を設定してください}" \
   "https://<gateway-host>/healthz"
 ```
 
-`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`）。Worker 内の `/healthz` handler は client token を要求しませんが、Cloudflare Access は edge で hostname を保護します。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。`contractFingerprint` は public tool contract の SHA-256 digest で、deploy した source revision の `gateway/contract/public-tools.fingerprint` と、local/connected server の `session_info` が返す `server_contract_fingerprint` に一致する必要があります。
+`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-fabric","readiness":"ready","identity":"temote-fabric","compatibilityIdentity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`）。Worker 内の `/healthz` handler は client token を要求しませんが、Cloudflare Access は edge で hostname を保護します。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。`contractFingerprint` は public tool contract の SHA-256 digest で、deploy した source revision の `fabric/contract/public-tools.fingerprint` と、local/connected server の `session_info` が返す `server_contract_fingerprint` に一致する必要があります。
 
 MCP `tools/list` や他の `/mcp` request は、`ACCESS_ALLOWED_EMAILS` に含まれる user として Access Managed OAuth で認証した MCP client から確認します。Worker は Access JWT の signature、audience、issuer、expiry、subject、allowlist 内 email を検証します。Access service token は host agent の Service Auth と `/healthz` smoke 用です。service-token JWT には user email がなく `sub` も空のため、`/mcp` の user identity check は通りません。local/test 用の `CLIENT_TOKEN` を production Worker に設定しないでください。
 
@@ -202,7 +230,7 @@ MCP `tools/list` や他の `/mcp` request は、`ACCESS_ALLOWED_EMAILS` に含�
 
 rollback では追加した exact な Worker route または custom domain だけを外します。
 
-1. Cloudflare dashboard で `<gateway-host>` の exact な route pattern または custom-domain binding を削除するか、`gateway/wrangler.toml` を戻して以前の target 構成を deploy します。
+1. Cloudflare dashboard で `<gateway-host>` の exact な route pattern または custom-domain binding を削除するか、`fabric/wrangler.toml` を戻して以前の target 構成を deploy します。
 2. DNS record、Access application、Tunnel はそのまま残し、direct origin を維持します。
 3. `curl -sSf https://<gateway-host>/healthz` と dashboard で hostname が Worker を指していないことを確認し、必要なら intended direct-origin 構成へ戻します。
 
@@ -431,6 +459,6 @@ migration 中は legacy session agent と host-level agent を同時に利用で
 
 ## Development
 
-local Worker 開発では `gateway/.dev.vars.example` を `gateway/.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、host bearer token、endpoint environment file は commit しないでください。
+local Worker 開発では `fabric/.dev.vars.example` を `fabric/.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、host bearer token、endpoint environment file は commit しないでください。
 
 routed tool schema と MCP protocol version は Rust 生成の contract snapshot に対して Rust/Node の両テストで照合します。`serverInfo.version` は Temote CLI CalVer ではなく、`GATEWAY_DEPLOYMENT` version-metadata binding が供給する Cloudflare deployment revision です。
