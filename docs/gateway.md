@@ -332,11 +332,17 @@ Per-source `source_head_revision` and `source_acked_revision` are journal cursor
 
 - Each poll refreshes a 90-second host lease and waits up to 20 seconds for work.
 - Gateway dispatch waits up to 35 seconds for the endpoint response.
+- Updated host and legacy agents separate polling from request execution, with at most eight in-flight requests shared across reconnects. The gateway advertises this internal capability at connect time. With an updated gateway, heartbeat-only polls renew the lease without dequeuing more work when all slots are occupied. Older gateways keep the one-request serial fallback without heartbeat-only polling.
+- A late response rejected as `stale_request` ends that response delivery without replacing the healthy host connection. Real generation/instance changes still fence stale agents. Response-upload failures never cause an accepted tool operation to be executed again.
 - `host_list` includes only registry entries whose corresponding host Durable Object still reports an active lease.
+- Explicit `host_info({host_id})` and `session_list({host_id})` check only the selected host's status. Unrelated host status failures do not delay these qualified requests.
 - A reconnect replaces the old generation and fences the previous agent instance.
+- Retiring a generation prevents new local dispatch admission and fences old response delivery. Local dispatches that have already started remain tracked under their original generation; a transport reconnect does not cancel them.
 - Disconnect, lease expiry, timeout, or Worker replacement never causes automatic replay of an ambiguous mutating tool call.
 - Aggregate unqualified session discovery fails closed if a currently leased host cannot be queried.
 - Local sandbox and approval policy are always enforced on the execution host.
+
+A gateway timeout describes the request transport, not the delegated task's execution outcome. Rediscover the existing task with `task_list` and read it through the matching `*_task_get`. If a start response was lost, retry only the same task-start request with its original `operation_id`; changing the ID may create another task.
 
 ## Migration from per-session agents
 

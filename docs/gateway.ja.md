@@ -437,11 +437,17 @@ gap または未 ACK の source revision がある場合、observation context �
 
 - poll ごとに90秒の host lease を更新し、最大20秒 work を待機します。
 - gateway dispatch は endpoint response を最大35秒待ちます。
+- 更新された host / legacy agent は poll と request 実行を分離し、reconnect をまたいで最大8件の in-flight request を共有します。gateway は connect 時にこの内部 capability を通知します。更新済み gateway では、全 slot が使用中でも request を dequeue しない heartbeat-only poll で lease を更新します。古い gateway では従来の1件ずつの処理へ戻し、heartbeat-only poll は使いません。
+- 遅れた response が `stale_request` で拒否された場合、その response の配送だけを終了し、正常な host 接続を置き換えません。実際の generation / instance 変更では引き続き古い agent を fence します。response upload の失敗で、受理済み tool operation を再実行しません。
 - `host_list` は registry entry だけで判断せず、対応する host Durable Object が active lease を返した host だけを表示します。
+- `host_info({host_id})` と `session_list({host_id})` は指定 host だけの status を確認します。他 host の status 取得失敗で、この明示的な問い合わせを待たせません。
 - reconnect は旧 generation を置き換え、古い agent instance を fence します。
+- generation 終了後は新たな local dispatch の受付と古い response の配送を fence します。開始済みの local dispatch は元の generation で追跡し、通信の reconnect だけを理由にキャンセルしません。
 - disconnect、lease expiry、timeout、Worker replacement のいずれでも、ambiguous な mutating tool call を自動 replay しません。
 - unqualified な aggregate session discovery は、leased host の一部を問い合わせできない場合 fail closed します。
 - sandbox と approval policy は実行 host で常に適用されます。
+
+gateway の timeout は request の通信状態を示し、delegated task の実行結果ではありません。`task_list` で既存 task を再発見し、対応する `*_task_get` で確認してください。start response を受け取れなかった場合は、元の `operation_id` と同じ request でだけ retry します。別の ID を使うと新しい task を作成する可能性があります。
 
 ## Per-session agent からの migration
 

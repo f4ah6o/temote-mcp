@@ -151,6 +151,12 @@ foreground timeout を超える sandbox 作業は session 所有の `job_id` を
 
 `task_list({session_id, limit?})` は同じ完全な session instance と canonical scope が所有する retained delegated task を、利用可能な backend 全体から再発見します。bounded な各項目の `backend`、`task_id`、state を見て、対応する `*_task_get` で reconcile と結果取得を行います。limit は既定 50、最大 128 です。読めない store は `backends` 内で `unavailable` として表示し、空の list と混同しません。list 自体は task を開始・reconcile せず、transcript や raw output も返しません。
 
+対応する `*_task_get` に `after_revision` を指定すると、保持された task の意味が変わっていない場合は小さな `not_modified` 結果を受け取れます。同じ状態を再確認しただけでは revision と更新時刻を進めません。実行状態の遷移、異なるエラーなど、保持する状態に意味のある変更があれば revision を進めます。execution、verification、delivery はそれぞれ別の状態です。
+
+task control と重なった読み取りは、`reconciliation_deferred: true` と保持済みの状態を返す場合があります。control が落ち着いてから読み取りを retry してください。古い観測で新しい task revision を上書きしたり、前の turn の interaction や evidence を新しい状態へ付けたりしません。
+
+OpenCode の status、messages、sessions、permissions、questions は、合計10秒の共通予算内で1つの観測として取得します。取得失敗や timeout は観測不明として扱い、空の結果に置き換えて完了・失敗を推定しません。応答の pending interaction にも同じ scope 検証済み snapshot を使います。読み取りに失敗した場合は既存 task の観測を retry し、それだけを理由に代わりの task を開始しないでください。
+
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
 ### Context plane
