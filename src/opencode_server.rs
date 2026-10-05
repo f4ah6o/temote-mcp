@@ -2590,6 +2590,20 @@ impl ServeClient {
         }
     }
 
+    async fn wait_private_workspace_registered(&self) -> bool {
+        if !matches!(self, Self::SdkV2(_)) {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, self.private_workspace_registered()).await {
+                Ok(Ok(true)) => return true,
+                _ if tokio::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(SERVE_HEALTH_POLL).await,
+            }
+        }
+    }
+
     async fn private_workspace_registered(&self) -> Result<bool> {
         let Self::SdkV2(inner) = self else {
             return Ok(false);
@@ -2597,27 +2611,35 @@ impl ServeClient {
         let status =
             v2_get_json(&inner.client, &inner.base_url, &inner.password, "api/mcp").await?;
         let connected = status
-            .get("temote_workspace")
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            == Some("connected");
-        if !connected {
-            return Ok(false);
-        }
-        let tools = v2_get_json(
-            &inner.client,
-            &inner.base_url,
-            &inner.password,
-            "api/experimental/tool/ids",
-        )
-        .await?;
-        Ok(tools.as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item.as_str().is_some_and(|id| {
-                    id.contains("temote_workspace") && id.ends_with("workspace_check")
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| {
+                servers.iter().any(|server| {
+                    server.get("name").and_then(Value::as_str) == Some("temote_workspace")
+                        && server.pointer("/status/status").and_then(Value::as_str)
+                            == Some("connected")
                 })
             })
-        }))
+            || status
+                .get("temote_workspace")
+                .and_then(|server| server.get("status"))
+                .and_then(Value::as_str)
+                == Some("connected");
+        #[cfg(test)]
+        eprintln!(
+            "private registration: connected={connected}, catalog={}",
+            inner
+                ._private_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.catalog_observed())
+        );
+        // The builtin tool inventory excludes MCP tools. Require the owned
+        // bridge's authenticated tools/list observation as well as connection.
+        Ok(connected
+            && inner
+                ._private_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.catalog_observed()))
     }
 
     async fn health(&self) -> Result<Value> {
@@ -3238,7 +3260,7 @@ async fn spawn_serve(
         {
             Ok(client) => {
                 if private_bridge.is_some() {
-                    let registered = client.private_workspace_registered().await.unwrap_or(false);
+                    let registered = client.wait_private_workspace_registered().await;
                     if !registered {
                         client.shutdown().await;
                         last_error = Some(anyhow::anyhow!(
@@ -5211,6 +5233,10 @@ async fn probe_private_registration(
     effort: &str,
     binary: &Path,
 ) -> Result<()> {
+    // Pre-acceptance probes run before a TaskRecord creates this store.
+    // Create and validate each private ancestor without accepting a task.
+    store.ensure_directory()?;
+    ensure_private_directory(&store.runtime_state_root())?;
     let state_dir = store.runtime_state_directory(task_id);
     ensure_private_directory(&state_dir)?;
     let data_dir = state_dir.join("probe-data");
@@ -5244,7 +5270,7 @@ async fn probe_private_registration(
     .await;
     let connected = match result {
         Ok(client) => {
-            let connected = client.private_workspace_registered().await.unwrap_or(false);
+            let connected = client.wait_private_workspace_registered().await;
             client.shutdown().await;
             connected
         }

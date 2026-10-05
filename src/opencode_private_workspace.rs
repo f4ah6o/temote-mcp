@@ -1,7 +1,10 @@
 //! Per-task, loopback-only MCP tool for a Host-opted-in managed OpenCode task.
 //! The tool has no caller-supplied command, path, environment, or task text.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -32,13 +35,21 @@ pub(crate) struct Authority {
 struct StateData {
     token: String,
     authority: Authority,
+    catalog_observed: Arc<AtomicBool>,
 }
 
 pub(crate) struct Bridge {
     pub port: u16,
     pub token: String,
     pub runtime_instance_id: Uuid,
+    catalog_observed: Arc<AtomicBool>,
     server: tokio::task::JoinHandle<()>,
+}
+
+impl Bridge {
+    pub(crate) fn catalog_observed(&self) -> bool {
+        self.catalog_observed.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for Bridge {
@@ -55,9 +66,11 @@ pub(crate) fn start(authority: Authority) -> Result<Arc<Bridge>> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let port = listener.local_addr()?.port();
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let catalog_observed = Arc::new(AtomicBool::new(false));
     let state = Arc::new(StateData {
         token: token.clone(),
         authority,
+        catalog_observed: Arc::clone(&catalog_observed),
     });
     let app = Router::new()
         .route("/mcp", post(request))
@@ -70,20 +83,22 @@ pub(crate) fn start(authority: Authority) -> Result<Arc<Bridge>> {
         port,
         token,
         runtime_instance_id,
+        catalog_observed,
         server,
     }))
 }
 
 pub(crate) fn configure(config: &mut Value, bridge: &Bridge) {
     config["mcp"] = json!({
-        "temote_workspace": {
+        "servers": {"temote_workspace": {
             "type": "remote",
             "url": format!("http://127.0.0.1:{}/mcp", bridge.port),
-            "enabled": true,
+            "disabled": false,
+            "codemode": false,
             "headers": {"Authorization": format!("Bearer {}", bridge.token)},
             "oauth": false,
-            "timeout": 120000
-        }
+            "timeout": {"startup":30000,"catalog":30000,"execution":120000}
+        }}
     });
 }
 
@@ -103,6 +118,9 @@ async fn request(
     let method = input.get("method").and_then(Value::as_str).unwrap_or("");
     if method == "notifications/initialized" {
         return (StatusCode::ACCEPTED, Json(Value::Null));
+    }
+    if method == "tools/list" {
+        state.catalog_observed.store(true, Ordering::Release);
     }
     let response = match method {
         "initialize" => Ok(json!({
