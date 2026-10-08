@@ -55,6 +55,9 @@ pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 const UPGRADE_PLAN_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
+const MAX_UPGRADE_BLOCKER_DIAGNOSTICS: usize = 8;
+const MAX_UPGRADE_BLOCKER_REASON_BYTES: usize = 1024;
+const SAFE_UPGRADE_RESTART_CONTEXT_KEYS: &[&str] = &["LANG", "LC_ALL", "PATH"];
 const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
@@ -3089,8 +3092,11 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let stopped_unrestorable = if preflight.blocked_session_count > 0 {
         anyhow::ensure!(
             force,
-            "upgrade is blocked by {} session(s)",
-            preflight.blocked_session_count
+            "{}",
+            blocked_upgrade_diagnostics(
+                preflight.blocked_session_count,
+                &preflight.blocked_sessions,
+            )
         );
         let planned_sessions = preflight.planned_sessions.clone();
         let stopped = stop_unrestorable_sessions(
@@ -3175,6 +3181,99 @@ fn ensure_upgrade_compatibility_gates(preflight: &RemoteUpgradePreflight) -> Res
         "sandbox helper generation is not compatible with the running supervisor"
     );
     Ok(())
+}
+
+fn blocked_upgrade_diagnostics(
+    blocked_session_count: usize,
+    blocked_sessions: &[crate::supervisor::UpgradeSessionBlocker],
+) -> String {
+    let mut message = format!("upgrade is blocked by {blocked_session_count} session(s)");
+    let details_count = blocked_sessions
+        .len()
+        .min(blocked_session_count)
+        .min(MAX_UPGRADE_BLOCKER_DIAGNOSTICS);
+
+    for blocker in blocked_sessions.iter().take(details_count) {
+        let valid_id = config::validate_session_id(&blocker.id).is_ok();
+        let session_id = if valid_id {
+            blocker.id.as_str()
+        } else {
+            "[unavailable]"
+        };
+        let reason = safe_upgrade_blocker_reason(blocker, valid_id);
+        message.push_str(&format!("\n- session {session_id}: {reason}"));
+    }
+
+    if blocked_session_count > details_count || blocked_sessions.len() > details_count {
+        message.push_str("\n- additional blocker details omitted");
+    }
+    message
+}
+
+fn safe_upgrade_blocker_reason(
+    blocker: &crate::supervisor::UpgradeSessionBlocker,
+    valid_id: bool,
+) -> String {
+    let reason = blocker.reason.as_str();
+    if reason.len() > MAX_UPGRADE_BLOCKER_REASON_BYTES || reason.chars().any(char::is_control) {
+        return "reason unavailable".to_owned();
+    }
+
+    if reason == "session runtime has ended; lifecycle maintenance is pending" {
+        return "session runtime has ended; lifecycle maintenance is pending".to_owned();
+    }
+    if !valid_id {
+        return "reason unavailable".to_owned();
+    }
+
+    let id = blocker.id.as_str();
+    for (suffix, safe_reason) in [
+        (
+            "has no in-memory restart context",
+            "restart context is unavailable",
+        ),
+        (
+            "named root no longer resolves to its current cwd",
+            "named root no longer resolves to the session workspace",
+        ),
+        (
+            "local cwd no longer resolves to its current cwd",
+            "session working directory no longer resolves",
+        ),
+        (
+            "has no lifecycle metadata",
+            "lifecycle metadata is unavailable",
+        ),
+        (
+            "is not in active lifecycle state during upgrade preflight",
+            "session is not active",
+        ),
+        (
+            "disappeared during upgrade preflight",
+            "session changed during preflight",
+        ),
+    ] {
+        if reason == format!("session {id} {suffix}") {
+            return safe_reason.to_owned();
+        }
+    }
+
+    let key_prefix = format!("session {id} restart context is unavailable or changed for keys: ");
+    if let Some(keys) = reason.strip_prefix(&key_prefix) {
+        let safe_keys = keys
+            .split(", ")
+            .filter(|key| SAFE_UPGRADE_RESTART_CONTEXT_KEYS.contains(key))
+            .collect::<BTreeSet<_>>();
+        if !safe_keys.is_empty() {
+            return format!(
+                "restart context is unavailable or changed for keys: {}",
+                safe_keys.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        return "restart context is unavailable or changed; key details omitted".to_owned();
+    }
+
+    "reason unavailable".to_owned()
 }
 
 /// True while the supervisor still runs the session instance the upgrade
@@ -8432,6 +8531,76 @@ mod tests {
             validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
         assert!(error.to_string().contains("session instance changed"));
         validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_keep_count_and_safe_session_reasons() {
+        let blockers = vec![crate::supervisor::UpgradeSessionBlocker {
+            id: "blocked-a".to_owned(),
+            reason: "session blocked-a has no in-memory restart context".to_owned(),
+        }];
+
+        let message = blocked_upgrade_diagnostics(1, &blockers);
+
+        assert!(message.starts_with("upgrade is blocked by 1 session(s)"));
+        assert!(message.contains("session blocked-a: restart context is unavailable"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_only_show_allowlisted_restart_context_keys() {
+        let blockers = vec![crate::supervisor::UpgradeSessionBlocker {
+            id: "blocked-a".to_owned(),
+            reason: "session blocked-a restart context is unavailable or changed for keys: LANG, PATH, KINTONE_PASSWORD, RAW_SECRET_SENTINEL".to_owned(),
+        }];
+
+        let message = blocked_upgrade_diagnostics(1, &blockers);
+
+        assert!(message.contains("keys: LANG, PATH"));
+        assert!(!message.contains("KINTONE_PASSWORD"));
+        assert!(!message.contains("RAW_SECRET_SENTINEL"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_fail_closed_for_malformed_and_oversized_input() {
+        let blockers = vec![
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "../ID_SECRET_SENTINEL".to_owned(),
+                reason: "raw error SECRET_REASON_SENTINEL".to_owned(),
+            },
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "blocked-newline".to_owned(),
+                reason: "session blocked-newline has no in-memory restart context\nINJECTED_SECRET_SENTINEL".to_owned(),
+            },
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "blocked-oversized".to_owned(),
+                reason: format!("SECRET_OVERSIZED_SENTINEL{}", "x".repeat(MAX_UPGRADE_BLOCKER_REASON_BYTES)),
+            },
+        ];
+
+        let message = blocked_upgrade_diagnostics(3, &blockers);
+
+        assert!(message.contains("session [unavailable]: reason unavailable"));
+        assert_eq!(message.matches("reason unavailable").count(), 3);
+        assert!(!message.contains("ID_SECRET_SENTINEL"));
+        assert!(!message.contains("SECRET_REASON_SENTINEL"));
+        assert!(!message.contains("INJECTED_SECRET_SENTINEL"));
+        assert!(!message.contains("SECRET_OVERSIZED_SENTINEL"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_bound_detail_count_and_output_size() {
+        let blockers = (0..MAX_UPGRADE_BLOCKER_DIAGNOSTICS + 3)
+            .map(|index| crate::supervisor::UpgradeSessionBlocker {
+                id: format!("blocked-{index}"),
+                reason: format!("session blocked-{index} has no in-memory restart context"),
+            })
+            .collect::<Vec<_>>();
+
+        let message = blocked_upgrade_diagnostics(blockers.len(), &blockers);
+
+        assert_eq!(message.matches("restart context is unavailable").count(), 8);
+        assert!(message.contains("additional blocker details omitted"));
+        assert!(message.len() < 2048);
     }
 
     fn force_stop_preflight_fixture(ids: &[&str]) -> RemoteUpgradePreflight {
