@@ -26,6 +26,7 @@
 
 ### Changed
 
+- Fabric host links negotiate bounded concurrent RPC handling while preserving serial compatibility with older Workers; accepted RPCs survive reconnects, response uploads retry only the same envelope, and `temote fabric status` reports staged readiness with a failing exit status until the active lease, generation, and public session inventory are usable.
 - New normal sessions require a configured named root at every entry point, including local cwd starts. Legacy sessions retain their proven stored cwd on restart and upgrade; remapping a root cannot move an existing session. ([named roots](docs/managed-sessions.md))
 - The canonical package and executable are now `temote`, with `temote-mcp` retained as a compatibility executable. Fabric configuration and commands accept canonical names while preserving existing state and credential identities. ([naming migration](docs/naming-migration.md))
 - Delegated task reads accept bounded `wait_ms` (default 0, maximum 30000) without a separate wait tool or a task mutation. Codex can continue a retained completed or interrupted task in a fresh turn; report views identify native structured output versus compatibility extraction. ([backend capabilities](docs/backend-capabilities.md))

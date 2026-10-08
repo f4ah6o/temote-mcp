@@ -19,6 +19,8 @@ Native Windows execution remains a later milestone. Windows 11 federation curren
 
 A host reconnect increments its generation. Requests and responses from an older generation or process `instance_id` are rejected. Timed-out or disconnected tool calls are not automatically replayed, because routed operations may be non-idempotent.
 
+New host agents negotiate up to eight concurrent RPCs; gateways that do not advertise capacity keep the original serial protocol. When all slots are occupied, the agent sends a lease heartbeat without accepting another request. Accepted RPCs remain owned across a transport reconnect, and a failed response upload retries only the same response envelope. Generation replacement still fences old responses; no RPC is automatically replayed.
+
 ## Host identity and authentication
 
 `host_id` is a stable, non-secret routing identity such as `mac-main`, `linux-main`, or `win-main`. It is not a credential.
@@ -155,8 +157,8 @@ Run the Wrangler command from `fabric/`. The whole hostname is protected by Acce
 ```sh
 (cd fabric && npx wrangler deployments status --name temote-mcp-gateway)
 curl --silent --show-error --fail \
-  --header "CF-Access-Client-Id: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID:?set the Access service-token client ID}" \
-  --header "CF-Access-Client-Secret: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET:?set the Access service-token client secret}" \
+  --header "CF-Access-Client-Id: ${TEMOTE_FABRIC_ACCESS_CLIENT_ID:?set the Access service-token client ID}" \
+  --header "CF-Access-Client-Secret: ${TEMOTE_FABRIC_ACCESS_CLIENT_SECRET:?set the Access service-token client secret}" \
   "https://<gateway-host>/healthz"
 ```
 
@@ -181,23 +183,25 @@ Configure named roots on the machine running the supervisor. Only root names are
 macOS example:
 
 ```sh
-export TEMOTE_MCP_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
-export TEMOTE_MCP_GATEWAY_HOST_ID=mac-main
-export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
-export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<token assigned to mac-main>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
+export TEMOTE_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
+export TEMOTE_FABRIC_HOST_ID=mac-main
+export TEMOTE_FABRIC_URL=https://<gateway-host>
+export TEMOTE_FABRIC_HOST_TOKEN='<token assigned to mac-main>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_ID='<Access service-token ID>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_SECRET='<Access service-token secret>'
 
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id mac-main
+temote fabric connect --host-id mac-main
 ```
+
+Run the supervisor and `fabric connect` in separate foreground terminals. `fabric connect` is also available as `temote-mcp gateway-agent`; both use the same reconnecting Host protocol. Existing `TEMOTE_MCP_GATEWAY_*` environment names remain supported as fallback aliases, while `TEMOTE_FABRIC_*` takes precedence. Check readiness with `temote fabric status`: it prints configuration, supervisor, remote endpoint identity, authorization, host lease/generation, and publicly usable session stages. It is read-only and exits unsuccessfully unless every stage is ready; credentials and remote response bodies are never printed.
 
 Linux uses the same model with Linux paths. On Windows 11, run the supervisor and agent inside WSL2 and use WSL paths such as `/mnt/d/Developer`:
 
 ```sh
-export TEMOTE_MCP_ROOTS='{"src":"/mnt/d/Developer"}'
+export TEMOTE_ROOTS='{"src":"/mnt/d/Developer"}'
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id win-main --platform wsl2
+temote fabric connect --host-id win-main --platform wsl2
 ```
 
 The existing host-level `gateway-agent --host-id` automatically sends bounded observation batches over its authenticated channel: at most 32 records or 512 KiB per batch, on a five-second loop with an eight-second sync request timeout. It writes locally first, so a Fabric timeout or authorization failure does not fail a delegated task or replay its backend operation. The agent scans retained session journals, including terminal observations created when the ordinary `task_get` polling observes completion, and persists an owner-only per-host, per-Fabric-endpoint, per-session cursor. It does not independently poll a backend after its caller stops polling. `committed_through_revision` records the highest source revision confirmed committed to D1; `acked_through_revision` is the contiguous source revision D1 can confirm. The delivered cursor can advance across a known gap so later retained records still sync, while the gap remains visible and `complete=false`. The source revision cursors are not cloud sequence numbers.
@@ -216,7 +220,7 @@ Instruction and error previews are excluded from cloud sync by default. `TEMOTE_
 
 Keep this setting unchanged until every pending batch for that host and Fabric endpoint is ACKed. D1 may commit a batch while its response is lost; after restart, the host retries from its durable cursor. If the preview setting changed, the retried payload differs and D1 rejects it with `409 conflicting_replay` rather than overwriting the committed observation. An opt-out retry omits previews. Do not weaken payload digest checks to make the retry appear successful. If a conflict occurs, restore the originally authorized preview policy and sync until ACK only when that upload remains authorized; otherwise stop that host agent and leave the source diagnosed. Turning previews off cannot undisclose preview text already committed to D1.
 
-`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs a read-only `/healthz` identity check and authenticated `/v1/hosts/status` probe. These classify the remote endpoint, Access authorization, and this host's active lease. Doctor also reports `session_availability` from the local supervisor's read-only session inventory as `listed_sessions`/`active_sessions` counts; this reuses the supervisor control protocol, never dispatches an MCP tool, and never mutates a session or lease. A confirmed inventory whose live (`active`/`starting`) session count is zero is reported as `failed`, not `ready`; an inventory that cannot be enumerated is `unavailable`. When a local host-level `gateway-agent` generation is recorded, doctor compares the authenticated gateway `generation` against it and reports `generation_replaced` when the remote generation is newer, so a superseded local agent is not mistaken for a healthy one. The host-level `gateway-agent` separately reports a bounded, non-secret `session_availability` value (`ready`, `session_unavailable`, or `unavailable`) on each poll; the authenticated `/v1/hosts/status` response returns the latest reported value, and an unreported value stays `not_checked` instead of being treated as `ready`. That remote value is derived read-only from the supervisor inventory and carries no session ID, path, or credential. Doctor never prints root paths or token values.
+`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_FABRIC_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs an Access-authenticated `/healthz` identity check and `/v1/hosts/status` probe without following redirects. These classify the remote endpoint, authorization, and this host's active lease and generation. Doctor also reports `session_availability` from the local supervisor's read-only session inventory as `listed_sessions`/`active_sessions`/`publicly_usable_sessions` counts; yolo/local-only sessions and sessions that are still starting do not count as publicly usable. This reuses the supervisor control protocol, never dispatches an MCP tool, and never mutates a session or lease. An inventory with no active non-yolo session is reported as `failed`, not `ready`; an inventory that cannot be enumerated is `unavailable`. Doctor requires the gateway's active lease and generation to match the local host-agent record before reporting registration as ready. The host-level agent reports a bounded `session_availability` value (`ready`, `session_unavailable`, or `unavailable`) on each poll; an unreported value stays `not_checked`. Doctor never prints root paths, credential values, or remote response bodies.
 
 ## MCP workflow
 

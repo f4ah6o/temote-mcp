@@ -347,7 +347,7 @@ async function handleToolCall(rpc, env, identity) {
     if (!hostId || Object.keys(args).some((key) => key !== "host_id")) {
       return mcpJson(rpcError(id, -32602, "host_info requires only a valid host_id"));
     }
-    const hosts = await readOnlineHosts(env);
+    const hosts = await readOnlineHosts(env, hostId);
     if (!hosts.ok) return mcpJson(rpcError(id, -32001, hosts.error));
     if (hosts.unavailable.includes(hostId)) {
       return mcpJson(rpcError(id, -32006, "host_status_unavailable", { host_id: hostId }));
