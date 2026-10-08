@@ -57,15 +57,39 @@ fn isolate_process<'a>(command: &'a mut Command, state_home: &Path) -> &'a mut C
 }
 
 #[cfg(unix)]
+fn copy_private_upgrade_executable(source: &Path, binary: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::copy(source, binary).expect("failed to copy upgrade test executable");
+    fs::set_permissions(binary, fs::Permissions::from_mode(0o700))
+        .expect("failed to protect upgrade test executable");
+
+    // Linux test-profile executables can exceed the production identity bound
+    // solely because of DWARF debug sections. The private E2E fixture does not
+    // need those sections, so strip them from the copy without changing the
+    // shared Cargo artifact or the production size bound.
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("strip")
+            .args(["--strip-debug"])
+            .arg(binary)
+            .output()
+            .expect("failed to start strip for private upgrade test executable");
+        assert!(
+            output.status.success(),
+            "failed to strip private upgrade test executable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
 fn private_upgrade_binary() -> (TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = TempDir::new().expect("failed to create private executable directory");
     let binary = directory.path().join("temote-mcp");
-    fs::copy(env!("CARGO_BIN_EXE_temote-mcp"), &binary)
-        .expect("failed to copy upgrade test executable");
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
-        .expect("failed to protect upgrade test executable");
+    copy_private_upgrade_executable(env!("CARGO_BIN_EXE_temote-mcp").as_ref(), &binary);
     let helper = directory.path().join("temote-linux-sandbox");
     fs::copy(env!("CARGO_BIN_EXE_temote-linux-sandbox"), &helper)
         .expect("failed to copy upgrade test sandbox helper");
@@ -78,14 +102,9 @@ fn private_upgrade_binary() -> (TempDir, PathBuf) {
 /// compatibility gate when pointed to by TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR.
 #[cfg(target_os = "linux")]
 fn helperless_upgrade_binary() -> (TempDir, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = TempDir::new().expect("failed to create private executable directory");
     let binary = directory.path().join("temote-mcp");
-    fs::copy(env!("CARGO_BIN_EXE_temote-mcp"), &binary)
-        .expect("failed to copy upgrade test executable");
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
-        .expect("failed to protect upgrade test executable");
+    copy_private_upgrade_executable(env!("CARGO_BIN_EXE_temote-mcp").as_ref(), &binary);
     (directory, binary)
 }
 
