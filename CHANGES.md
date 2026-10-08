@@ -39,6 +39,7 @@
 
 ### Fixed
 
+- Version-pinned `cargo binstall temote@<version>` now downloads the binary archive from the matching CalVer release instead of the latest release.
 - A blocked normal upgrade now keeps its count summary and adds bounded per-session IDs with sanitized reasons; raw blocker errors and non-allowlisted restart-context keys are omitted.
 - Local diagnostic status, session list/info, and upgrade preflight now use a restricted supervisor request that skips query-triggered reaping and lifecycle reconciliation; older supervisors fail closed without a legacy diagnostic fallback, while normal maintenance and upgrade/apply paths retain their compatible behavior. ([read-only diagnostics](docs/usage.md#sessions), [Fabric readiness](docs/gateway.md#host-identity-and-authentication))
 - Managed source preparation now selects the visible Codex catalog default and advertised effort, rather than choosing a hidden auxiliary model by alphabetical order. Accepted receipts retain their original selection. ([managed source start](issues/doing/20261005-managed-session-source-start.md))
