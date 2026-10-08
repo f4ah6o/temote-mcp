@@ -276,10 +276,11 @@ fn classify_host_session_availability(sessions: &[(&str, bool)]) -> HostSessionA
     }
 }
 
-/// Reads the local supervisor's session inventory read-only. Enumeration
-/// failure is reported as `unavailable`; it is never presented as ready.
+/// Refreshes the local supervisor's session inventory through its
+/// legacy-compatible operational control path. Enumeration failure is
+/// reported as `unavailable`; it is never presented as ready.
 async fn current_host_session_availability() -> HostSessionAvailability {
-    match session_control::request_session_views().await {
+    match session_control::request_session_views_operational().await {
         Ok(views) => {
             let sessions = views
                 .iter()

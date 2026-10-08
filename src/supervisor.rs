@@ -411,6 +411,7 @@ struct UpgradePlanOptions {
     fence: bool,
     force: bool,
     collect_blockers: bool,
+    reap_finished: bool,
 }
 
 pub(crate) struct SupervisorUpgradePlanRequest<'a> {
@@ -2002,8 +2003,26 @@ impl SessionSupervisor {
         dry_run: bool,
         limit: usize,
     ) -> Result<crate::session_control::SessionGcReport> {
+        self.gc_session_metadata_inner(dry_run, limit, true).await
+    }
+
+    pub(crate) async fn gc_session_metadata_read_only(
+        &self,
+        limit: usize,
+    ) -> Result<crate::session_control::SessionGcReport> {
+        self.gc_session_metadata_inner(true, limit, false).await
+    }
+
+    async fn gc_session_metadata_inner(
+        &self,
+        dry_run: bool,
+        limit: usize,
+        reap_finished: bool,
+    ) -> Result<crate::session_control::SessionGcReport> {
         let _transition = self.transitions.lock().await;
-        self.reap_finished().await;
+        if reap_finished {
+            self.reap_finished().await;
+        }
         if !dry_run {
             self.ensure_mutations_allowed()?;
         }
@@ -2395,6 +2414,7 @@ impl SessionSupervisor {
                     fence,
                     force: request.force,
                     collect_blockers: false,
+                    reap_finished: true,
                 },
                 expected_sessions,
             )
@@ -2419,6 +2439,33 @@ impl SessionSupervisor {
                 fence: false,
                 force,
                 collect_blockers: true,
+                reap_finished: false,
+            },
+            None,
+        )
+        .await
+    }
+
+    /// Compatibility preview used by legacy maintenance/apply handshakes.
+    /// Diagnostic clients use `preview_upgrade_plan`, which never reaps.
+    pub(crate) async fn preview_upgrade_plan_with_maintenance(
+        &self,
+        target_version: &str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &approvals::CapturedStartEnvironment,
+        force: bool,
+    ) -> Result<SupervisorUpgradePreview> {
+        self.prepare_upgrade_plan(
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            UpgradePlanOptions {
+                fence: false,
+                force,
+                collect_blockers: true,
+                reap_finished: true,
             },
             None,
         )
@@ -2439,14 +2486,21 @@ impl SessionSupervisor {
             !self.upgrade_fenced.load(Ordering::Acquire),
             "another supervisor upgrade is already in progress"
         );
-        self.reap_finished().await;
+        if options.reap_finished {
+            self.reap_finished().await;
+        }
 
         let source_version = env!("CARGO_PKG_VERSION").to_owned();
         let handoff_required = options.force || source_version != target_version;
+        let mut finished_sessions = Vec::new();
         let active_sessions = {
             let sessions = self.sessions.lock().await;
             let mut identities = Vec::with_capacity(sessions.len());
             for (session_id, handle) in sessions.iter() {
+                if !options.reap_finished && handle.is_finished() {
+                    finished_sessions.push(session_id.clone());
+                    continue;
+                }
                 let snapshot = handle.snapshot().await?;
                 identities.push(SupervisorUpgradeSessionIdentity {
                     session_id: session_id.clone(),
@@ -2475,7 +2529,13 @@ impl SessionSupervisor {
             }
         }
         let mut plans = Vec::new();
-        let mut blocked_sessions = Vec::new();
+        let mut blocked_sessions = finished_sessions
+            .iter()
+            .map(|id| UpgradeSessionBlocker {
+                id: id.clone(),
+                reason: "session runtime has ended; lifecycle maintenance is pending".to_owned(),
+            })
+            .collect::<Vec<_>>();
         if handoff_required {
             let ids = {
                 let sessions = self.sessions.lock().await;
@@ -2484,6 +2544,9 @@ impl SessionSupervisor {
                 ids
             };
             for id in ids {
+                if finished_sessions.contains(&id) {
+                    continue;
+                }
                 let attempt: Result<UpgradeSessionPlan> = async {
                     let snapshot = {
                         let sessions = self.sessions.lock().await;

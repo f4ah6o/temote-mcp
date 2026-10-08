@@ -96,6 +96,12 @@ pub(crate) fn installed_upgrade_locator() -> Result<PathBuf> {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
     Ping,
+    /// A versioned-by-shape request envelope for operations that must not
+    /// trigger lifecycle maintenance. Keep this allowlist separate from
+    /// `ControlRequest` so callers cannot wrap arbitrary commands here.
+    ReadOnlyDiagnostic {
+        request: ReadOnlyDiagnosticRequest,
+    },
     Approval {
         session_id: String,
         request: Request,
@@ -204,6 +210,32 @@ enum ControlRequest {
     },
     AttachConsole,
     AttachActivity(AttachActivityRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum ReadOnlyDiagnosticRequest {
+    Ping,
+    List,
+    Info {
+        session_id: String,
+    },
+    PermissionStatus {
+        session_id: String,
+    },
+    GcPreview {
+        limit: usize,
+    },
+    UpgradePreview {
+        executable: PathBuf,
+        #[serde(default)]
+        installed_locator: Option<PathBuf>,
+        target_version: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,7 +368,10 @@ impl SessionBackend {
         match self {
             #[cfg(test)]
             Self::InProcess(supervisor) => list_session_views(supervisor).await,
-            Self::LocalControl => request_session_views().await,
+            // MCP serving is operational discovery and must keep working with
+            // supervisors that predate the restricted diagnostic envelope.
+            // CLI and doctor diagnostics call `request_session_views` directly.
+            Self::LocalControl => request_session_views_operational().await,
         }
     }
 
@@ -371,6 +406,9 @@ impl SessionBackend {
                 "named_roots": supervisor.named_root_names(),
                 "repository_clone_admission_supported": true,
             })),
+            // This status probe is part of operational host/session workflows
+            // and must remain compatible with older lifecycle supervisors.
+            // Strict diagnostics call `read_only_local_status` directly.
             Self::LocalControl => request(ControlRequest::Ping).await,
         }
     }
@@ -555,6 +593,10 @@ impl SessionBackend {
             }
         }
     }
+}
+
+pub(crate) async fn read_only_local_status() -> Result<Value> {
+    read_only_request(ReadOnlyDiagnosticRequest::Ping).await
 }
 
 fn require_repository_clone_admission_capability(status: &Value) -> Result<()> {
@@ -1039,7 +1081,7 @@ pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> 
 }
 
 pub async fn list() -> Result<()> {
-    let result = request(ControlRequest::List).await?;
+    let result = read_only_request(ReadOnlyDiagnosticRequest::List).await?;
     let sessions: Vec<SessionView> = serde_json::from_value(result)?;
     println!("SESSION\tSTATUS\tPID\tPERMISSION\tCWD");
     for session in sessions {
@@ -1060,7 +1102,7 @@ pub async fn list() -> Result<()> {
 }
 
 pub async fn info(session_id: String) -> Result<()> {
-    let result = request(ControlRequest::Info { session_id }).await?;
+    let result = read_only_request(ReadOnlyDiagnosticRequest::Info { session_id }).await?;
     print_json(&result)
 }
 
@@ -1125,7 +1167,11 @@ pub async fn forget(session_id: String) -> Result<()> {
 }
 
 pub async fn gc(apply: bool, limit: usize) -> Result<()> {
-    let result = request(ControlRequest::Gc { apply, limit }).await?;
+    let result = if apply {
+        request(ControlRequest::Gc { apply, limit }).await?
+    } else {
+        read_only_request(ReadOnlyDiagnosticRequest::GcPreview { limit }).await?
+    };
     print_json(&result)
 }
 
@@ -1148,10 +1194,13 @@ pub async fn permission(
     session_id: String,
     command: crate::cli::SessionPermissionCommand,
 ) -> Result<()> {
+    if matches!(&command, crate::cli::SessionPermissionCommand::Status) {
+        let result =
+            read_only_request(ReadOnlyDiagnosticRequest::PermissionStatus { session_id }).await?;
+        return print_json(&result);
+    }
     let control_request = match command {
-        crate::cli::SessionPermissionCommand::Status => {
-            ControlRequest::PermissionStatus { session_id }
-        }
+        crate::cli::SessionPermissionCommand::Status => unreachable!("handled above"),
         crate::cli::SessionPermissionCommand::Ask => ControlRequest::PermissionMode {
             session_id,
             permission_mode: Some(config::PermissionMode::Ask),
@@ -1293,6 +1342,48 @@ async fn handle_control_connection(
     );
 
     match request {
+        ControlRequest::ReadOnlyDiagnostic { request } => match request {
+            ReadOnlyDiagnosticRequest::UpgradePreview {
+                executable,
+                installed_locator,
+                target_version,
+                environment,
+                force,
+            } => {
+                handle_upgrade_request(
+                    stream,
+                    supervisor,
+                    UpgradeControlRequest {
+                        executable,
+                        installed_locator,
+                        target_version,
+                        environment,
+                        dry_run: true,
+                        force,
+                        expected_sessions: None,
+                    },
+                    false,
+                )
+                .await
+            }
+            request => {
+                let result = dispatch_read_only_diagnostic(request, &supervisor).await;
+                let response = match result {
+                    Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
+                    Err(error) => {
+                        json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")})
+                    }
+                };
+                stream
+                    .write_all(&encode_line_with_limit(
+                        &response,
+                        MAX_CONTROL_MESSAGE_BYTES,
+                    )?)
+                    .await?;
+                let _ = stream.shutdown().await;
+                Ok(())
+            }
+        },
         ControlRequest::AttachConsole => {
             handle_console_attachment(stream, console_registration).await
         }
@@ -1322,6 +1413,7 @@ async fn handle_control_connection(
                     force,
                     expected_sessions,
                 },
+                true,
             )
             .await
         }
@@ -1347,6 +1439,46 @@ async fn handle_control_connection(
     }
 }
 
+async fn dispatch_read_only_diagnostic(
+    request: ReadOnlyDiagnosticRequest,
+    supervisor: &Arc<SessionSupervisor>,
+) -> Result<Value> {
+    match request {
+        ReadOnlyDiagnosticRequest::Ping => Ok(supervisor_status(supervisor)?),
+        ReadOnlyDiagnosticRequest::List => {
+            Ok(serde_json::to_value(list_session_views(supervisor).await?)?)
+        }
+        ReadOnlyDiagnosticRequest::Info { session_id }
+        | ReadOnlyDiagnosticRequest::PermissionStatus { session_id } => Ok(serde_json::to_value(
+            inspect_session_read_only(&session_id).await?,
+        )?),
+        ReadOnlyDiagnosticRequest::GcPreview { limit } => Ok(serde_json::to_value(
+            supervisor.gc_session_metadata_read_only(limit).await?,
+        )?),
+        ReadOnlyDiagnosticRequest::UpgradePreview { .. } => {
+            unreachable!("upgrade preview is handled before generic control dispatch")
+        }
+    }
+}
+
+fn supervisor_status(supervisor: &SessionSupervisor) -> Result<Value> {
+    Ok(json!({
+        "status": "active",
+        "host_id": host_identity::resolve()?,
+        "version": env!("CARGO_PKG_VERSION"),
+        "boot_generation": crate::boot_identity::generation(),
+        "pid": std::process::id(),
+        "control_protocol": CONTROL_PROTOCOL_VERSION,
+        "local_task_protocol": local_tasks::PROTOCOL_VERSION,
+        "mcp_task_protocol": crate::mcp_tasks::PROTOCOL_VERSION,
+        "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
+        "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
+        "roots_configured": supervisor.roots_configured(),
+        "named_roots": supervisor.named_root_names(),
+        "repository_clone_admission_supported": true,
+    }))
+}
+
 async fn dispatch_request(
     request: ControlRequest,
     supervisor: &Arc<SessionSupervisor>,
@@ -1358,21 +1490,12 @@ async fn dispatch_request(
     }
     supervisor.reap_finished().await;
     match request {
-        ControlRequest::Ping => Ok(json!({
-            "status": "active",
-            "host_id": host_identity::resolve()?,
-            "version": env!("CARGO_PKG_VERSION"),
-            "boot_generation": crate::boot_identity::generation(),
-            "pid": std::process::id(),
-            "control_protocol": CONTROL_PROTOCOL_VERSION,
-            "local_task_protocol": local_tasks::PROTOCOL_VERSION,
-            "mcp_task_protocol": crate::mcp_tasks::PROTOCOL_VERSION,
-            "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
-            "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
-            "roots_configured": supervisor.roots_configured(),
-            "named_roots": supervisor.named_root_names(),
-            "repository_clone_admission_supported": true,
-        })),
+        ControlRequest::ReadOnlyDiagnostic { .. } => {
+            unreachable!("read-only diagnostics are dispatched before legacy maintenance")
+        }
+        // Kept as a legacy command for operational handshakes. New diagnostic
+        // callers use the restricted envelope above.
+        ControlRequest::Ping => supervisor_status(supervisor),
         ControlRequest::Approval {
             session_id,
             request,
@@ -1841,6 +1964,7 @@ async fn handle_upgrade_request(
     mut stream: UnixStream,
     supervisor: Arc<SessionSupervisor>,
     request: UpgradeControlRequest,
+    reap_before_preview: bool,
 ) -> Result<()> {
     let UpgradeControlRequest {
         executable,
@@ -1870,15 +1994,27 @@ async fn handle_upgrade_request(
         classify_helper_generation(installed_locator.as_deref().unwrap_or(&executable));
 
     if dry_run {
-        let preview = supervisor
-            .preview_upgrade_plan(
-                &target_version,
-                capabilities.control_protocol,
-                capabilities.lifecycle_schema,
-                &environment,
-                force,
-            )
-            .await;
+        let preview = if reap_before_preview {
+            supervisor
+                .preview_upgrade_plan_with_maintenance(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                )
+                .await
+        } else {
+            supervisor
+                .preview_upgrade_plan(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                )
+                .await
+        };
         let preview = match preview {
             Ok(preview) => preview,
             Err(error) => {
@@ -2608,6 +2744,12 @@ pub struct RemoteUpgradePreflight {
 pub async fn remote_upgrade_preflight(
     executable: &InstalledUpgradeExecutable,
 ) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_read_only_with_force(executable, false).await
+}
+
+pub(crate) async fn remote_upgrade_preflight_for_apply(
+    executable: &InstalledUpgradeExecutable,
+) -> Result<RemoteUpgradePreflight> {
     upgrade_preflight_with_force(executable, false).await
 }
 
@@ -2632,23 +2774,59 @@ async fn upgrade_preflight_with_force(
     executable: &InstalledUpgradeExecutable,
     force: bool,
 ) -> Result<RemoteUpgradePreflight> {
-    let ping = upgrade_request(ControlRequest::Ping).await?;
+    upgrade_preflight_inner(executable, force, false).await
+}
+
+async fn upgrade_preflight_read_only_with_force(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_inner(executable, force, true).await
+}
+
+async fn upgrade_preflight_inner(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+    read_only: bool,
+) -> Result<RemoteUpgradePreflight> {
+    let ping = if read_only {
+        read_only_request(ReadOnlyDiagnosticRequest::Ping).await?
+    } else {
+        upgrade_request(ControlRequest::Ping).await?
+    };
     validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
         .context("running supervisor did not report its version")?
         .to_owned();
-    let preview_value = upgrade_request(ControlRequest::Upgrade {
-        executable: executable.execution_path().to_owned(),
-        installed_locator: Some(executable.path.clone()),
-        target_version: executable.target_version.clone(),
-        environment: CapturedStartEnvironment::capture(),
-        dry_run: true,
-        force,
-        expected_sessions: None,
-    })
-    .await?;
+    let environment = CapturedStartEnvironment::capture();
+    let preview_value = if read_only {
+        upgrade_request(ControlRequest::ReadOnlyDiagnostic {
+            request: ReadOnlyDiagnosticRequest::UpgradePreview {
+                executable: executable.execution_path().to_owned(),
+                installed_locator: Some(executable.path.clone()),
+                target_version: executable.target_version.clone(),
+                environment,
+                force,
+            },
+        })
+        .await
+        .context(
+            "read-only supervisor upgrade preview is unsupported; no legacy maintenance request was attempted",
+        )?
+    } else {
+        upgrade_request(ControlRequest::Upgrade {
+            executable: executable.execution_path().to_owned(),
+            installed_locator: Some(executable.path.clone()),
+            target_version: executable.target_version.clone(),
+            environment,
+            dry_run: true,
+            force,
+            expected_sessions: None,
+        })
+        .await?
+    };
     let helper_generation = preview_helper_generation(&preview_value, &executable.path);
     let preview: crate::supervisor::SupervisorUpgradePreview =
         serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
@@ -2895,11 +3073,12 @@ fn codex_plugin_reconcile_command(
 
 pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let executable = capture_installed_upgrade_executable()?;
-    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     if dry_run {
+        let preflight = upgrade_preflight_read_only_with_force(&executable, force).await?;
         println!("{}", serde_json::to_string_pretty(&preflight)?);
         return Ok(());
     }
+    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
     ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
     // Every non-destructive gate must pass before --force may stop
@@ -3177,6 +3356,39 @@ async fn run_approval_broker(
 async fn request(request: ControlRequest) -> Result<Value> {
     let path = config::supervisor_socket_path()?;
     request_at_path(&path, request).await
+}
+
+async fn read_only_request(request: ReadOnlyDiagnosticRequest) -> Result<Value> {
+    let path = config::supervisor_socket_path()?;
+    read_only_request_at_path(&path, request).await
+}
+
+async fn read_only_request_at_path(
+    path: &Path,
+    request: ReadOnlyDiagnosticRequest,
+) -> Result<Value> {
+    read_only_request_at_path_until(
+        path,
+        request,
+        tokio::time::Instant::now() + UPGRADE_CONTROL_RPC_TIMEOUT,
+    )
+    .await
+}
+
+async fn read_only_request_at_path_until(
+    path: &Path,
+    request: ReadOnlyDiagnosticRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    upgrade_request_at_path_until(
+        path,
+        ControlRequest::ReadOnlyDiagnostic { request },
+        deadline,
+    )
+    .await
+    .context(
+        "read-only supervisor diagnostics are unsupported or unavailable; no legacy maintenance request was attempted",
+    )
 }
 
 async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
@@ -3930,7 +4142,7 @@ async fn upgrade_request_at_path_until(
 ) -> Result<Value> {
     tokio::time::timeout_at(deadline, request_at_path(path, request))
         .await
-        .map_err(|_| anyhow::anyhow!("supervisor upgrade control request timed out"))?
+        .map_err(|_| anyhow::anyhow!("supervisor control request timed out"))?
 }
 
 fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
@@ -4382,7 +4594,22 @@ async fn degraded_owned_session_view(snapshot: config::Session) -> Result<Sessio
 }
 
 pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
-    let result = request(ControlRequest::List).await?;
+    let path = config::supervisor_socket_path()?;
+    request_session_views_at_path(&path).await
+}
+
+async fn request_session_views_at_path(path: &Path) -> Result<Vec<SessionView>> {
+    let result = read_only_request_at_path(path, ReadOnlyDiagnosticRequest::List).await?;
+    serde_json::from_value(result).context("invalid supervisor session list response")
+}
+
+pub(crate) async fn request_session_views_operational() -> Result<Vec<SessionView>> {
+    let path = config::supervisor_socket_path()?;
+    request_session_views_operational_at_path(&path).await
+}
+
+async fn request_session_views_operational_at_path(path: &Path) -> Result<Vec<SessionView>> {
+    let result = request_at_path(path, ControlRequest::List).await?;
     serde_json::from_value(result).context("invalid supervisor session list response")
 }
 
@@ -4393,7 +4620,7 @@ async fn request_upgrade_session_views() -> Result<Vec<SessionView>> {
 
 pub(crate) async fn session_views_for_mcp() -> Result<Vec<SessionView>> {
     if supervisor_is_available().await? {
-        request_session_views().await
+        request_session_views_operational().await
     } else {
         filesystem_session_views_read_only().await
     }
@@ -5136,6 +5363,8 @@ mod tests {
         (server, accepted)
     }
 
+    const READ_ONLY_DIAGNOSTIC_CHILD_ENV: &str = "TEMOTE_TEST_READ_ONLY_DIAGNOSTIC_PRIVATE_PROCESS";
+
     #[test]
     fn control_request_half_close_only_tolerates_not_connected() {
         assert!(finish_control_request_half_close(Ok(())).is_ok());
@@ -5650,6 +5879,30 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    async fn request_read_only_test(
+        supervisor: &Arc<SessionSupervisor>,
+        request: ReadOnlyDiagnosticRequest,
+    ) -> Value {
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(supervisor),
+            registration,
+        ));
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(&encode_line(&ControlRequest::ReadOnlyDiagnostic { request }).unwrap())
+            .await
+            .unwrap();
+        client.get_mut().shutdown().await.unwrap();
+        let response = read_activity_test_json(&mut client).await;
+        task.await.unwrap().unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        response["result"].clone()
+    }
+
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("volume");
@@ -5692,6 +5945,296 @@ mod tests {
         assert_eq!(result["roots_configured"], true);
         assert_eq!(result["repository_clone_admission_supported"], true);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostics_do_not_reap_finished_sessions_or_reconcile_lifecycle() {
+        if std::env::var_os(READ_ONLY_DIAGNOSTIC_CHILD_ENV).is_some() {
+            read_only_diagnostics_private_fixture().await;
+            return;
+        }
+
+        // `config::state_dir()` intentionally uses a process-private test
+        // root. Run the ghost-active fixture in its own process so unrelated
+        // parallel tests cannot reconcile it as a stale session.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_control::tests::read_only_diagnostics_do_not_reap_finished_sessions_or_reconcile_lifecycle",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(READ_ONLY_DIAGNOSTIC_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private diagnostic fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn read_only_diagnostics_private_fixture() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("readonly-diagnostic-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo", Some(&id)).await.unwrap();
+        supervisor
+            .set_restart_policy(&id, "on-failure")
+            .await
+            .unwrap();
+        supervisor.crash_for_test(&id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if config::read_session_lifecycle(&id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == LifecycleStatus::Crashed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test runtime did not persist its crashed state");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Model a process that exited before its lifecycle record was
+        // reconciled. Read-only Info must report the contradiction without
+        // rewriting this durable fixture.
+        let mut lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        lifecycle.status = LifecycleStatus::Active;
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+
+        let metadata_path = config::session_path(&id).unwrap();
+        let lifecycle_path = config::session_lifecycle_path(&id).unwrap();
+        let metadata_before = tokio::fs::read(&metadata_path).await.unwrap();
+        let lifecycle_before = tokio::fs::read(&lifecycle_path).await.unwrap();
+        assert!(supervisor.is_managed_for_test(&id).await);
+
+        request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::Ping).await;
+        request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::List).await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::Info {
+                session_id: id.clone(),
+            },
+        )
+        .await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::PermissionStatus {
+                session_id: id.clone(),
+            },
+        )
+        .await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::GcPreview { limit: 10 },
+        )
+        .await;
+
+        assert!(supervisor.is_managed_for_test(&id).await);
+        assert_eq!(
+            tokio::fs::read(&metadata_path).await.unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let executable = _temp.path().join("fake-upgrade-target");
+            std::fs::write(
+                &executable,
+                b"#!/bin/sh\nif [ \"$1\" = \"supervisor\" ] && [ \"$2\" = \"--capabilities\" ]; then echo '{\"version\":\"test-version\",\"control_protocol\":2,\"lifecycle_schema\":1,\"upgrade_plan_schema\":1}'; else exit 2; fi\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let preview = request_read_only_test(
+                &supervisor,
+                ReadOnlyDiagnosticRequest::UpgradePreview {
+                    executable,
+                    installed_locator: None,
+                    target_version: "test-version".to_owned(),
+                    environment: CapturedStartEnvironment::default(),
+                    force: false,
+                },
+            )
+            .await;
+            assert!(
+                !preview["active_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|session| session["session_id"] == id)
+            );
+            assert!(
+                preview["blocked_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|blocker| {
+                        blocker["session_id"] == id
+                            && blocker["reason"]
+                                .as_str()
+                                .unwrap()
+                                .contains("lifecycle maintenance is pending")
+                    }),
+                "preview did not classify the ended runtime conservatively: {preview}"
+            );
+        }
+        assert!(supervisor.is_managed_for_test(&id).await);
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+
+        supervisor.reap_finished().await;
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostics_fail_closed_on_legacy_supervisor_without_ping_fallback() {
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum LegacyControlRequest {
+            Ping,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(serde_json::from_str::<LegacyControlRequest>(&line).is_err());
+            drop(stream);
+            let second_connection =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+            (line, second_connection.is_ok())
+        });
+
+        let error = read_only_request_at_path(&path, ReadOnlyDiagnosticRequest::Ping)
+            .await
+            .unwrap_err();
+        let (line, used_fallback) = server.await.unwrap();
+        assert!(
+            !used_fallback,
+            "diagnostic request retried with a legacy command"
+        );
+        let sent: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(sent["command"], "read_only_diagnostic");
+        assert_eq!(sent["request"]["operation"], "ping");
+        assert!(error.to_string().contains("no legacy maintenance request"));
+
+        let mut mutating = json!({
+            "command": "read_only_diagnostic",
+            "request": {"operation": "stop", "session_id": "example"}
+        });
+        assert!(serde_json::from_value::<ControlRequest>(mutating.take()).is_err());
+    }
+
+    #[tokio::test]
+    async fn operational_session_list_keeps_legacy_compatibility_while_diagnostics_fail_closed() {
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum LegacyControlRequest {
+            List,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-list.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (legacy_line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<LegacyControlRequest>(&legacy_line).unwrap(),
+                LegacyControlRequest::List
+            ));
+            stream
+                .write_all(&encode_line(&json!({"ok": true, "result": []})).unwrap())
+                .await
+                .unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (diagnostic_line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(serde_json::from_str::<LegacyControlRequest>(&diagnostic_line).is_err());
+            drop(stream);
+            let fallback = tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok();
+            (legacy_line, diagnostic_line, fallback)
+        });
+
+        let operational = request_session_views_operational_at_path(&path)
+            .await
+            .unwrap();
+        assert!(operational.is_empty());
+        let diagnostic = request_session_views_at_path(&path).await.unwrap_err();
+        assert!(
+            format!("{diagnostic:#}").contains("no legacy maintenance request"),
+            "strict diagnostic should explain that it did not fallback: {diagnostic:#}"
+        );
+
+        let (legacy_line, diagnostic_line, fallback) = server.await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&legacy_line).unwrap()["command"],
+            "list"
+        );
+        let diagnostic: Value = serde_json::from_str(&diagnostic_line).unwrap();
+        assert_eq!(diagnostic["command"], "read_only_diagnostic");
+        assert_eq!(diagnostic["request"]["operation"], "list");
+        assert!(!fallback, "strict diagnostics attempted a legacy fallback");
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostic_first_request_is_bounded_and_never_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stalled-diagnostic.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            let fallback = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok();
+            (line, fallback)
+        });
+
+        let error = read_only_request_at_path_until(
+            &path,
+            ReadOnlyDiagnosticRequest::Ping,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "diagnostic Ping did not use the bounded request deadline: {error:#}"
+        );
+        let (line, fallback) = server.await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["command"], "read_only_diagnostic");
+        assert_eq!(request["request"]["operation"], "ping");
+        assert!(!fallback, "diagnostic Ping attempted a legacy fallback");
     }
 
     #[test]

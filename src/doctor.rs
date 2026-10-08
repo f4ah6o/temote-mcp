@@ -872,27 +872,16 @@ async fn check_gateway_supervisor(report: &mut Report, host_id: &str) {
 }
 
 async fn gateway_supervisor_result(host_id: &str) -> GatewayStageResult {
-    match crate::session_control::SessionBackend::local_control().await {
-        Ok(sessions) => match sessions.status().await {
-            Ok(status) => classify_gateway_supervisor_status(host_id, &status),
-            Err(error) => GatewayStageResult::failed(
-                GatewayStage::LocalSupervisor,
-                "control",
-                format!(
-                    "host_id={host_id}, supervisor status failed ({})",
-                    safe_error_code(&error)
-                ),
-                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
-            ),
-        },
+    match crate::session_control::read_only_local_status().await {
+        Ok(status) => classify_gateway_supervisor_status(host_id, &status),
         Err(error) => GatewayStageResult::unavailable(
             GatewayStage::LocalSupervisor,
             "control",
             format!(
-                "host_id={host_id}, supervisor unavailable ({})",
+                "host_id={host_id}, read-only supervisor diagnostics unavailable ({})",
                 safe_error_code(&error)
             ),
-            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
+            "Start or upgrade the Temote supervisor before checking host-level gateway readiness.",
         ),
     }
 }

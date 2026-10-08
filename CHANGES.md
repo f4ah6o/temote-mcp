@@ -39,6 +39,7 @@
 
 ### Fixed
 
+- Local diagnostic status, session list/info, and upgrade preflight now use a restricted supervisor request that skips query-triggered reaping and lifecycle reconciliation; older supervisors fail closed without a legacy diagnostic fallback, while normal maintenance and upgrade/apply paths retain their compatible behavior. ([read-only diagnostics](docs/usage.md#sessions), [Fabric readiness](docs/gateway.md#host-identity-and-authentication))
 - Managed source preparation now selects the visible Codex catalog default and advertised effort, rather than choosing a hidden auxiliary model by alphabetical order. Accepted receipts retain their original selection. ([managed source start](issues/doing/20261005-managed-session-source-start.md))
 
 - Supervisor-owned session discovery preserves a bounded degraded entry when metadata is missing or corrupt, without repairing it or inventing active runtime evidence. ([dogfood discovery](issues/doing/20261005-dogfood-supervisor-metadata-and-link-path.md))
