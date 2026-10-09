@@ -140,6 +140,12 @@ Sandbox work that outlives the foreground timeout can return a session-owned `jo
 
 `task_list({session_id, limit?})` rediscovers retained delegated tasks across enabled backends for the same full session instance and canonical scope. It returns bounded entries with `backend`, `task_id`, and state; use that backend's `*_task_get` to reconcile and retrieve a task. The limit defaults to 50 and is at most 128. `backends` reports an unreadable store as `unavailable` instead of treating it as empty. Listing never starts or reconciles a task and does not include transcripts or raw output.
 
+Use `after_revision` on the matching `*_task_get` to request a compact `not_modified` result when the retained task meaning has not changed. Unchanged reconciliation does not refresh the task's revision or update time; execution transitions, changed errors, and other retained semantic changes still advance it. A task's execution state, verification result, and delivery state remain separate.
+
+A read that overlaps task control may return retained state with `reconciliation_deferred: true`. Retry that read after the control settles. An older observation cannot overwrite a newer task revision or attach its previous turn's interactions and evidence to the newer state.
+
+OpenCode status, messages, sessions, permissions, and questions are read as one observation within a shared ten-second budget. A failed or timed-out read makes the observation unknown instead of substituting an empty result and inferring completion or failure. The same scoped interaction snapshot is reused for the response. Retry observation of the existing task; do not start a replacement task because a read failed.
+
 The combined stdout/stderr retained for delegated work is capped at 1 MiB and reports when output was truncated.
 
 ### Context plane

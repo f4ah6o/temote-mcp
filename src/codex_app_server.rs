@@ -127,6 +127,7 @@ struct CodexLifecycleEntry {
     closing: bool,
     cleanup_complete: bool,
     in_flight: usize,
+    task_controls: HashMap<(PathBuf, Uuid), usize>,
     cancellation: watch::Sender<bool>,
     drain_notify: Arc<tokio::sync::Notify>,
 }
@@ -138,6 +139,7 @@ impl CodexLifecycleEntry {
             closing: false,
             cleanup_complete: false,
             in_flight: 0,
+            task_controls: HashMap::new(),
             cancellation,
             drain_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -184,6 +186,56 @@ fn finish_session_shutdown(owner: &SessionInstance) -> Result<()> {
     entry.cleanup_complete = true;
     registry.entries.remove(owner);
     Ok(())
+}
+
+// Only live control calls defer reads. Retained accepted receipts must still
+// reconcile after a caller or backend crashes.
+struct TaskControlGuard {
+    owner: SessionInstance,
+    key: (PathBuf, Uuid),
+}
+
+impl TaskControlGuard {
+    fn acquire(session: &config::Session, task_id: Uuid) -> Result<Self> {
+        let owner = SessionInstance::from_session(session);
+        let key = (config::canonical_directory(&session.cwd)?, task_id);
+        let mut registry = codex_lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get_mut(&owner)
+            .context("Codex session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+        *entry.task_controls.entry(key.clone()).or_default() += 1;
+        Ok(Self { owner, key })
+    }
+}
+
+impl Drop for TaskControlGuard {
+    fn drop(&mut self) {
+        let mut registry = codex_lifecycle_registry().lock().unwrap();
+        let Some(entry) = registry.entries.get_mut(&self.owner) else {
+            return;
+        };
+        if let Some(count) = entry.task_controls.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                entry.task_controls.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn task_control_in_flight(record: &TaskRecord) -> bool {
+    codex_lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(&record.owner)
+        .is_some_and(|entry| {
+            entry
+                .task_controls
+                .contains_key(&(record.scope_cwd.clone(), record.task_id))
+        })
 }
 
 fn session_instance_is_closing(owner: &SessionInstance) -> bool {
@@ -805,7 +857,11 @@ impl TaskStore {
     {
         let _guard = self.lock()?;
         let mut record = self.load_locked(session, task_id)?;
+        let previous = record.clone();
         f(&mut record)?;
+        if record == previous {
+            return Ok(record);
+        }
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
@@ -1967,20 +2023,19 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
     view
 }
 
-fn task_view_after_reconciliation(
+fn reconciled_task_view(
     record: &TaskRecord,
-    after_revision: Option<u64>,
     evidence_ref: Option<&evidence::EvidenceRef>,
+    after_revision: Option<u64>,
 ) -> Value {
     if after_revision == Some(record.revision) {
-        json!({
+        return json!({
             "task_id": record.task_id,
             "status": "not_modified",
             "revision": record.revision,
-        })
-    } else {
-        task_view(record, evidence_ref)
+        });
     }
+    task_view(record, evidence_ref)
 }
 
 fn store_evidence_for_instance(
@@ -4524,6 +4579,36 @@ fn replay_operation(record: &TaskRecord, operation_id: Uuid, fingerprint: Uuid) 
     Ok(operation_view(record.task_id, &receipt.outcome))
 }
 
+struct ReconciledRecord {
+    record: TaskRecord,
+    deferred: bool,
+}
+
+fn reconcile_snapshot<F>(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    expected: &TaskRecord,
+    apply: F,
+) -> Result<ReconciledRecord>
+where
+    F: FnOnce(&mut TaskRecord) -> Result<()>,
+{
+    let mut deferred = false;
+    let record = store.update_if_instance_live(session, expected.task_id, owner, |record| {
+        if record.revision != expected.revision
+            || record.generation != expected.generation
+            || record.thread_id != expected.thread_id
+            || record.turn_id != expected.turn_id
+        {
+            deferred = true;
+            return Ok(());
+        }
+        apply(record)
+    })?;
+    Ok(ReconciledRecord { record, deferred })
+}
+
 pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
     let binary = configured_codex_binary()?;
@@ -4562,6 +4647,9 @@ async fn task_get_with_store_and_binary(
         // successor. In particular, do not reconstruct a source runtime.
         return Ok(task_view_at_revision(&record, after_revision));
     }
+    if task_control_in_flight(&record) {
+        return Ok(task_view_at_revision(&record, after_revision));
+    }
     let acquired_lease = match runtime_access {
         RuntimeAccess::Local => None,
         RuntimeAccess::Acquired(lease) => Some(lease),
@@ -4577,8 +4665,8 @@ async fn task_get_with_store_and_binary(
                 .find(|receipt| receipt.action == "start")
                 .map(|receipt| receipt.operation_id);
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if record.status.is_terminal() {
+            let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
+                if record.status != TaskStatus::Accepted {
                     return Ok(());
                 }
                 if record.status != TaskStatus::ReconciliationRequired {
@@ -4591,12 +4679,12 @@ async fn task_get_with_store_and_binary(
                 Ok(())
             })?;
             drop(apply_permit);
+            if reconciled.deferred {
+                return Ok(task_view_at_revision(&reconciled.record, after_revision));
+            }
+            record = reconciled.record;
         }
-        return Ok(task_view_after_reconciliation(
-            &record,
-            after_revision,
-            None,
-        ));
+        return Ok(reconciled_task_view(&record, None, after_revision));
     }
 
     let client =
@@ -4607,7 +4695,7 @@ async fn task_get_with_store_and_binary(
             }
             Err(_) => {
                 let apply_permit = ensure_current_active_instance(&owner, session).await?;
-                record = store.update_if_instance_live(session, task_id, &owner, |record| {
+                let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
                     if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                         record.status = TaskStatus::Unknown;
                         record.revision = record.revision.saturating_add(1);
@@ -4615,11 +4703,11 @@ async fn task_get_with_store_and_binary(
                     Ok(())
                 })?;
                 drop(apply_permit);
-                return Ok(task_view_after_reconciliation(
-                    &record,
-                    after_revision,
-                    None,
-                ));
+                return Ok(if reconciled.deferred {
+                    task_view_at_revision(&reconciled.record, after_revision)
+                } else {
+                    reconciled_task_view(&reconciled.record, None, after_revision)
+                });
             }
         };
     let thread_id = record.thread_id.clone().unwrap();
@@ -4635,7 +4723,7 @@ async fn task_get_with_store_and_binary(
         Ok(response) => response,
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            let record = store.update_if_instance_live(session, task_id, &owner, |record| {
+            let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
                 if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
@@ -4643,11 +4731,11 @@ async fn task_get_with_store_and_binary(
                 Ok(())
             })?;
             drop(apply_permit);
-            return Ok(task_view_after_reconciliation(
-                &record,
-                after_revision,
-                None,
-            ));
+            return Ok(if reconciled.deferred {
+                task_view_at_revision(&reconciled.record, after_revision)
+            } else {
+                reconciled_task_view(&reconciled.record, None, after_revision)
+            });
         }
     };
     let derived = match derive_thread_state_after(
@@ -4658,7 +4746,7 @@ async fn task_get_with_store_and_binary(
         Ok(derived) => derived,
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            record = store.update_if_instance_live(session, task_id, &owner, |record| {
+            let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
                 if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
@@ -4666,103 +4754,99 @@ async fn task_get_with_store_and_binary(
                 Ok(())
             })?;
             drop(apply_permit);
+            if reconciled.deferred {
+                return Ok(task_view_at_revision(&reconciled.record, after_revision));
+            }
+            record = reconciled.record;
             if after_revision == Some(record.revision) {
-                return Ok(task_view_after_reconciliation(
-                    &record,
-                    after_revision,
-                    None,
-                ));
+                return Ok(reconciled_task_view(&record, None, after_revision));
             }
             let evidence_permit = ensure_current_active_instance(&owner, session).await?;
             let evidence_ref = store_evidence_for_instance(&owner, session, &response);
             drop(evidence_permit);
-            return Ok(task_view(&record, evidence_ref.as_ref()));
+            return Ok(reconciled_task_view(
+                &record,
+                evidence_ref.as_ref(),
+                after_revision,
+            ));
         }
     };
-    let reconciled_status = reconciled_task_status(record.status, derived.status);
-    let changed = record.status != reconciled_status
-        || record.turn_id != derived.turn_id
-        || (derived.report_status.is_some()
-            && (record.report != derived.report
-                || record.report_status != derived.report_status
-                || record.report_source.as_deref() != Some("native_structured_output")))
-        || (derived.usage.is_some() && record.usage != derived.usage);
-    if changed || (record.generation == 0 && derived.turn_id.is_some()) {
-        let apply_permit = ensure_current_active_instance(&owner, session).await?;
-        record = store.update_if_instance_live(session, task_id, &owner, |record| {
-            if record.status.is_terminal() {
-                let previous = record.clone();
-                if let Some(usage) = &derived.usage {
-                    record.usage = Some(usage.clone());
-                }
-                if derived.report_status.is_some()
-                    && (record.report != derived.report
-                        || record.report_status != derived.report_status
-                        || record.report_source.as_deref() != Some("native_structured_output"))
-                {
-                    record.report = derived.report.clone();
-                    record.report_status = derived.report_status.clone();
-                    record.report_source = Some("native_structured_output".to_owned());
-                }
-                if record.usage != previous.usage
-                    || record.report != previous.report
-                    || record.report_status != previous.report_status
-                    || record.report_source != previous.report_source
-                {
-                    record.revision = record.revision.saturating_add(1);
-                }
-                return Ok(());
-            }
+    let apply_permit = ensure_current_active_instance(&owner, session).await?;
+    let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
+        if record.status.is_terminal() {
             let previous = record.clone();
-            record.status = reconciled_task_status(record.status, derived.status);
-            if derived.turn_id.is_some() {
-                record.turn_id = derived.turn_id.clone();
-                if record.generation == 0 {
-                    record.generation = 1;
-                }
+            if let Some(usage) = &derived.usage {
+                record.usage = Some(usage.clone());
             }
-            if derived.usage.is_some() {
-                record.usage = derived.usage.clone();
-            }
-            if derived.report_status.is_some() {
+            if derived.report_status.is_some()
+                && (record.report != derived.report
+                    || record.report_status != derived.report_status
+                    || record.report_source.as_deref() != Some("native_structured_output"))
+            {
                 record.report = derived.report.clone();
                 record.report_status = derived.report_status.clone();
                 record.report_source = Some("native_structured_output".to_owned());
             }
-            if record.status != previous.status
-                || record.turn_id != previous.turn_id
-                || record.generation != previous.generation
-                || record.usage != previous.usage
+            if record.usage != previous.usage
                 || record.report != previous.report
                 || record.report_status != previous.report_status
                 || record.report_source != previous.report_source
             {
                 record.revision = record.revision.saturating_add(1);
             }
-            let outcome = record.outcome();
-            if derived.turn_id.is_some()
-                && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
-                    receipt.action == "start" && receipt.phase == OperationPhase::Accepted
-                })
-            {
-                receipt.phase = OperationPhase::Applied;
-                receipt.outcome = outcome;
+            return Ok(());
+        }
+        let previous = record.clone();
+        record.status = reconciled_task_status(record.status, derived.status);
+        if derived.turn_id.is_some() {
+            record.turn_id = derived.turn_id.clone();
+            if record.generation == 0 {
+                record.generation = 1;
             }
-            Ok(())
-        })?;
-        drop(apply_permit);
+        }
+        if derived.usage.is_some() {
+            record.usage = derived.usage.clone();
+        }
+        if derived.report_status.is_some() {
+            record.report = derived.report.clone();
+            record.report_status = derived.report_status.clone();
+            record.report_source = Some("native_structured_output".to_owned());
+        }
+        let pending_start = derived.turn_id.is_some()
+            && record.operations.iter().any(|receipt| {
+                receipt.action == "start" && receipt.phase == OperationPhase::Accepted
+            });
+        if *record == previous && !pending_start {
+            return Ok(());
+        }
+        record.revision = record.revision.saturating_add(1);
+        let outcome = record.outcome();
+        if pending_start
+            && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
+                receipt.action == "start" && receipt.phase == OperationPhase::Accepted
+            })
+        {
+            receipt.phase = OperationPhase::Applied;
+            receipt.outcome = outcome;
+        }
+        Ok(())
+    })?;
+    drop(apply_permit);
+    if reconciled.deferred {
+        return Ok(task_view_at_revision(&reconciled.record, after_revision));
     }
+    record = reconciled.record;
     if after_revision == Some(record.revision) {
-        return Ok(task_view_after_reconciliation(
-            &record,
-            after_revision,
-            None,
-        ));
+        return Ok(reconciled_task_view(&record, None, after_revision));
     }
     let evidence_permit = ensure_current_active_instance(&owner, session).await?;
     let evidence_ref = store_evidence_for_instance(&owner, session, &response);
     drop(evidence_permit);
-    Ok(task_view(&record, evidence_ref.as_ref()))
+    Ok(reconciled_task_view(
+        &record,
+        evidence_ref.as_ref(),
+        after_revision,
+    ))
 }
 
 fn reconciled_task_status(current: TaskStatus, derived: TaskStatus) -> TaskStatus {
@@ -5069,6 +5153,7 @@ async fn task_control_with_store_and_binary(
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
+    let _control_guard = TaskControlGuard::acquire(session, task_id)?;
     let (mut record, acquired_lease) = match store.accept_control_if_instance_live(
         session,
         task_id,
@@ -5732,6 +5817,40 @@ for raw in sys.stdin:
                             _ => json!({}),
                         };
                         let _ = reply.send(Ok(result));
+                    }
+                    ClientCommand::Notify { .. } => {}
+                    ClientCommand::Shutdown => break,
+                }
+            }
+        });
+        RpcClient {
+            tx: commands,
+            actor: Arc::new(Mutex::new(Some(actor))),
+            connected: Arc::new(AtomicBool::new(true)),
+            pending_approvals: Arc::new(AtomicU64::new(0)),
+            pending_summary_binding: Arc::new(Mutex::new(None)),
+            runtime_instance_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn reconciliation_client(
+        response: Arc<Mutex<std::result::Result<Value, String>>>,
+        methods: Arc<Mutex<Vec<String>>>,
+        mut barrier: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> RpcClient {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
+        let actor = tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    ClientCommand::Request { method, reply, .. } => {
+                        methods.lock().unwrap().push(method.to_owned());
+                        assert_eq!(method, "thread/read");
+                        let result = response.lock().unwrap().clone();
+                        if let Some((entered, release)) = barrier.take() {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                        let _ = reply.send(result);
                     }
                     ClientCommand::Notify { .. } => {}
                     ClientCommand::Shutdown => break,
@@ -8772,6 +8891,342 @@ for raw in sys.stdin:
                 .len(),
             persisted.operation_tombstones.len()
         );
+    }
+
+    #[test]
+    fn reconciliation_snapshot_preserves_retention_and_fences_newer_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "codex-snapshot-fence", false);
+        let owner = SessionInstance::from_session(&session);
+        codex_lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), CodexLifecycleEntry::new());
+        let store = TaskStore::new(root.path().join("tasks"));
+        let mut expected = task_record(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        expected.updated_at = expected.updated_at.saturating_sub(60);
+        store.save(&expected).unwrap();
+        for _ in 0..2 {
+            let result =
+                reconcile_snapshot(&session, &owner, &store, &expected, |_| Ok(())).unwrap();
+            assert!(!result.deferred);
+            assert_eq!(result.record, expected);
+        }
+        for changed_field in ["revision", "generation", "thread", "turn"] {
+            let mut newer = expected.clone();
+            match changed_field {
+                "revision" => newer.revision += 1,
+                "generation" => newer.generation += 1,
+                "thread" => newer.thread_id = Some("new-thread".to_owned()),
+                "turn" => newer.turn_id = Some("new-turn".to_owned()),
+                _ => unreachable!(),
+            }
+            store.save(&newer).unwrap();
+            // The same fence surrounds successful observations, malformed
+            // reads and transport failures: none may revise a newer task.
+            for stale_status in [
+                TaskStatus::Completed,
+                TaskStatus::Unknown,
+                TaskStatus::ReconciliationRequired,
+            ] {
+                let result = reconcile_snapshot(&session, &owner, &store, &expected, |record| {
+                    record.status = stale_status;
+                    record.revision += 1;
+                    Ok(())
+                })
+                .unwrap();
+                assert!(result.deferred);
+                assert_eq!(result.record, newer);
+                assert_eq!(store.load(&session, expected.task_id).unwrap(), newer);
+            }
+        }
+        codex_lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .remove(&owner);
+    }
+
+    #[test]
+    fn in_flight_control_guard_is_scoped_counted_and_not_a_retained_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "codex-control-guard", false);
+        let owner = SessionInstance::from_session(&session);
+        codex_lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), CodexLifecycleEntry::new());
+        let mut record = task_record(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        let first = TaskControlGuard::acquire(&session, record.task_id).unwrap();
+        let second = TaskControlGuard::acquire(&session, record.task_id).unwrap();
+        assert!(task_control_in_flight(&record));
+        let mut replacement = record.clone();
+        replacement.owner.started_at += 1;
+        assert!(!task_control_in_flight(&replacement));
+        replacement = record.clone();
+        replacement.scope_cwd = root.path().join("other-scope");
+        assert!(!task_control_in_flight(&replacement));
+        drop(first);
+        assert!(task_control_in_flight(&record));
+        record.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "steer".to_owned(),
+            phase: OperationPhase::Accepted,
+            outcome: record.outcome(),
+        });
+        drop(second);
+        assert!(!task_control_in_flight(&record));
+        codex_lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .remove(&owner);
+    }
+
+    #[tokio::test]
+    async fn task_get_semantic_revision_tracks_usage_and_state_without_poll_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("codex-revision-{}", Uuid::new_v4().simple());
+        let (handle, session) = active_test_session(root.path(), &id, false).await;
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &session,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        record.updated_at = record.updated_at.saturating_sub(60);
+        record.verification = Some(passed_verification_at(record.revision));
+        store.save(&record).unwrap();
+
+        // An omitted turn must retain the bound turn without counting the
+        // missing optional value as a public state change.
+        let response = Arc::new(Mutex::new(Ok(json!({
+            "thread": {"status": {"type": "active"}, "turns": []}
+        }))));
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = reconciliation_client(Arc::clone(&response), Arc::clone(&methods), None);
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        insert_runtime(&session, task_id, &store, client, lease)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let out = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": 7}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                out,
+                json!({"task_id": task_id, "status": "not_modified", "revision": 7})
+            );
+        }
+        let unchanged = store.load(&session, task_id).unwrap();
+        assert_eq!(unchanged.updated_at, record.updated_at);
+        assert_eq!(unchanged.turn_id, record.turn_id);
+        assert_eq!(
+            task_view(&unchanged, None)["verification"]["status"],
+            "passed"
+        );
+
+        for (status, expected_status, revision) in [
+            ("inProgress", "running", 8),
+            ("waitingApproval", "waiting_approval", 9),
+            ("completed", "completed", 10),
+        ] {
+            *response.lock().unwrap() = Ok(json!({
+                "thread": {"tokenUsage": {"totalTokens": 6}, "turns": [{"id": "turn", "status": status}]}
+            }));
+            let out = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision - 1}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out["status"], expected_status);
+            assert_eq!(out["revision"], revision);
+            assert_eq!(out["usage"]["total_tokens"], 6);
+            assert_eq!(out["verification"]["status"], "not_run");
+            assert_eq!(out["verification"]["stale"], true);
+            let again = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                again,
+                json!({"task_id": task_id, "status": "not_modified", "revision": revision})
+            );
+        }
+        assert_eq!(methods.lock().unwrap().len(), 8);
+        remove_session_with_store(&session, &store).await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_get_semantic_revision_exposes_read_failure_once_and_then_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("codex-read-failure-{}", Uuid::new_v4().simple());
+        let (handle, session) = active_test_session(root.path(), &id, false).await;
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = task_record(
+            &session,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        store.save(&record).unwrap();
+        let response = Arc::new(Mutex::new(
+            Err("backend temporarily unavailable".to_owned()),
+        ));
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = reconciliation_client(Arc::clone(&response), Arc::clone(&methods), None);
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        insert_runtime(&session, task_id, &store, client, lease)
+            .await
+            .unwrap();
+
+        for (backend_response, expected_status, revision) in [
+            (
+                Err("backend temporarily unavailable".to_owned()),
+                "unknown",
+                8,
+            ),
+            (
+                Ok(json!({"thread": {"status": {"type": "active"}, "turns": []}})),
+                "running",
+                9,
+            ),
+            (Ok(json!({"invalid": "thread response"})), "unknown", 10),
+        ] {
+            *response.lock().unwrap() = backend_response;
+            let changed = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision - 1}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(changed["status"], expected_status);
+            assert_eq!(changed["revision"], revision);
+            let unchanged = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                unchanged,
+                json!({"task_id": task_id, "status": "not_modified", "revision": revision})
+            );
+        }
+        assert_eq!(methods.lock().unwrap().len(), 6);
+        remove_session_with_store(&session, &store).await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_get_semantic_revision_discards_superseded_backend_response() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("codex-read-race-{}", Uuid::new_v4().simple());
+        let (handle, session) = active_test_session(root.path(), &id, false).await;
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = task_record(
+            &session,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        store.save(&record).unwrap();
+        let response = Arc::new(Mutex::new(Ok(json!({
+            "thread": {"status": {"type": "active"}, "turns": []}
+        }))));
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let client = reconciliation_client(
+            response,
+            Arc::clone(&methods),
+            Some((entered_tx, release_rx)),
+        );
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        insert_runtime(&session, task_id, &store, client, lease)
+            .await
+            .unwrap();
+        let read_session = session.clone();
+        let read_store = store.clone();
+        let read = tokio::spawn(async move {
+            task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": 7}),
+                &read_session,
+                &read_store,
+                Path::new("must-not-start"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let newer = store
+            .update(&session, task_id, |record| {
+                record.status = TaskStatus::WaitingApproval;
+                record.usage = Some(BTreeMap::from([("total_tokens".to_owned(), 6)]));
+                record.revision += 1;
+                Ok(())
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let out = read.await.unwrap().unwrap();
+        assert_eq!(out["status"], "waiting_approval");
+        assert_eq!(out["revision"], newer.revision);
+        assert_eq!(out["usage"]["total_tokens"], 6);
+        assert_eq!(out["reconciliation_deferred"], true);
+        assert!(out["evidence"].is_null());
+        assert_eq!(
+            store.load(&session, task_id).unwrap().revision,
+            newer.revision
+        );
+        assert_eq!(methods.lock().unwrap().as_slice(), ["thread/read"]);
+        remove_session_with_store(&session, &store).await.unwrap();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
