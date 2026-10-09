@@ -7,7 +7,7 @@ Temote MCP is a Rust MCP server for delegating local-machine work through explic
 ## Repository rules
 
 - Product names: **Temote MCP** for the local Host and **Temote Fabric** for the remote connection plane.
-- CLI/package name: `temote`; `temote-mcp` remains a compatibility executable and plugin/skill ID.
+- Crates.io package name: `temote-mcp`. The canonical CLI is `temote`; the `temote-mcp` executable remains a compatibility alias and plugin/skill ID.
 - Environment-variable prefix: `TEMOTE_`; Fabric Link uses `TEMOTE_FABRIC_`. Existing `TEMOTE_MCP_` names remain read-only compatibility aliases, with canonical names taking priority.
 - Keep `README.md` and `README.ja.md` short and user-oriented: what it is, installation, first session, Agent Skill installation, and links to deeper docs.
 - Put detailed human documentation under `docs/`.

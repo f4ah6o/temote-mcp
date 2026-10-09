@@ -1567,7 +1567,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "temote"
+name = "temote-mcp"
 version = "2026.8.0"
 dependencies = [
  "anyhow",

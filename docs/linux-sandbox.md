@@ -1,11 +1,12 @@
 # Linux sandbox and crates.io packaging
 
-Temote owns its Linux sandbox boundary directly. The published `temote-mcp` Cargo package contains two binaries:
+Temote owns its Linux sandbox boundary directly. The published `temote-mcp` Cargo package contains three binaries:
 
+- `temote` (canonical CLI)
 - `temote-mcp`
 - `temote-linux-sandbox`
 
-`cargo install temote-mcp` installs both binaries from the same package. There are no runtime or build dependencies on `codex-*` or `unofficial-codex-*` crates.
+`cargo install temote-mcp` installs all three binaries from the same package. There are no runtime or build dependencies on `codex-*` or `unofficial-codex-*` crates.
 
 ## Security model
 

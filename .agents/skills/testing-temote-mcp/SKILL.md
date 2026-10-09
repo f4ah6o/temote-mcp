@@ -7,8 +7,10 @@ description: Live-test temote-mcp end-to-end — session lifecycle, stdio MCP JS
 
 ## Build
 
-`cargo build --locked` → binary at `target/debug/temote-mcp`. `cargo test` has known
-pre-existing failures on Devin VMs (github.com proxy 403s); runtime testing avoids them.
+`cargo build --locked` → canonical CLI at `target/debug/temote`, compatibility
+executable at `target/debug/temote-mcp`, and helper at
+`target/debug/temote-linux-sandbox`. `cargo test` has known pre-existing failures
+on Devin VMs (github.com proxy 403s); runtime testing avoids them.
 
 ## Live session for MCP tool calls
 

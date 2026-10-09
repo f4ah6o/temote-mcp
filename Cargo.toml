@@ -1,5 +1,5 @@
 [package]
-name = "temote"
+name = "temote-mcp"
 version = "2026.8.0"
 edition = "2024"
 license = "MIT AND Apache-2.0"
@@ -8,8 +8,8 @@ repository = "https://github.com/f4ah6o/temote-mcp"
 readme = "README.md"
 default-run = "temote"
 
-# Keep the established Rust crate and executable names available to existing
-# clients while making `temote` the default CLI. Both binaries share one source.
+# Keep the established registry package and compatibility executable name while
+# making `temote` the default CLI. Both CLI binaries share one source.
 [lib]
 name = "temote_mcp"
 
@@ -24,7 +24,7 @@ test = false
 bench = false
 
 [package.metadata.binstall]
-# cargo-dist archives use versionless target filenames on prefixless CalVer tags.
+# cargo-dist archives use the package-name/target stem on prefixless CalVer tags.
 # Bind a requested cargo-binstall version to its matching release, not latest.
 pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }.tar.xz"
 pkg-fmt = "txz"
