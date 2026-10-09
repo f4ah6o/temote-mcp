@@ -6856,14 +6856,26 @@ for raw in sys.stdin:
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if !config::session_is_active(&id).await.unwrap() {
+                let lifecycle = config::read_session_lifecycle(&id)
+                    .await
+                    .unwrap()
+                    .expect("old session lifecycle should remain available while stopping");
+                let current = config::read_session_metadata(&id).await.unwrap();
+                let old_metadata_retained = current.id == old.id
+                    && current.started_at == old.started_at
+                    && current.process_id == 0;
+                if session_instance_is_closing(&old_instance)
+                    && lifecycle.started_at == old.started_at
+                    && lifecycle.status == config::LifecycleStatus::Stopped
+                    && old_metadata_retained
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("session did not enter the inactive stopping state");
+        .expect("old instance did not reach its persisted stopped state while draining");
 
         let mut starting = {
             let supervisor = Arc::clone(&supervisor);

@@ -62,6 +62,27 @@ async function rpc(env, method, params = {}, { modern = false, token = "test-cli
 
 const tool = (env, name, args = {}, options) => rpc(env, "tools/call", { name, arguments: args }, options);
 
+test("static Host discovery remains available when browser-enrollment D1 is absent", async () => {
+  for (const database of [undefined, null]) {
+    const { env } = fixture();
+    if (database === undefined) delete env.OBSERVATION_DB;
+    else env.OBSERVATION_DB = null;
+    const result = await tool(env, "host_list");
+    assert.equal(result.response.status, 200);
+    const hosts = JSON.parse(result.body.result.content[0].text);
+    assert.deepEqual(hosts.map((host) => host.host_id), ["host-a", "host-b"]);
+  }
+
+  const { env } = fixture();
+  env.OBSERVATION_DB = {
+    prepare() { throw new Error("migration missing"); },
+    batch() { throw new Error("migration missing"); },
+  };
+  const unavailable = await tool(env, "host_list");
+  assert.equal(unavailable.body.error.code, -32001,
+    "configured but unavailable D1 does not fall back to static discovery");
+});
+
 test("Fabric resource and reads use MCP client authentication, not host tokens or dashboard auth", async () => {
   const { env, calls } = fixture();
   for (const token of [null, "wrong", "private-host-token"]) {

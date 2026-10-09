@@ -82,10 +82,10 @@ export function jsonResponse(value, status = 200, extraHeaders = {}) {
 export function withCors(response) {
   const headers = new Headers(response.headers);
   headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
+  headers.set("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
   headers.set(
     "access-control-allow-headers",
-    "accept,authorization,content-type,mcp-protocol-version,mcp-method,mcp-name,mcp-session-id,cf-access-client-id,cf-access-client-secret,x-temote-host-id",
+    "accept,authorization,content-type,mcp-protocol-version,mcp-method,mcp-name,mcp-session-id,cf-access-client-id,cf-access-client-secret,x-temote-host-id,x-temote-fabric-host-grant",
   );
   headers.set("access-control-expose-headers", "mcp-session-id");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });

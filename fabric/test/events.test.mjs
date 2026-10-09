@@ -16,6 +16,7 @@ function database() {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec("PRAGMA foreign_keys = ON");
   sqlite.exec(fs.readFileSync(new URL("../migrations/0005_mcp_events.sql", import.meta.url), "utf8"));
+  sqlite.exec(fs.readFileSync(new URL("../migrations/0006_browser_host_enrollment.sql", import.meta.url), "utf8"));
   const wrap = (sql, params = []) => ({
     bind(...next) { return wrap(sql, next); },
     first() { return sqlite.prepare(sql).get(...params) ?? null; },

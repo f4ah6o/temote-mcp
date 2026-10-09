@@ -264,8 +264,8 @@ test("dashboard gates assets, redirects, API paths, errors, and methods before g
       method: "OPTIONS",
       assertion: fixture.assertion,
     }), env);
-    assert.equal(authorizedOptions.status, 405);
-    assert.deepEqual(await authorizedOptions.json(), { error_code: "method_not_allowed" });
+    assert.equal(authorizedOptions.status, 403);
+    assert.deepEqual(await authorizedOptions.json(), { error_code: "browser_data_surface_unavailable" });
     assertDashboardHeaders(authorizedOptions);
 
     const redirect = await worker.fetch(dashboardRequest("/dash", {
@@ -293,7 +293,7 @@ test("dashboard gates assets, redirects, API paths, errors, and methods before g
       const alias = await worker.fetch(dashboardRequest(path, {
         assertion: fixture.assertion,
       }), env);
-      assert.equal(alias.status, 404, path);
+      assert.equal(alias.status, 403, path);
       assertDashboardHeaders(alias);
     }
 
@@ -302,23 +302,23 @@ test("dashboard gates assets, redirects, API paths, errors, and methods before g
         method: "POST",
         assertion: fixture.assertion,
       }), env);
-      assert.equal(post.status, 405, path);
+      assert.equal(post.status, 403, path);
       assertDashboardHeaders(post);
     }
 
     const bootstrapWithoutDeployment = await worker.fetch(dashboardRequest("/dash/api/v1/bootstrap", {
       assertion: fixture.assertion,
     }), env);
-    assert.equal(bootstrapWithoutDeployment.status, 503);
-    assert.equal((await bootstrapWithoutDeployment.json()).error_code, "bootstrap_unavailable");
+    assert.equal(bootstrapWithoutDeployment.status, 403);
+    assert.equal((await bootstrapWithoutDeployment.json()).error_code, "browser_data_surface_unavailable");
     assertDashboardHeaders(bootstrapWithoutDeployment);
 
     for (const path of ["/dash/unknown/path"]) {
       const notFound = await worker.fetch(dashboardRequest(path, {
         assertion: fixture.assertion,
       }), env);
-      assert.equal(notFound.status, 404, path);
-      assert.deepEqual(await notFound.json(), { error_code: "not_found" });
+      assert.equal(notFound.status, 403, path);
+      assert.deepEqual(await notFound.json(), { error_code: "browser_data_surface_unavailable" });
       assertDashboardHeaders(notFound);
     }
   });

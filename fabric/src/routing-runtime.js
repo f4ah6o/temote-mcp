@@ -6,7 +6,8 @@ import {
   validateHostId,
   validateSessionId,
 } from "./protocol.js";
-import { authorizeFederatedHost, authorizeLegacyHost } from "./access.js";
+import { authorizeLegacyHost, validateLegacyHostInventory } from "./access.js";
+import { activeBrowserGrant, allBrowserHostIds, authorizeBrowserHost, authorizeLegacyFederatedHost, browserHostIdsForOwner, sameBrowserGrantSnapshot } from "./enrollment.js";
 import {
   agentRoute,
   agentRouteKey,
@@ -48,10 +49,118 @@ const MAX_RPC_METHOD_BYTES = 256;
 const MAX_RPC_ID_BYTES = 256;
 const MAX_RPC_TOOL_NAME_BYTES = 256;
 const SESSION_AVAILABILITY_VALUES = ["ready", "session_unavailable", "unavailable"];
+const BROWSER_ROUTED_TOOLS = new Set([
+  "session_list", "session_start", "session_info", "session_stop", "session_restart",
+  "codex_status", "codex_task_start", "codex_task_get", "codex_task_control",
+  "evidence_read", "task_list", "poll_job", "job_list", "stop_job",
+]);
 
-async function proxyToHost(rpc, env, hostId) {
+function browserDispatchAllowed(request, approvedRoots) {
+  if (request?.method !== "tools/call" || !BROWSER_ROUTED_TOOLS.has(request?.params?.name)) return false;
+  const args = request?.params?.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  if (request.params.name === "session_start") {
+    if (typeof args.path !== "string" || Object.hasOwn(args, "source")
+        || Object.keys(args).some((key) => !["path", "session_id"].includes(key))
+        || args.path.startsWith("/") || args.path.includes("\\") || args.path.includes("\0")
+        || /%(?:2f|5c)/i.test(args.path)) return false;
+    const parts = args.path.split("/");
+    if (parts.some((part) => !part || part === "." || part === "..")) return false;
+    return approvedRoots.includes(parts[0]);
+  }
+  if (request.params.name === "session_list") return Object.keys(args).length === 0;
+  const allowedKeys = {
+    session_info: ["session_id"],
+    session_stop: ["session_id"],
+    session_restart: ["session_id"],
+    codex_status: ["session_id"],
+    codex_task_start: ["session_id", "operation_id", "task", "model", "effort", "continuation"],
+    codex_task_get: ["session_id", "task_id", "after_revision", "wait_ms"],
+    codex_task_control: ["session_id", "task_id", "operation_id", "action", "input"],
+    evidence_read: ["session_id", "evidence_id", "offset_bytes", "max_bytes"],
+    task_list: ["session_id", "limit"],
+    poll_job: ["session_id", "job_id", "output_limit_bytes", "status_only"],
+    job_list: ["session_id", "limit"],
+    stop_job: ["session_id", "job_id"],
+  }[request.params.name];
+  if (!allowedKeys || Object.keys(args).some((key) => !allowedKeys.includes(key))
+      || typeof args.session_id !== "string" || !args.session_id || args.session_id.length > 256) return false;
+  const uuid = (value) => typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  switch (request.params.name) {
+    case "codex_task_start":
+      return uuid(args.operation_id) && typeof args.task === "string" && args.task.length > 0
+        && args.task.length <= 1_048_576 && typeof args.model === "string" && args.model.length > 0
+        && args.model.length <= 256 && typeof args.effort === "string" && args.effort.length > 0
+        && args.effort.length <= 256;
+    case "codex_task_get":
+      return uuid(args.task_id)
+        && (!Object.hasOwn(args, "after_revision") || Number.isSafeInteger(args.after_revision) && args.after_revision >= 0)
+        && (!Object.hasOwn(args, "wait_ms") || Number.isSafeInteger(args.wait_ms) && args.wait_ms >= 0 && args.wait_ms <= 30_000);
+    case "codex_task_control":
+      return uuid(args.task_id) && uuid(args.operation_id)
+        && ["steer", "resume", "interrupt"].includes(args.action)
+        && (!Object.hasOwn(args, "input") || typeof args.input === "string" && args.input.length <= 1_048_576);
+    case "evidence_read":
+      return uuid(args.evidence_id)
+        && (!Object.hasOwn(args, "offset_bytes") || Number.isSafeInteger(args.offset_bytes) && args.offset_bytes >= 0)
+        && (!Object.hasOwn(args, "max_bytes") || Number.isSafeInteger(args.max_bytes) && args.max_bytes >= 1 && args.max_bytes <= 65_536);
+    case "task_list":
+    case "job_list":
+      return !Object.hasOwn(args, "limit") || Number.isSafeInteger(args.limit) && args.limit >= 1 && args.limit <= 128;
+    case "poll_job":
+      return typeof args.job_id === "string" && args.job_id.length > 0 && args.job_id.length <= 256
+        && (!Object.hasOwn(args, "status_only") || typeof args.status_only === "boolean")
+        && (!Object.hasOwn(args, "output_limit_bytes") || Number.isSafeInteger(args.output_limit_bytes)
+          && args.output_limit_bytes >= 256 && args.output_limit_bytes <= 1_048_576);
+    case "stop_job":
+      return typeof args.job_id === "string" && args.job_id.length > 0 && args.job_id.length <= 256;
+    default:
+      return ["session_info", "session_stop", "session_restart", "codex_status"].includes(request.params.name);
+  }
+}
+
+function browserSessionBinding(value, request) {
+  const needsBinding = !["session_list", "session_start"].includes(request?.params?.name);
+  if (!needsBinding) return value === undefined ? { ok: true, value: null } : { ok: false };
+  const args = request?.params?.arguments;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== "session_id,session_instance"
+      || value.session_id !== args?.session_id
+      || typeof value.session_id !== "string" || value.session_id.length < 1 || value.session_id.length > 256
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.session_instance ?? "")) {
+    return { ok: false };
+  }
+  return { ok: true, value: { session_id: value.session_id, session_instance: value.session_instance } };
+}
+
+async function proxyToHost(rpc, env, hostId, ownerKey = null, expectedAuth = null, browserSession = null) {
+  if (ownerKey === null && expectedAuth === null) {
+    const reserved = await allBrowserHostIds(env);
+    if (!reserved) return mcpJson(rpcError(rpc.id ?? null, -32001, "host grant inventory unavailable"));
+    if (reserved.has(hostId)) return mcpJson(rpcError(rpc.id ?? null, -32004, "host_offline", { host_id: hostId }));
+    const routed = withoutHostRoutingArgument(rpc);
+    return proxyDispatch(rpc, routed, env, hostStub(env, hostId), { host_id: hostId });
+  }
+  const hosts = await readOnlineHosts(env, hostId, ownerKey);
+  if (!hosts.ok) return mcpJson(rpcError(rpc.id ?? null, -32001, hosts.error));
+  if (hosts.unavailable.includes(hostId)) {
+    return mcpJson(rpcError(rpc.id ?? null, -32006, "host_status_unavailable", { host_id: hostId }));
+  }
+  if (!hosts.value.some((host) => host.host_id === hostId)) {
+    return mcpJson(rpcError(rpc.id ?? null, -32004, "host_offline", { host_id: hostId }));
+  }
   const routed = withoutHostRoutingArgument(rpc);
-  return proxyDispatch(rpc, routed, env, hostStub(env, hostId), { host_id: hostId });
+  const auth = ownerKey === null ? null : hosts.value.find((host) => host.host_id === hostId)?.fabric_auth ?? null;
+  if (expectedAuth && !sameBrowserGrantSnapshot({
+    owner_key: auth?.owner_key,
+    grant_id: auth?.grant_id,
+    grant_generation: auth?.grant_generation,
+    approved_roots: auth?.approved_roots,
+  }, expectedAuth)) {
+    return mcpJson(rpcError(rpc.id ?? null, -32004, "host_authorization_changed", { host_id: hostId }));
+  }
+  return proxyDispatch(rpc, routed, env, hostStub(env, hostId), { host_id: hostId }, auth, browserSession);
 }
 
 async function proxyToLegacySession(rpc, env, sessionId) {
@@ -61,14 +170,18 @@ async function proxyToLegacySession(rpc, env, sessionId) {
   });
 }
 
-async function proxyDispatch(originalRpc, routedRpc, env, stub, routeData) {
+async function proxyDispatch(originalRpc, routedRpc, env, stub, routeData, fabricAuth = null, browserSession = null) {
   const id = originalRpc.id ?? null;
   let response;
   try {
     response = await stub.fetch("https://route.internal/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ request: routedRpc }),
+      body: JSON.stringify({
+        request: routedRpc,
+        ...(fabricAuth ? { _fabric_auth: fabricAuth } : {}),
+        ...(browserSession ? { _fabric_session: browserSession } : {}),
+      }),
     });
   } catch {
     return mcpJson(rpcError(id, -32001, "host request failed", routeData));
@@ -79,7 +192,7 @@ async function proxyDispatch(originalRpc, routedRpc, env, stub, routeData) {
     if (isModernRequest(originalRpc) && payload.result) {
       payload.result = modernizeResult(originalRpc.method, payload.result, gatewayVersion(env));
     }
-    if (routeData.host_id && payload.result) {
+    if (routeData.host_id && !fabricAuth && payload.result) {
       try { await observeHostResponse(env, routeData.host_id, originalRpc, payload); }
       catch { /* Event persistence failure cannot change an accepted Host tool response. */ }
     }
@@ -109,15 +222,44 @@ async function readRegistryCollection(env, action, maxEntries) {
   return { ok: true, value: values };
 }
 
-async function readOnlineHosts(env, hostId = null) {
+async function readOnlineHosts(env, hostId = null, ownerKey = null) {
   const hosts = await readRegistryCollection(env, "hosts", MAX_REGISTRY_HOSTS);
   if (!hosts.ok) return hosts;
   // A qualified lookup must not wait for, or probe, unrelated host leases.
   // Aggregate discovery still checks every host and fails closed above it.
-  const candidates = hostId === null
+  let candidates = hostId === null
     ? hosts.value
     : hosts.value.filter((host) => host?.host_id === hostId);
+  if (ownerKey !== null) {
+    const inventory = validateLegacyHostInventory(env);
+    if (!inventory.ok) return { ok: false, error: "legacy host inventory unavailable" };
+    const allowed = await browserHostIdsForOwner(env, ownerKey);
+    if (!allowed) return { ok: false, error: "host grant inventory unavailable" };
+    candidates = candidates.filter((host) => allowed.has(host?.host_id) && !inventory.ids.has(host?.host_id));
+  }
+  if (ownerKey === null) {
+    const reserved = await allBrowserHostIds(env);
+    if (!reserved) return { ok: false, error: "host grant inventory unavailable" };
+    candidates = candidates.filter((host) => !reserved.has(host?.host_id) && host?.auth_mode !== "browser");
+  }
   const filtered = await filterOnlineRegistryHosts(candidates, env);
+  if (ownerKey !== null) {
+    const authorized = [];
+    for (const host of filtered.online) {
+      const grant = await activeBrowserGrant(env, host.host_id, ownerKey);
+      if (!grant) continue;
+      host.approved_root_names = grant.approved_roots;
+      host.fabric_auth = {
+        mode: "browser",
+        owner_key: grant.owner_key,
+        grant_id: grant.grant_id,
+        grant_generation: grant.grant_generation,
+        approved_roots: grant.approved_roots,
+      };
+      authorized.push(host);
+    }
+    return { ok: true, value: authorized, unavailable: filtered.unavailable };
+  }
   return { ok: true, value: filtered.online, unavailable: filtered.unavailable };
 }
 
@@ -128,17 +270,38 @@ async function readOnlineLegacySessions(env) {
   return { ok: true, value: filtered.online, unavailable: filtered.unavailable };
 }
 
-function parseSessionListPayload(payload, hostId) {
+function parseSessionListPayload(payload, hostId, approvedRoots = null, { includeBinding = false } = {}) {
   const text = payload?.result?.content?.find((entry) => entry?.type === "text")?.text;
   if (typeof text !== "string") throw new Error("host session_list returned no text result");
   const sessions = JSON.parse(text);
   if (!Array.isArray(sessions) || sessions.length > MAX_REGISTRY_SESSIONS) {
     throw new Error("host session_list returned invalid session collection");
   }
+  if (approvedRoots !== null) {
+    return sessions.filter((session) => approvedRoots.includes(session?.root_name))
+      .map((session) => browserSafeSession(session, hostId, includeBinding));
+  }
   return sessions.map((session) => ({ ...session, host_id: hostId, routing_mode: "host" }));
 }
 
-async function sessionsFromHost(env, host) {
+function browserSafeSession(session, hostId, includeBinding) {
+  const safe = { host_id: hostId, routing_mode: "host" };
+  const fields = ["session_id", "root_name", "logical_path", "status", "permission_mode", "backend"];
+  if (includeBinding) fields.push("session_instance");
+  for (const field of fields) {
+    const value = session?.[field];
+    const safePath = field !== "logical_path"
+      || (typeof value === "string" && value.split("/").every((part) => part !== ".." && part !== "."));
+    const safeInstance = field !== "session_instance"
+      || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value ?? "");
+    if (typeof value === "string" && value.length <= 256 && safePath && safeInstance && !value.includes("\\") && !value.startsWith("/")) {
+      safe[field] = value;
+    }
+  }
+  return safe;
+}
+
+export async function sessionsFromHost(env, host, approvedRoots = null, { includeBinding = false } = {}) {
   const rpc = {
     jsonrpc: "2.0",
     id: `gateway-session-list-${crypto.randomUUID()}`,
@@ -150,7 +313,7 @@ async function sessionsFromHost(env, host) {
     response = await hostStub(env, host.host_id).fetch("https://host.internal/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ request: rpc }),
+      body: JSON.stringify({ request: rpc, ...(host.fabric_auth ? { _fabric_auth: host.fabric_auth } : {}) }),
     });
   } catch {
     return { ok: false, host_id: host.host_id };
@@ -159,7 +322,11 @@ async function sessionsFromHost(env, host) {
   const payload = await safeBoundedJson(response, MAX_INTERNAL_RPC_RESPONSE_BYTES, "host session_list response");
   if (!payload || payload.error) return { ok: false, host_id: host.host_id };
   try {
-    return { ok: true, host_id: host.host_id, sessions: parseSessionListPayload(payload, host.host_id) };
+    return {
+      ok: true,
+      host_id: host.host_id,
+      sessions: parseSessionListPayload(payload, host.host_id, approvedRoots, { includeBinding }),
+    };
   } catch {
     return { ok: false, host_id: host.host_id };
   }
@@ -169,14 +336,16 @@ async function collectHostSessions(env, hosts) {
   const results = [];
   const limit = MAX_SESSION_STATUS_CHECK_CONCURRENCY;
   for (let offset = 0; offset < hosts.length; offset += limit) {
-    const batch = await Promise.all(hosts.slice(offset, offset + limit).map((host) => sessionsFromHost(env, host)));
+    const batch = await Promise.all(hosts.slice(offset, offset + limit).map((host) => sessionsFromHost(
+      env, host, Object.hasOwn(host, "approved_root_names") ? host.approved_root_names : null,
+    )));
     results.push(...batch);
   }
   return results;
 }
 
-async function listGatewaySessions(env, hostId) {
-  const hosts = await readOnlineHosts(env, hostId ?? null);
+async function listGatewaySessions(env, hostId, ownerKey = null) {
+  const hosts = await readOnlineHosts(env, hostId ?? null, ownerKey);
   if (!hosts.ok) return hosts;
   if (hostId) {
     if (hosts.unavailable.includes(hostId)) {
@@ -184,8 +353,13 @@ async function listGatewaySessions(env, hostId) {
     }
     const host = hosts.value.find((candidate) => candidate.host_id === hostId);
     if (!host) return { ok: false, code: -32004, error: "host_offline", data: { host_id: hostId } };
-    const result = await sessionsFromHost(env, host);
+    const result = await sessionsFromHost(env, host, ownerKey === null ? null : host.approved_root_names ?? []);
     if (!result.ok) return { ok: false, error: "host session discovery failed", data: { host_id: hostId } };
+    if (ownerKey !== null && !sameBrowserGrantSnapshot(
+      await activeBrowserGrant(env, hostId, ownerKey), host.fabric_auth,
+    )) {
+      return { ok: false, error: "host session discovery failed", data: { host_id: hostId } };
+    }
     return { ok: true, value: result.sessions };
   }
 
@@ -197,7 +371,7 @@ async function listGatewaySessions(env, hostId) {
       data: { unavailable_hosts: hosts.unavailable },
     };
   }
-  const legacy = await readOnlineLegacySessions(env);
+  const legacy = ownerKey === null ? await readOnlineLegacySessions(env) : { ok: true, value: [], unavailable: [] };
   if (!legacy.ok) return legacy;
   if (legacy.unavailable.length > 0) {
     return {
@@ -218,6 +392,14 @@ async function listGatewaySessions(env, hostId) {
     routing_mode: "legacy-session",
   }));
   const federated = hostResults.flatMap((result) => result.sessions);
+  if (ownerKey !== null) {
+    for (const host of hosts.value) {
+      if (!sameBrowserGrantSnapshot(await activeBrowserGrant(env, host.host_id, ownerKey), host.fabric_auth)) {
+        return { ok: false, code: -32004, error: "host authorization changed during session discovery" };
+      }
+    }
+    return { ok: true, value: federated.sort(compareSessionRoute) };
+  }
   return { ok: true, value: [...legacySessions, ...federated].sort(compareSessionRoute) };
 }
 
@@ -289,8 +471,14 @@ async function handleHostApi(request, env, action) {
 
   const headerHostId = request.headers.get("x-temote-host-id");
   const federated = headerHostId !== null;
+  let authContext = { mode: "legacy" };
   if (federated) {
-    if (!validateHostId(headerHostId) || !authorizeFederatedHost(request, env, headerHostId)) {
+    if (!validateHostId(headerHostId)) return unauthorizedHost();
+    const browserGrantHeader = request.headers.get("x-temote-fabric-host-grant");
+    if (browserGrantHeader !== null) {
+      authContext = await authorizeBrowserHost(request, env, headerHostId);
+      if (!authContext) return unauthorizedHost();
+    } else if (!await authorizeLegacyFederatedHost(request, env, headerHostId)) {
       return unauthorizedHost();
     }
   } else if (!authorizeLegacyHost(request, env)) {
@@ -314,13 +502,75 @@ async function handleHostApi(request, env, action) {
     stub = sessionStub(env, sessionId);
   }
 
+  const trustedBody = federated
+    ? { ...body.value, _fabric_auth: authContext }
+    : body.value;
   const response = await stub.fetch(`https://route.internal/${action}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body.value),
+    body: JSON.stringify(trustedBody),
   });
+  if (authContext.mode === "browser") {
+    // D1 is the revoke/expiry commit point. A long poll or RPC that crossed a
+    // revoke boundary must not return a stale response to the caller.
+    const current = await authorizeBrowserHost(request, env, headerHostId);
+    if (!current || current.owner_key !== authContext.owner_key
+        || current.grant_id !== authContext.grant_id
+        || current.grant_generation !== authContext.grant_generation) return unauthorizedHost();
+  }
   return withCors(response);
 }
+
+function validateTransportContext(value) {
+  if (value === undefined) return { mode: "legacy" };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.mode === "legacy" && Object.keys(value).length === 1) return { mode: "legacy" };
+  if (value.mode !== "browser" || !/^[0-9a-f]{64}$/.test(value.owner_key)
+      || !UUID_PATTERN.test(value.grant_id) || !Number.isSafeInteger(value.grant_generation)
+      || value.grant_generation < 1 || !validRootNameList(value.approved_roots)) return null;
+  return {
+    mode: "browser",
+    owner_key: value.owner_key,
+    grant_id: value.grant_id,
+    grant_generation: value.grant_generation,
+    approved_roots: [...value.approved_roots].sort(),
+  };
+}
+
+function verifyTransportContext(host, supplied) {
+  if (!host) return jsonResponse({ error: "host_offline" }, 409);
+  const current = validateTransportContext(host.auth_mode === undefined ? undefined : {
+    mode: host.auth_mode,
+    ...(host.auth_mode === "browser" ? {
+      owner_key: host.owner_key,
+      grant_id: host.grant_id,
+      grant_generation: host.grant_generation,
+      approved_roots: host.approved_roots,
+    } : {}),
+  });
+  const incoming = validateTransportContext(supplied);
+  if (!current || !incoming || current.mode !== incoming.mode) return jsonResponse({ error: "stale_auth_generation" }, 409);
+  if (current.mode === "browser" && (current.owner_key !== incoming.owner_key
+      || current.grant_id !== incoming.grant_id
+      || current.grant_generation !== incoming.grant_generation
+      || !sameStringSet(current.approved_roots, incoming.approved_roots))) {
+    return jsonResponse({ error: "stale_auth_generation" }, 409);
+  }
+  return null;
+}
+
+function sameStringSet(left, right) {
+  return validRootNameList(left) && validRootNameList(right)
+    && left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
+}
+
+function validRootNameList(value) {
+  return Array.isArray(value) && value.length > 0 && value.length <= 32
+    && value.every((root) => typeof root === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(root) && root !== "." && root !== "..")
+    && new Set(value).size === value.length;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export class GatewaySession {
   constructor(state, env, options = {}) {
@@ -340,6 +590,8 @@ export class GatewaySession {
     const body = await readJson(request, gatewaySessionBodyLimit(action));
     if (!body.ok) return jsonResponse({ error: "invalid_json", detail: body.error }, 400);
     switch (action) {
+      case "fence":
+        return this.fence(body.value);
       case "connect":
         return this.connect(body.value);
       case "poll":
@@ -391,6 +643,47 @@ export class GatewaySession {
       const metadataValidation = validateFederatedHostMetadata(body);
       if (metadataValidation) return metadataValidation;
     }
+    const authContext = route.host_id ? validateTransportContext(body._fabric_auth) : { mode: "legacy" };
+    if (!authContext) return jsonResponse({ error: "host_auth_context_invalid" }, 403);
+    if (authContext.mode === "browser" && !sameStringSet(body.named_roots, authContext.approved_roots)) {
+      return jsonResponse({ error: "approved_roots_mismatch" }, 403);
+    }
+    const existingHost = await this.currentHost();
+    let browserMarker = await this.state.storage.get("browser_authority");
+    if (browserMarker !== undefined && browserMarker !== null && !validBrowserAuthorityMarker(browserMarker)) {
+      return jsonResponse({ error: "browser_authority_marker_unavailable" }, 503);
+    }
+    if (!browserMarker && existingHost?.auth_mode === "browser") {
+      if (!/^[0-9a-f]{64}$/.test(existingHost.owner_key ?? "")) {
+        return jsonResponse({ error: "browser_authority_marker_unavailable" }, 503);
+      }
+      browserMarker = { version: 1, owner_key: existingHost.owner_key };
+      await this.state.storage.put("browser_authority", browserMarker);
+    }
+    if (browserMarker) {
+      if (authContext.mode !== "browser" || authContext.owner_key !== browserMarker.owner_key) {
+        return jsonResponse({ error: "browser_host_cannot_downgrade", migration_required: true }, 409);
+      }
+    } else if (authContext.mode === "browser") {
+      browserMarker = { version: 1, owner_key: authContext.owner_key };
+      // Persist the anti-downgrade marker before publishing any live lease.
+      // A later connect/registry failure must not turn this Host id back into
+      // a static-token identity.
+      await this.state.storage.put("browser_authority", browserMarker);
+    }
+    if (existingHost && Number.isSafeInteger(existingHost.expires_at) && existingHost.expires_at > Date.now()) {
+      const sameBrowserOwner = existingHost.auth_mode === "browser"
+        && authContext.mode === "browser"
+        && existingHost.owner_key === authContext.owner_key;
+      if (sameBrowserOwner) {
+        // Same owner may reconnect after an explicit grant generation/root
+        // update. The D1 grant check on every routed request remains the
+        // authorization commit point.
+      } else {
+      const authMismatch = verifyTransportContext(existingHost, authContext);
+      if (authMismatch) return jsonResponse({ error: "active_host_auth_context_conflict" }, 409);
+      }
+    }
     const previousGeneration = await this.state.storage.get("generation");
     const generation = nextGatewayGeneration(previousGeneration);
     if (generation === null) {
@@ -406,6 +699,13 @@ export class GatewaySession {
       last_seen: now,
       expires_at: now + HOST_LEASE_MS,
       ...(route.host_id ? {
+        auth_mode: authContext.mode,
+        ...(authContext.mode === "browser" ? {
+          owner_key: authContext.owner_key,
+          grant_id: authContext.grant_id,
+          grant_generation: authContext.grant_generation,
+          approved_roots: [...authContext.approved_roots],
+        } : {}),
         agent_protocol: body.agent_protocol,
         runtime_version: body.runtime_version,
         control_protocol: body.control_protocol,
@@ -438,10 +738,25 @@ export class GatewaySession {
     });
   }
 
+  async fence(body) {
+    if (!validateHostId(body?.host_id) || !Number.isSafeInteger(body?.generation) || body.generation < 1) {
+      return jsonResponse({ error: "invalid_fence" }, 400);
+    }
+    const host = await this.currentHost();
+    if (!host || host.host_id !== body.host_id || host.auth_mode !== "browser"
+        || !Number.isSafeInteger(host.grant_generation) || host.grant_generation >= body.generation) {
+      return new Response(null, { status: 204 });
+    }
+    await this.clearHost(host, "host_grant_fenced");
+    return new Response(null, { status: 204 });
+  }
+
   async poll(body) {
     const validation = validateAgentIdentity(body, true);
     if (validation) return validation;
     const host = await this.currentHost();
+    const authMismatch = verifyTransportContext(host, body._fabric_auth);
+    if (authMismatch) return authMismatch;
     const mismatch = verifyGeneration(host, body);
     if (mismatch) return mismatch;
 
@@ -496,11 +811,16 @@ export class GatewaySession {
       return jsonResponse({ error: "invalid_response" }, 400);
     }
     const host = await this.currentHost();
+    const authMismatch = verifyTransportContext(host, body._fabric_auth);
+    if (authMismatch) return authMismatch;
     const mismatch = verifyGeneration(host, body);
     if (mismatch) return mismatch;
 
     const pending = this.pending.get(body.request_id);
     if (!pending) return jsonResponse({ error: "stale_request" }, 409);
+    if (JSON.stringify(body._fabric_session ?? null) !== JSON.stringify(pending.browser_session ?? null)) {
+      return jsonResponse({ error: "stale_session_binding" }, 409);
+    }
     if (!validHostRpcResponse(body.response, pending.rpc_id)) {
       return jsonResponse({ error: "invalid_response", detail: "JSON-RPC response does not match pending request" }, 400);
     }
@@ -527,6 +847,8 @@ export class GatewaySession {
     const validation = validateAgentIdentity(body, true);
     if (validation) return validation;
     const host = await this.currentHost();
+    const authMismatch = verifyTransportContext(host, body._fabric_auth);
+    if (authMismatch) return authMismatch;
     const mismatch = verifyGeneration(host, body);
     if (mismatch) return mismatch;
     await this.clearHost(host, "host_disconnected");
@@ -538,11 +860,41 @@ export class GatewaySession {
     if (!request || typeof request !== "object" || !validRpcId(request.id)) {
       return jsonResponse({ error: "invalid_rpc_request" }, 400);
     }
+    const marker = await this.state.storage.get("browser_authority");
+    if (marker !== undefined && marker !== null && !validBrowserAuthorityMarker(marker)) {
+      return jsonResponse({ error: "browser_authority_marker_unavailable" }, 503);
+    }
+    const incomingAuth = validateTransportContext(body?._fabric_auth);
+    if (!incomingAuth) return jsonResponse({ error: "host_auth_context_invalid" }, 403);
+    if (marker && (incomingAuth.mode !== "browser" || incomingAuth.owner_key !== marker.owner_key)) {
+      return jsonResponse({ error: "browser_host_cannot_downgrade", migration_required: true }, 403);
+    }
     const host = await this.currentHost();
     if (!host) return jsonResponse({ error: "host_offline" }, 503);
     if (host.expires_at <= Date.now()) {
       await this.clearHost(host, "host_lease_expired");
       return jsonResponse({ error: "host_offline", detail: "lease expired" }, 503);
+    }
+    const authMismatch = verifyTransportContext(host, incomingAuth);
+    if (authMismatch) return authMismatch;
+    let browserSession = null;
+    if (incomingAuth.mode === "browser") {
+      const committed = await activeBrowserGrant(this.env, host.host_id, incomingAuth.owner_key);
+      if (!sameBrowserGrantSnapshot(committed, {
+        mode: "browser",
+        owner_key: incomingAuth.owner_key,
+        grant_id: incomingAuth.grant_id,
+        grant_generation: incomingAuth.grant_generation,
+        approved_roots: incomingAuth.approved_roots,
+      })) return jsonResponse({ error: "stale_auth_generation" }, 409);
+      if (!browserDispatchAllowed(request, incomingAuth.approved_roots)) {
+        return jsonResponse({ error: "browser_operation_not_allowed" }, 403);
+      }
+      const binding = browserSessionBinding(body?._fabric_session, request);
+      if (!binding.ok) return jsonResponse({ error: "browser_session_binding_invalid" }, 403);
+      browserSession = binding.value;
+    } else if (body?._fabric_session !== undefined) {
+      return jsonResponse({ error: "unexpected_session_binding" }, 403);
     }
 
     if (this.pending.size >= MAX_PENDING_HOST_REQUESTS) {
@@ -559,9 +911,18 @@ export class GatewaySession {
         this.removeQueuedRequest(requestId);
         resolve({ status: 504, error: "host_request_timeout" });
       }, this.rpcTimeoutMs);
-      this.pending.set(requestId, { resolve, timer, generation: host.generation, rpc_id: request.id });
+      this.pending.set(requestId, {
+        resolve, timer, generation: host.generation, rpc_id: request.id,
+        browser_session: browserSession,
+      });
     });
-    this.queue.push({ request_id: requestId, request, generation: host.generation });
+    this.queue.push({
+      request_id: requestId,
+      request,
+      generation: host.generation,
+      ...(incomingAuth.mode === "browser" ? { _fabric_auth: incomingAuth } : {}),
+      ...(browserSession ? { _fabric_session: browserSession } : {}),
+    });
     this.flushWaitingPoll();
 
     const result = await outcome;
@@ -592,7 +953,12 @@ export class GatewaySession {
     while (this.queue.length > 0) {
       const entry = this.queue.shift();
       if (entry.generation === generation) {
-        return { request_id: entry.request_id, request: entry.request };
+        return {
+          request_id: entry.request_id,
+          request: entry.request,
+          ...(entry._fabric_auth ? { _fabric_auth: entry._fabric_auth } : {}),
+          ...(entry._fabric_session ? { _fabric_session: entry._fabric_session } : {}),
+        };
       }
       const pending = this.pending.get(entry.request_id);
       if (pending && pending.generation === entry.generation) {
@@ -639,6 +1005,17 @@ export class GatewaySession {
     // Registry I/O can yield to a newer connect. A failed renewal from an old
     // generation must not clear the replacement host or its pending requests.
     if (verifyGeneration(await this.currentHost(), host)) return;
+    if (host.auth_mode === "browser") {
+      const marker = await this.state.storage.get("browser_authority");
+      if (marker === undefined || marker === null) {
+        if (!/^[0-9a-f]{64}$/.test(host.owner_key ?? "")) {
+          return jsonResponse({ error: "browser_authority_marker_unavailable" }, 503);
+        }
+        await this.state.storage.put("browser_authority", { version: 1, owner_key: host.owner_key });
+      } else if (!validBrowserAuthorityMarker(marker) || marker.owner_key !== host.owner_key) {
+        return jsonResponse({ error: "browser_authority_marker_unavailable" }, 503);
+      }
+    }
     this.failAllPending(503, reason);
     this.queue.length = 0;
     this.replaceWaitingPoll(reason);
@@ -684,6 +1061,11 @@ export class GatewaySession {
       console.error("registry remove failed", error);
     }
   }
+}
+
+function validBrowserAuthorityMarker(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && value.version === 1 && /^[0-9a-f]{64}$/.test(value.owner_key ?? "");
 }
 
 export class GatewayRegistry {

@@ -588,6 +588,8 @@ mod tests {
             host_token: "host-token".to_owned(),
             access_client_id: None,
             access_client_secret: None,
+            browser_auth: None,
+            browser_auth_blocked: None,
         };
         deliver_pending_in(&store, &gateway, &host, "current-instance", 17)
             .await

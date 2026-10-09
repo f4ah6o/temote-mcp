@@ -70,8 +70,25 @@ export async function handleDashboardRequest(request, env) {
   try {
     const identity = await authorizeDashboard(request, env);
     if (!identity) return dashboardJson({ error_code: "access_unauthorized" }, 401);
-
     const url = new URL(request.url);
+    if (identity.auth_mode === "browser_owner") {
+      // The static shell carries no owner data and can only call the guarded
+      // dashboard API below. Keep it available while denying every data route
+      // until the shared replica has an owner/root namespace proof.
+      if (request.method !== "GET") {
+        return dashboardJson({ error_code: "browser_data_surface_unavailable" }, 403);
+      }
+      if (url.pathname === "/dash") {
+        return dashboardResponse(new Response(null, {
+          status: 308,
+          headers: { location: "/dash/" },
+        }));
+      }
+      const browserAssetPath = STATIC_ASSETS.get(url.pathname);
+      if (browserAssetPath) return await serveDashboardAsset(browserAssetPath, url, env);
+      return dashboardJson({ error_code: "browser_data_surface_unavailable" }, 403);
+    }
+
     if (request.method !== "GET") {
       return dashboardJson({ error_code: "method_not_allowed" }, 405, { allow: "GET" });
     }
@@ -89,13 +106,7 @@ export async function handleDashboardRequest(request, env) {
 
     const assetPath = STATIC_ASSETS.get(url.pathname);
     if (assetPath) {
-      if (!env?.ASSETS || typeof env.ASSETS.fetch !== "function") {
-        return dashboardJson({ error_code: "dashboard_assets_unavailable" }, 503);
-      }
-      const assetUrl = new URL(assetPath, url.origin);
-      const asset = await env.ASSETS.fetch(new Request(assetUrl, { method: "GET" }));
-      if (!asset.ok) return dashboardJson({ error_code: "dashboard_asset_unavailable" }, 503);
-      return dashboardResponse(asset);
+      return await serveDashboardAsset(assetPath, url, env);
     }
 
     return dashboardJson({ error_code: "not_found" }, 404);
@@ -104,4 +115,14 @@ export async function handleDashboardRequest(request, env) {
     // path. Do not log error bodies that may contain host-provided detail.
     return dashboardJson({ error_code: "internal_error" }, 500);
   }
+}
+
+async function serveDashboardAsset(assetPath, url, env) {
+  if (!env?.ASSETS || typeof env.ASSETS.fetch !== "function") {
+    return dashboardJson({ error_code: "dashboard_assets_unavailable" }, 503);
+  }
+  const assetUrl = new URL(assetPath, url.origin);
+  const asset = await env.ASSETS.fetch(new Request(assetUrl, { method: "GET" }));
+  if (!asset.ok) return dashboardJson({ error_code: "dashboard_asset_unavailable" }, 503);
+  return dashboardResponse(asset);
 }

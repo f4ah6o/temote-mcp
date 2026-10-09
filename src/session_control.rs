@@ -99,6 +99,20 @@ pub(crate) fn installed_upgrade_locator() -> Result<PathBuf> {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
     Ping,
+    #[cfg(feature = "network")]
+    FabricInventory,
+    #[cfg(feature = "network")]
+    FabricTool {
+        authority: crate::fabric_browser::FabricAuthority,
+        tool: String,
+        arguments: Value,
+        expected_session: Option<crate::fabric_browser::BrowserSessionBinding>,
+    },
+    #[cfg(feature = "network")]
+    FabricVerifySession {
+        authority: crate::fabric_browser::FabricAuthority,
+        expected_session: crate::fabric_browser::BrowserSessionBinding,
+    },
     /// A versioned-by-shape request envelope for operations that must not
     /// trigger lifecycle maintenance. Keep this allowlist separate from
     /// `ControlRequest` so callers cannot wrap arbitrary commands here.
@@ -413,6 +427,74 @@ impl SessionBackend {
             // and must remain compatible with older lifecycle supervisors.
             // Strict diagnostics call `read_only_local_status` directly.
             Self::LocalControl => request(ControlRequest::Ping).await,
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub async fn fabric_inventory(
+        &self,
+    ) -> Result<crate::fabric_browser::LocalSupervisorInventory> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => supervisor.fabric_inventory(),
+            Self::LocalControl => {
+                let result = request(ControlRequest::FabricInventory)
+                    .await
+                    .context("running Supervisor does not support browser enrollment inventory")?;
+                serde_json::from_value(result)
+                    .context("running Supervisor returned an invalid browser enrollment inventory")
+            }
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub async fn fabric_tool(
+        &self,
+        authority: crate::fabric_browser::FabricAuthority,
+        tool: &str,
+        arguments: Value,
+        expected_session: Option<crate::fabric_browser::BrowserSessionBinding>,
+    ) -> Result<Value> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor
+                    .fabric_tool(authority, tool, arguments, expected_session)
+                    .await
+            }
+            Self::LocalControl => request(ControlRequest::FabricTool {
+                authority,
+                tool: tool.to_owned(),
+                arguments,
+                expected_session,
+            })
+            .await
+            .context("Supervisor denied browser-scoped operation"),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub async fn fabric_verify_session(
+        &self,
+        authority: crate::fabric_browser::FabricAuthority,
+        expected_session: crate::fabric_browser::BrowserSessionBinding,
+    ) -> Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor
+                    .fabric_verify_session(authority, expected_session)
+                    .await
+            }
+            Self::LocalControl => {
+                request(ControlRequest::FabricVerifySession {
+                    authority,
+                    expected_session,
+                })
+                .await
+                .context("Supervisor could not revalidate browser session instance")?;
+                Ok(())
+            }
         }
     }
 
@@ -1493,6 +1575,32 @@ async fn dispatch_request(
     }
     supervisor.reap_finished().await;
     match request {
+        #[cfg(feature = "network")]
+        ControlRequest::FabricInventory => {
+            Ok(serde_json::to_value(supervisor.fabric_inventory()?)?)
+        }
+        #[cfg(feature = "network")]
+        #[cfg(feature = "network")]
+        ControlRequest::FabricTool {
+            authority,
+            tool,
+            arguments,
+            expected_session,
+        } => {
+            supervisor
+                .fabric_tool(authority, &tool, arguments, expected_session)
+                .await
+        }
+        #[cfg(feature = "network")]
+        ControlRequest::FabricVerifySession {
+            authority,
+            expected_session,
+        } => {
+            supervisor
+                .fabric_verify_session(authority, expected_session)
+                .await?;
+            Ok(json!({"verified": true}))
+        }
         ControlRequest::ReadOnlyDiagnostic { .. } => {
             unreachable!("read-only diagnostics are dispatched before legacy maintenance")
         }

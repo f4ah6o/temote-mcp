@@ -430,6 +430,93 @@ pub(crate) async fn dispatch_public(
     dispatch_with_mode(request, true, sessions).await
 }
 
+/// Execute the narrow typed task/evidence/job surface admitted by an enrolled
+/// Fabric Host. The Supervisor validates the grant, root, and exact session
+/// instance before calling this function; this boundary still requires the
+/// explicit session id and reuses each public tool's normal argument checks.
+#[cfg(feature = "network")]
+pub(crate) async fn dispatch_browser_scoped_tool(
+    name: &str,
+    args: Value,
+    session: &config::Session,
+) -> Result<Value> {
+    const ALLOWED: &[&str] = &[
+        "codex_status",
+        "codex_task_start",
+        "codex_task_get",
+        "codex_task_control",
+        "evidence_read",
+        "task_list",
+        "poll_job",
+        "job_list",
+        "stop_job",
+    ];
+    anyhow::ensure!(
+        ALLOWED.contains(&name),
+        "tool is unavailable for browser-enrolled Hosts"
+    );
+    let object = args
+        .as_object()
+        .context("tool arguments must be an object")?;
+    anyhow::ensure!(
+        object.get("session_id").and_then(Value::as_str) == Some(session.id.as_str()),
+        "browser-scoped tool requires the authorized session_id"
+    );
+    if matches!(name, "codex_task_start" | "codex_task_control") {
+        anyhow::ensure!(
+            object
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+            "browser-scoped task mutation requires a UUID operation_id"
+        );
+    }
+
+    let coverage = activity_tool_coverage(name);
+    let activity = if let Some(coverage) = coverage {
+        tool_activity_scope(
+            session,
+            coverage.operation,
+            activity_tool_summary(&args, coverage.operation),
+        )
+        .await
+    } else {
+        None
+    };
+    let result = async {
+        match name {
+            "evidence_read" => evidence_read_tool(&args, session, true).await,
+            "task_list" => task_list_tool(&args, session, true).await,
+            "poll_job" => poll_job(&args, session).await,
+            "job_list" => job_list(&args, session),
+            "stop_job" => stop_job_with_activity(&args, session, activity.as_ref()).await,
+            "codex_status" | "codex_task_start" | "codex_task_get" | "codex_task_control" => {
+                let (backend, operation) =
+                    delegation_operation(name).context("browser task operation is unavailable")?;
+                anyhow::ensure!(
+                    backend == orchestration::Backend::Codex,
+                    "browser task operation is unavailable"
+                );
+                text_result(serde_json::to_string_pretty(
+                    &invoke_backend_task(
+                        backend,
+                        operation,
+                        &args,
+                        session,
+                        true,
+                        activity.as_ref(),
+                    )
+                    .await?,
+                )?)
+            }
+            _ => unreachable!("allowlist checked above"),
+        }
+    }
+    .await;
+    finish_covered_tool_activity(coverage, activity.as_ref(), &result);
+    result
+}
+
 async fn dispatch_with_mode(
     request: &Value,
     public: bool,

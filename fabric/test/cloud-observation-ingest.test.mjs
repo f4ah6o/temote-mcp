@@ -537,6 +537,8 @@ class FakeD1 {
     const sql = statement.sql.trim();
     const args = statement.args;
 
+    if (sql.startsWith("SELECT host_id FROM fabric_host_grants")) return { results: [] };
+
     if (sql.startsWith("SELECT owner_id")) {
       const key = args[0] + "\n" + args[1] + "\n" + args[2];
       const source = state.sources.get(key);
