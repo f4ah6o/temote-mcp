@@ -3,7 +3,7 @@
 Status: open
 Model: unknown
 Created: 2026-10-05
-Updated: 2026-10-05
+Updated: 2026-10-09
 Branch: codex/20261005-complete-issues-fabric
 
 ## 概要
@@ -111,6 +111,7 @@ Assess user-visible, operational, compatibility, and migration effects during im
 
 - 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
 - 2026-10-05: V1 defaults and egress architecture were selected. Fabric remains the subscription/outbox owner; the Host sender is a constrained transport, not a subscription or task authority. Remote live ChatGPT and credentialed Access gates remain NOT RUN until executed.
+- 2026-10-09: Re-checked against main 2706754; unchecked criteria and live/acceptance gates remain open.
 
 ## 2026-10-05 実行パケット
 
