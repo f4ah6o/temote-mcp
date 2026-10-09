@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -27,7 +28,6 @@ const MAX_GATEWAY_POLL_RESPONSE_BYTES: usize =
     MAX_GATEWAY_RESPONSE_BYTES + MAX_GATEWAY_POLL_ENVELOPE_BYTES;
 const _: () = assert!(MAX_GATEWAY_POLL_ENVELOPE_BYTES >= 64 * 1024);
 const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
-const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_GATEWAY_REQUESTS: usize = 8;
@@ -114,6 +114,37 @@ enum PollOutcome {
     Idle,
     Request(Box<PollEnvelope>),
     Exit(GenerationExit),
+}
+
+#[derive(Clone)]
+pub(crate) struct HostAgentDisplay {
+    pub(crate) host_id: String,
+    pub(crate) gateway_origin: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum BrowserFailureDiagnostic {
+    SupervisorMetadata,
+    Connect,
+    ConnectionRecord,
+    Generation,
+    Disconnect,
+}
+
+impl BrowserFailureDiagnostic {
+    fn message(self) -> &'static str {
+        match self {
+            Self::SupervisorMetadata => {
+                "gateway host metadata refresh failed: code=local_supervisor_metadata"
+            }
+            Self::Connect => "gateway host connect failed: code=remote_connect",
+            Self::ConnectionRecord => {
+                "gateway agent connection record unavailable: code=local_record"
+            }
+            Self::Generation => "gateway generation ended: code=host_generation",
+            Self::Disconnect => "gateway host disconnect failed: code=remote_disconnect",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,6 +419,10 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
     let instance_id = Uuid::new_v4().to_string();
 
     if let Some(host_id) = options.host_id {
+        let display = HostAgentDisplay {
+            host_id: host_id.clone(),
+            gateway_origin: None,
+        };
         return run_host_agent(
             &gateway,
             &host_id,
@@ -395,6 +430,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
             platform,
             reconnect_delay,
             None,
+            display,
         )
         .await;
     }
@@ -416,10 +452,22 @@ pub(crate) async fn run_browser_link_with_lease(
     protocol: crate::fabric_browser::BrowserOAuth,
     prepared: crate::fabric_browser::PreparedBrowserLink,
     _link_lease: crate::fabric_browser::ProfileLock,
+    display_host_id: String,
+    display_gateway_origin: String,
 ) -> Result<()> {
     prepared
         .record
         .validate_for_link(&prepared.record.gateway_origin)?;
+    let configured_gateway_origin = Url::parse(&protocol.options.gateway_url)?
+        .origin()
+        .ascii_serialization();
+    anyhow::ensure!(
+        display_host_id == prepared.record.host_id
+            && display_host_id == prepared.authority.host_id
+            && display_gateway_origin == prepared.record.gateway_origin
+            && display_gateway_origin == configured_gateway_origin,
+        "browser Link display identity does not match verified local enrollment"
+    );
     validate_federated_platform(detected_platform())?;
     let browser_auth = Arc::new(RwLock::new(BrowserWireAuth {
         access_token: prepared.record.oauth_access_token.clone(),
@@ -462,6 +510,10 @@ pub(crate) async fn run_browser_link_with_lease(
         detected_platform(),
         DEFAULT_RECONNECT_DELAY,
         Some(prepared.authority),
+        HostAgentDisplay {
+            host_id: display_host_id,
+            gateway_origin: Some(display_gateway_origin),
+        },
     )
     .await;
     refresh_task.abort();
@@ -630,7 +682,7 @@ async fn run_legacy_agent(
             }
         };
 
-        log_generation_outcome(outcome, connection.generation);
+        log_generation_outcome(outcome, connection.generation, false);
         if wait_or_stop(reconnect_delay, &mut ctrl_c, &session.id).await? {
             return Ok(());
         }
@@ -644,9 +696,15 @@ async fn run_host_agent(
     platform: &str,
     reconnect_delay: Duration,
     browser_authority: Option<crate::fabric_browser::FabricAuthority>,
+    display: HostAgentDisplay,
 ) -> Result<()> {
     validate_federated_platform(platform)?;
     let host_id = host_identity::validate(host_id)?;
+    anyhow::ensure!(
+        display.host_id == host_id,
+        "Host display identity differs from the connected Host"
+    );
+    let browser_mode = browser_authority.is_some();
     let worker_auth =
         browser_authority
             .as_ref()
@@ -684,7 +742,13 @@ async fn run_host_agent(
 
     eprintln!(
         "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
-        host_id, platform, instance_id, gateway.base_url,
+        display.host_id,
+        platform,
+        instance_id,
+        display
+            .gateway_origin
+            .as_deref()
+            .unwrap_or(&gateway.base_url),
     );
 
     let ctrl_c = tokio::signal::ctrl_c();
@@ -706,15 +770,19 @@ async fn run_host_agent(
                 .and_then(|status| host_supervisor_metadata(&status)),
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
-                eprintln!("Stopping gateway agent for host {host_id}");
+                eprintln!("Stopping gateway agent for host {}", display.host_id);
                 return Ok(());
             }
         };
         let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(error) => {
-                eprintln!("gateway host metadata refresh failed: {error:#}");
-                if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+                if browser_mode {
+                    eprintln!("{}", BrowserFailureDiagnostic::SupervisorMetadata.message());
+                } else {
+                    eprintln!("gateway host metadata refresh failed: {error:#}");
+                }
+                if wait_or_stop(reconnect_delay, &mut ctrl_c, &display.host_id).await? {
                     return Ok(());
                 }
                 continue;
@@ -732,7 +800,7 @@ async fn run_host_agent(
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
-                eprintln!("Stopping gateway agent for host {host_id}");
+                eprintln!("Stopping gateway agent for host {}", display.host_id);
                 return Ok(());
             }
         };
@@ -740,8 +808,12 @@ async fn run_host_agent(
         let connection = match connected {
             Ok(connection) => connection,
             Err(error) => {
-                eprintln!("gateway host connect failed: {error:#}");
-                if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+                if browser_mode {
+                    eprintln!("{}", BrowserFailureDiagnostic::Connect.message());
+                } else {
+                    eprintln!("gateway host connect failed: {error:#}");
+                }
+                if wait_or_stop(reconnect_delay, &mut ctrl_c, &display.host_id).await? {
                     return Ok(());
                 }
                 continue;
@@ -749,7 +821,7 @@ async fn run_host_agent(
         };
         eprintln!(
             "gateway connected: mode=host host_id={} generation={} lease_seconds={} named_roots={}",
-            connection.host_id,
+            display.host_id,
             connection.generation,
             connection.lease_seconds,
             if worker_auth
@@ -768,7 +840,11 @@ async fn run_host_agent(
         let connection_record =
             HostAgentConnectionRecordFile::create(&host_id, connection.generation);
         if let Err(error) = &connection_record {
-            eprintln!("gateway agent connection record unavailable: {error:#}");
+            if browser_mode {
+                eprintln!("{}", BrowserFailureDiagnostic::ConnectionRecord.message());
+            } else {
+                eprintln!("gateway agent connection record unavailable: {error:#}");
+            }
         }
         let _connection_record = connection_record.ok();
 
@@ -799,12 +875,12 @@ async fn run_host_agent(
                     connection.generation,
                     worker_auth.as_ref(),
                 ).await;
-                eprintln!("Stopping gateway agent for host {host_id}");
+                eprintln!("Stopping gateway agent for host {}", display.host_id);
                 return Ok(());
             }
         };
 
-        log_generation_outcome(outcome, connection.generation);
+        log_generation_outcome(outcome, connection.generation, browser_mode);
         if gateway
             .browser_auth_blocked
             .as_ref()
@@ -814,13 +890,13 @@ async fn run_host_agent(
                 "browser OAuth state is uncertain; Link has halted and requires interactive recovery"
             );
         }
-        if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+        if wait_or_stop(reconnect_delay, &mut ctrl_c, &display.host_id).await? {
             return Ok(());
         }
     }
 }
 
-fn log_generation_outcome(outcome: Result<GenerationExit>, generation: u64) {
+fn log_generation_outcome(outcome: Result<GenerationExit>, generation: u64, browser_mode: bool) {
     match outcome {
         Ok(GenerationExit::Replaced) => {
             eprintln!("gateway generation {generation} was replaced; reconnecting");
@@ -832,7 +908,11 @@ fn log_generation_outcome(outcome: Result<GenerationExit>, generation: u64) {
             eprintln!("local supervisor metadata changed; reconnecting gateway host generation");
         }
         Err(error) => {
-            eprintln!("gateway generation ended: {error:#}");
+            if browser_mode {
+                eprintln!("{}", BrowserFailureDiagnostic::Generation.message());
+            } else {
+                eprintln!("gateway generation ended: {error:#}");
+            }
         }
     }
 }
@@ -1001,7 +1081,7 @@ async fn connect_legacy(
     let response = require_success(response, "gateway connect").await?;
     let bytes = read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway connect").await?;
     let body: LegacyConnectResponse =
-        serde_json::from_slice(&bytes).context("gateway connect returned invalid JSON")?;
+        parse_gateway_json(&bytes, "gateway connect returned invalid JSON")?;
     anyhow::ensure!(
         body.session_id == session_id,
         "gateway returned a different session_id"
@@ -1033,7 +1113,7 @@ async fn connect_host(
     let bytes =
         read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway host connect").await?;
     let body: HostConnectResponse =
-        serde_json::from_slice(&bytes).context("gateway host connect returned invalid JSON")?;
+        parse_gateway_json(&bytes, "gateway host connect returned invalid JSON")?;
     anyhow::ensure!(
         body.host_id == host_id,
         "gateway returned a different host_id"
@@ -1588,9 +1668,10 @@ fn gateway_conflict(value: &Value) -> Result<GatewayConflict> {
 
 async fn read_gateway_conflict(response: Response) -> Result<GatewayConflict> {
     let bytes = read_bounded_body(response, MAX_GATEWAY_ERROR_BYTES, "gateway conflict").await?;
-    gateway_conflict(
-        &serde_json::from_slice(&bytes).context("gateway conflict returned invalid JSON")?,
-    )
+    gateway_conflict(&parse_gateway_json(
+        &bytes,
+        "gateway conflict returned invalid JSON",
+    )?)
 }
 
 async fn verify_host_generation_metadata(
@@ -1650,8 +1731,7 @@ async fn poll_envelope(response: Response, poll_started: Instant) -> Result<Poll
     let response = require_success(response, "gateway poll").await?;
     let bytes =
         read_bounded_body(response, MAX_GATEWAY_POLL_RESPONSE_BYTES, "gateway poll").await?;
-    let envelope: PollEnvelope =
-        serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
+    let envelope: PollEnvelope = parse_gateway_json(&bytes, "gateway poll returned invalid JSON")?;
     anyhow::ensure!(
         !envelope.request_id.is_empty() && envelope.request_id.len() <= 256,
         "gateway poll returned invalid request identity"
@@ -1865,7 +1945,11 @@ async fn disconnect_host(
         .send()
         .await;
     if let Err(error) = result {
-        eprintln!("gateway host disconnect failed: {error}");
+        if worker_auth.is_some() {
+            eprintln!("{}", BrowserFailureDiagnostic::Disconnect.message());
+        } else {
+            eprintln!("gateway host disconnect failed: {error}");
+        }
     }
 }
 
@@ -2023,14 +2107,15 @@ async fn require_success(response: Response, operation: &str) -> Result<Response
         return Ok(response);
     }
     let status = response.status();
-    let body = read_bounded_body(response, MAX_GATEWAY_ERROR_BYTES, operation)
-        .await
-        .with_context(|| format!("{operation} failed with HTTP {status}"))?;
-    let detail = String::from_utf8_lossy(&body)
-        .chars()
-        .take(MAX_GATEWAY_ERROR_DISPLAY_CHARS)
-        .collect::<String>();
-    anyhow::bail!("{operation} failed with HTTP {status}: {detail}")
+    anyhow::bail!("{}", gateway_failure_message(operation, status))
+}
+
+fn gateway_failure_message(operation: &str, status: StatusCode) -> String {
+    format!("{operation} failed with HTTP {status}")
+}
+
+fn parse_gateway_json<T: DeserializeOwned>(bytes: &[u8], message: &'static str) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!(message))
 }
 
 pub(crate) async fn read_bounded_body(
@@ -2137,6 +2222,71 @@ fn detected_platform() -> &'static str {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[tokio::test]
+    async fn remote_gateway_error_handling_never_includes_auth_response_content() {
+        let fake_response_body =
+            "access_token=ACCESS_SECRET_SENTINEL host_grant=GRANT_SECRET_SENTINEL";
+        let response: Response = axum::http::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(fake_response_body)
+            .unwrap()
+            .into();
+        let error = require_success(response, "gateway host connect")
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered,
+            "gateway host connect failed with HTTP 401 Unauthorized"
+        );
+        assert!(!rendered.contains("ACCESS_SECRET_SENTINEL"));
+        assert!(!rendered.contains("GRANT_SECRET_SENTINEL"));
+
+        let successful: Response = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body("successful response body")
+            .unwrap()
+            .into();
+        let successful = require_success(successful, "gateway host connect")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bounded_body(
+                successful,
+                MAX_GATEWAY_RESPONSE_BYTES,
+                "gateway host connect"
+            )
+            .await
+            .unwrap(),
+            b"successful response body"
+        );
+    }
+
+    #[test]
+    fn browser_failure_categories_cannot_format_secret_sentinels() {
+        let fake_anyhow_error = anyhow::anyhow!(
+            "oauth:ACCESS_SECRET_SENTINEL refresh=REFRESH_SECRET_SENTINEL grant=HOST_GRANT_SECRET_SENTINEL"
+        );
+        let diagnostics = [
+            BrowserFailureDiagnostic::SupervisorMetadata,
+            BrowserFailureDiagnostic::Connect,
+            BrowserFailureDiagnostic::ConnectionRecord,
+            BrowserFailureDiagnostic::Generation,
+            BrowserFailureDiagnostic::Disconnect,
+        ];
+        for diagnostic in diagnostics {
+            let rendered = diagnostic.message();
+            assert!(!rendered.contains(&fake_anyhow_error.to_string()));
+            for sentinel in [
+                "ACCESS_SECRET_SENTINEL",
+                "REFRESH_SECRET_SENTINEL",
+                "HOST_GRANT_SECRET_SENTINEL",
+            ] {
+                assert!(!rendered.contains(sentinel));
+            }
+        }
+    }
 
     #[cfg(feature = "network")]
     #[test]

@@ -17,6 +17,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::digest::{SHA256, digest};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -493,7 +494,7 @@ impl CredentialStore for OsCredentialStore {
             "secure credential record is oversized"
         );
         let record: CredentialRecord =
-            serde_json::from_slice(&bytes).context("secure credential record is malformed")?;
+            parse_untrusted_json(&bytes, "secure credential record is malformed")?;
         anyhow::ensure!(
             record.schema_version == RECORD_VERSION,
             "secure credential schema is unsupported"
@@ -658,6 +659,23 @@ struct OAuthMetadata {
     issuer: String,
 }
 
+/// An endpoint that has passed the origin allowlist and HTTPS checks. OAuth
+/// requests only accept this wrapper, and the underlying client is HTTPS-only.
+#[derive(Clone)]
+struct ValidatedHttpsEndpoint(Url);
+
+impl ValidatedHttpsEndpoint {
+    fn new(url: &Url, permitted_origins: &[String]) -> Result<Self> {
+        validate_permitted_url(url, permitted_origins)?;
+        anyhow::ensure!(url.scheme() == "https", "OAuth endpoint must use HTTPS");
+        Ok(Self(url.clone()))
+    }
+
+    fn url(&self) -> &Url {
+        &self.0
+    }
+}
+
 #[derive(Clone)]
 pub struct BrowserOAuth {
     pub options: BrowserConnectOptions,
@@ -691,7 +709,8 @@ impl BrowserOAuth {
     }
 
     async fn fetch_json(&self, url: &Url) -> Result<Value> {
-        validate_permitted_url(url, &self.options.permitted_origins)?;
+        let endpoint = ValidatedHttpsEndpoint::new(url, &self.options.permitted_origins)?;
+        let url = endpoint.url();
         let host = url.host_str().context("OAuth endpoint has no host")?;
         let addrs = resolve_public_addresses(
             host,
@@ -701,7 +720,7 @@ impl BrowserOAuth {
         .await?;
         let client = pinned_http_client(host, &addrs)?;
         let response = client
-            .get(url.clone())
+            .get(endpoint.url().clone())
             .send()
             .await
             .context("OAuth metadata request failed")?;
@@ -720,13 +739,13 @@ impl BrowserOAuth {
             "OAuth metadata response is oversized"
         );
         let bytes = read_bounded_response(response).await?;
-        let value: Value =
-            serde_json::from_slice(&bytes).context("OAuth metadata is invalid JSON")?;
+        let value: Value = parse_untrusted_json(&bytes, "OAuth metadata is invalid JSON")?;
         Ok(value)
     }
 
     async fn post_form(&self, url: &Url, form: &[(&str, &str)]) -> Result<TokenResponse> {
-        validate_permitted_url(url, &self.options.permitted_origins)?;
+        let endpoint = ValidatedHttpsEndpoint::new(url, &self.options.permitted_origins)?;
+        let url = endpoint.url();
         let host = url.host_str().context("token endpoint has no host")?;
         let addrs = resolve_public_addresses(
             host,
@@ -736,7 +755,7 @@ impl BrowserOAuth {
         .await?;
         let client = pinned_http_client(host, &addrs)?;
         let response = client
-            .post(url.clone())
+            .post(endpoint.url().clone())
             .form(form)
             .send()
             .await
@@ -757,7 +776,7 @@ impl BrowserOAuth {
         );
         let bytes = read_bounded_response(response).await?;
         let value: TokenResponse =
-            serde_json::from_slice(&bytes).context("OAuth token response is malformed")?;
+            parse_untrusted_json(&bytes, "OAuth token response is malformed")?;
         anyhow::ensure!(
             value.token_type.eq_ignore_ascii_case("bearer"),
             "OAuth token type is unsupported"
@@ -776,9 +795,10 @@ impl BrowserOAuth {
     async fn metadata(&self) -> Result<OAuthMetadata> {
         let gateway = Url::parse(&self.options.gateway_url)?;
         let protected_url = gateway.join("/.well-known/oauth-protected-resource")?;
-        let protected: ProtectedResourceMetadata =
-            serde_json::from_value(self.fetch_json(&protected_url).await?)
-                .context("protected-resource metadata is invalid")?;
+        let protected: ProtectedResourceMetadata = parse_untrusted_value(
+            self.fetch_json(&protected_url).await?,
+            "protected-resource metadata is invalid",
+        )?;
         anyhow::ensure!(
             protected.resource == self.options.resource,
             "protected-resource metadata does not match the pinned resource"
@@ -792,17 +812,18 @@ impl BrowserOAuth {
         );
         let issuer_url = Url::parse(&self.options.issuer)?;
         let server_metadata_url = issuer_url.join("/.well-known/oauth-authorization-server")?;
-        let metadata: AuthorizationServerMetadata =
-            serde_json::from_value(self.fetch_json(&server_metadata_url).await?)
-                .context("authorization-server metadata is invalid")?;
+        let metadata: AuthorizationServerMetadata = parse_untrusted_value(
+            self.fetch_json(&server_metadata_url).await?,
+            "authorization-server metadata is invalid",
+        )?;
         anyhow::ensure!(
             metadata.issuer == self.options.issuer,
             "OAuth issuer does not match configured pin"
         );
         let authorization_endpoint = Url::parse(&metadata.authorization_endpoint)?;
         let token_endpoint = Url::parse(&metadata.token_endpoint)?;
-        validate_permitted_url(&authorization_endpoint, &self.options.permitted_origins)?;
-        validate_permitted_url(&token_endpoint, &self.options.permitted_origins)?;
+        ValidatedHttpsEndpoint::new(&authorization_endpoint, &self.options.permitted_origins)?;
+        ValidatedHttpsEndpoint::new(&token_endpoint, &self.options.permitted_origins)?;
         Ok(OAuthMetadata {
             authorization_endpoint,
             token_endpoint,
@@ -921,7 +942,7 @@ impl BrowserOAuth {
             "verified Fabric identity was rejected"
         );
         let bytes = read_bounded_response(response).await?;
-        let value: Value = serde_json::from_slice(&bytes)?;
+        let value: Value = parse_untrusted_json(&bytes, "Worker identity response is malformed")?;
         let owner_key = value
             .get("owner_key")
             .and_then(Value::as_str)
@@ -1939,12 +1960,13 @@ impl EnrollmentConfirmation for TerminalEnrollmentConfirmation {
 pub async fn run_connect(options: BrowserConnectOptions) -> Result<()> {
     let backend = crate::session_control::SessionBackend::local_control().await?;
     let inventory = backend.fabric_inventory().await?;
+    let protocol = BrowserOAuth::new(options.clone())?;
     let gateway_origin = Url::parse(&options.gateway_url)?
         .origin()
         .ascii_serialization();
+    let display_host_id = crate::host_identity::validate(&inventory.host_id)?;
     let profile = profile_key(&gateway_origin, "", &inventory.host_id);
     let link_lease = ProfileLock::link_lifetime(&profile)?;
-    let protocol = BrowserOAuth::new(options.clone())?;
     let mut confirmation = TerminalEnrollmentConfirmation;
     let prepared = prepare_browser_link_with_transition(
         &options,
@@ -1955,7 +1977,14 @@ pub async fn run_connect(options: BrowserConnectOptions) -> Result<()> {
         || Ok(Box::new(ProfileLock::transition(&profile)?)),
     )
     .await?;
-    crate::gateway::run_browser_link_with_lease(protocol, prepared, link_lease).await
+    crate::gateway::run_browser_link_with_lease(
+        protocol,
+        prepared,
+        link_lease,
+        display_host_id,
+        gateway_origin,
+    )
+    .await
 }
 
 pub async fn run_logout(options: BrowserConnectOptions) -> Result<()> {
@@ -2369,7 +2398,7 @@ async fn revoke_generation(
 
 fn parse_enrollment_status(value: Value, expected_host_id: &str) -> Result<EnrollmentStatus> {
     let worker: WorkerEnrollmentStatus =
-        serde_json::from_value(value).context("Worker enrollment response is malformed")?;
+        parse_untrusted_value(value, "Worker enrollment response is malformed")?;
     let status =
         EnrollmentStatus::try_from(worker).context("Worker enrollment deadline is malformed")?;
     anyhow::ensure!(
@@ -2459,8 +2488,7 @@ impl<'a> BrowserApi<'a> {
             "Fabric enrollment status was rejected"
         );
         let bytes = read_bounded_response(response).await?;
-        let value: Value =
-            serde_json::from_slice(&bytes).context("Fabric enrollment status is malformed")?;
+        let value: Value = parse_untrusted_json(&bytes, "Fabric enrollment status is malformed")?;
         parse_enrollment_status(value, host_id).map(Some)
     }
 
@@ -2497,19 +2525,22 @@ impl<'a> BrowserApi<'a> {
             "Fabric enrollment was rejected"
         );
         let bytes = read_bounded_response(response).await?;
-        serde_json::from_slice(&bytes).context("Fabric enrollment response is malformed")
+        parse_untrusted_json(&bytes, "Fabric enrollment response is malformed")
     }
 }
 
 pub fn require_confirmed_identity(identity: &VerifiedIdentity, host_id: &str) -> Result<()> {
     use std::io::{IsTerminal, Write as _};
+    let prompt = OwnerConfirmationPrompt::new(identity, host_id)?;
     anyhow::ensure!(
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal(),
         "browser enrollment requires an interactive terminal to confirm the verified owner"
     );
-    eprintln!("Cloudflare verified this account as: {}", identity.email);
-    eprint!("To claim Fabric Host {host_id}, type its id: ");
-    std::io::stderr().flush()?;
+    let mut stderr = std::io::stderr();
+    prompt.write_to(&mut stderr)?;
+    stderr.flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     anyhow::ensure!(
@@ -2517,6 +2548,37 @@ pub fn require_confirmed_identity(identity: &VerifiedIdentity, host_id: &str) ->
         "browser enrollment was not confirmed"
     );
     Ok(())
+}
+
+/// A prompt projection containing only validated display fields. Secret-bearing
+/// identity, OAuth, and credential records are never formatted as a whole.
+struct OwnerConfirmationPrompt {
+    email: String,
+    host_id: String,
+}
+
+impl OwnerConfirmationPrompt {
+    fn new(identity: &VerifiedIdentity, host_id: &str) -> Result<Self> {
+        validate_verified_identity(identity)?;
+        Ok(Self {
+            email: identity.email.clone(),
+            host_id: crate::host_identity::validate(host_id)?,
+        })
+    }
+
+    fn write_to(&self, writer: &mut impl std::io::Write) -> Result<()> {
+        writeln!(
+            writer,
+            "Cloudflare verified this account as: {}",
+            self.email
+        )?;
+        write!(
+            writer,
+            "To claim Fabric Host {}, type its id: ",
+            self.host_id
+        )?;
+        Ok(())
+    }
 }
 
 pub fn select_roots(available: &[String]) -> Result<Vec<String>> {
@@ -2663,6 +2725,7 @@ fn pinned_http_client(host: &str, addresses: &[SocketAddr]) -> Result<reqwest::C
         "OAuth endpoint addresses are not public"
     );
     reqwest::Client::builder()
+        .https_only(true)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
@@ -2719,6 +2782,16 @@ async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Parse secret-bearing or remote JSON without retaining serde's error text,
+/// which can include the offending field value.
+fn parse_untrusted_json<T: DeserializeOwned>(bytes: &[u8], message: &'static str) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!(message))
+}
+
+fn parse_untrusted_value<T: DeserializeOwned>(value: Value, message: &'static str) -> Result<T> {
+    serde_json::from_value(value).map_err(|_| anyhow::anyhow!(message))
 }
 
 async fn wait_for_loopback_code(
@@ -3043,6 +3116,87 @@ fn secret_tool_clear_args(profile: &str, version: u64) -> [String; 5] {
 pub(crate) mod tests_support {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn confirmation_prompt_projects_only_bounded_public_identity_fields() {
+        let identity = VerifiedIdentity {
+            owner_key: "a".repeat(64),
+            email: "owner@example.test".to_owned(),
+        };
+        let prompt = OwnerConfirmationPrompt::new(&identity, "host-public-1").unwrap();
+        let mut output = Vec::new();
+        prompt.write_to(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("owner@example.test"));
+        assert!(output.contains("host-public-1"));
+        for sentinel in [
+            "a".repeat(64),
+            "oauth:ACCESS_SECRET_SENTINEL".to_owned(),
+            "REFRESH_SECRET_SENTINEL".to_owned(),
+            "HOST_GRANT_SECRET_SENTINEL".to_owned(),
+        ] {
+            assert!(!output.contains(&sentinel));
+        }
+        assert!(
+            OwnerConfirmationPrompt::new(
+                &VerifiedIdentity {
+                    owner_key: "a".repeat(64),
+                    email: "owner@example.test\nLEAK_SENTINEL".to_owned(),
+                },
+                "host-public-1",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_secret_bearing_json_errors_do_not_echo_fake_values() {
+        let sentinel = "PARSE_SECRET_SENTINEL";
+        let credential = format!(r#"{{"schema_version":"{sentinel}"}}"#);
+        let credential_error = parse_untrusted_json::<CredentialRecord>(
+            credential.as_bytes(),
+            "secure credential record is malformed",
+        )
+        .err()
+        .expect("credential payload should be malformed");
+        assert_eq!(
+            format!("{credential_error:#}"),
+            "secure credential record is malformed"
+        );
+        assert!(!format!("{credential_error:#}").contains(sentinel));
+
+        let token = format!(
+            r#"{{"access_token":"ACCESS_SENTINEL","token_type":"Bearer","expires_in":"{sentinel}","refresh_token":"REFRESH_SENTINEL"}}"#
+        );
+        let token_error = parse_untrusted_json::<TokenResponse>(
+            token.as_bytes(),
+            "OAuth token response is malformed",
+        )
+        .err()
+        .expect("token payload should be malformed");
+        let rendered = format!("{token_error:#}");
+        assert_eq!(rendered, "OAuth token response is malformed");
+        for secret in [sentinel, "ACCESS_SENTINEL", "REFRESH_SENTINEL"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn oauth_request_endpoint_requires_allowlisted_https_without_query_data() {
+        let origins = vec!["https://login.example".to_owned()];
+        let https = Url::parse("https://login.example/token").unwrap();
+        assert!(ValidatedHttpsEndpoint::new(&https, &origins).is_ok());
+
+        for rejected in [
+            "http://login.example/token",
+            "https://login.example/token?refresh_token=SECRET_SENTINEL",
+            "https://user:password@login.example/token",
+        ] {
+            let endpoint = Url::parse(rejected).unwrap();
+            assert!(ValidatedHttpsEndpoint::new(&endpoint, &origins).is_err());
+        }
+    }
 
     #[derive(Default)]
     pub struct MemoryStore(Mutex<Option<CredentialRecord>>);
