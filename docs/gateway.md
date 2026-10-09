@@ -78,6 +78,8 @@ Run repository `just` commands from the repository root. Run npm and Wrangler co
 2. Select a public target, inspect its existing ownership, and configure Cloudflare Access for the whole hostname **before publishing**. Enable Managed OAuth for human MCP clients and a Service Auth policy for host agents. See [Deployment target](#deployment-target). Keep `workers_dev = false`.
 3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, inspect pending migrations, and apply them using the pinned Wrangler from `fabric/`. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing knowledge, support, and supersession rows; review it against the target database before applying. Keep existing Durable Object class names and bindings when updating a deployed Worker.
 
+Apply the complete ordered D1 migration set, including `0006_browser_host_enrollment.sql`, before deploying a Worker build that contains browser enrollment. Legacy federated-host authorization now checks the grant table to reserve browser host IDs; if the table is missing or D1 cannot answer that check, the Worker deliberately rejects the host request. Do not deploy the Worker ahead of the migration, and do not treat a missing-table 401 as a host-token configuration problem.
+
 ```sh
 (cd fabric && npx wrangler d1 migrations list temote-observation --remote)
 (cd fabric && npx wrangler d1 migrations apply temote-observation --remote)
@@ -180,6 +182,33 @@ Do not remove or rewrite unrelated routes, DNS records, or Access policies as pa
 
 Configure named roots on the machine running the supervisor. Only root names are advertised to the gateway; physical paths remain local.
 
+### Browser-enrolled Host
+
+The browser flow uses the running Supervisor's configured roots and never adds or remaps a root. Start the Supervisor with the intended named roots in one terminal, then run one `temote fabric connect` command in another. It opens the system browser, verifies the signed-in owner with the Worker, asks you to confirm the Host identity and selected root names, then starts the existing outbound HTTPS Link. If the current Supervisor cannot provide the private root inventory/admission protocol, connect fails closed and explains that the Supervisor must be upgraded and restarted; it does not stop or reconfigure it.
+
+```sh
+# Supervisor terminal. The paths remain local to this machine.
+export TEMOTE_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
+temote-mcp supervisor
+
+# Link terminal. These are public endpoint/client settings, not credentials.
+temote fabric connect \
+  --gateway-url https://<gateway-host> \
+  --oauth-issuer https://<configured-access-issuer> \
+  --oauth-client-id <public-client-id> \
+  --host-id mac-main
+```
+
+The RFC 8707 resource defaults to the Fabric origin; set `--oauth-resource` only when the Access configuration requires another explicitly reviewed resource value. The CLI uses macOS Keychain or an available Linux Secret Service to persist one atomic credential record. Linux and Windows 11 under WSL2 require an already available Secret Service; other or unavailable secure stores fail closed. Browser mode uses the opaque OAuth bearer for Access and a separate Host-grant header for Worker authorization. It does not use the static host-token or Access Service Token variables below.
+
+Run `temote fabric logout` with the same gateway, issuer, client, and Host settings to revoke the remote Host grant before removing the secure credential record. If revocation cannot be confirmed, credentials stay stored so the operation can be retried. The browser enrollment grant expires after 90 days; reconnect verifies an existing saved profile and refreshes OAuth without another browser login when the grant remains valid. Reauthorization or root changes require explicit confirmation.
+
+The first browser-authenticated release exposes owner-filtered live Host/session operations under the approved roots. Cloud context, dashboard data, Fabric data, interaction, mentions, and observation replicas remain unavailable to browser identities until their owner/root namespace can be verified.
+
+### Existing static Host-token mode
+
+`temote fabric connect` and `temote fabric link` are aliases for the same lifecycle. With `TEMOTE_FABRIC_HOST_TOKEN` (or a supported legacy alias) configured, either command runs the existing static per-host token Link; without a Host token, either command starts browser enrollment. The static mode accepts the optional Access Service Token pair only when both values are configured. A service-token value without a Host token, or an incomplete pair, is an error. The existing `temote-mcp gateway-agent` command remains available for explicit static compatibility.
+
 macOS example:
 
 ```sh
@@ -191,17 +220,17 @@ export TEMOTE_FABRIC_ACCESS_CLIENT_ID='<Access service-token ID>'
 export TEMOTE_FABRIC_ACCESS_CLIENT_SECRET='<Access service-token secret>'
 
 temote-mcp supervisor
-temote fabric connect --host-id mac-main
+temote fabric link --host-id mac-main
 ```
 
-Run the supervisor and `fabric connect` in separate foreground terminals. `fabric connect` is also available as `temote-mcp gateway-agent`; both use the same reconnecting Host protocol. Existing `TEMOTE_MCP_GATEWAY_*` environment names remain supported as fallback aliases, while `TEMOTE_FABRIC_*` takes precedence. Check readiness with `temote fabric status`: it prints configuration, supervisor, remote endpoint identity, authorization, host lease/generation, and publicly usable session stages. It is read-only and exits unsuccessfully unless every stage is ready; credentials and remote response bodies are never printed. It uses a restricted local diagnostic request; if the running supervisor does not support that request, the local stage is unavailable and the CLI does not send a legacy maintenance probe.
+Run the supervisor and static `fabric link` in separate foreground terminals. `temote fabric link` is also available as `temote-mcp gateway-agent`; both use the same reconnecting Host protocol. Existing `TEMOTE_MCP_GATEWAY_*` environment names remain supported as fallback aliases, while `TEMOTE_FABRIC_*` takes precedence. Check readiness with `temote fabric status`: it prints configuration, supervisor, remote endpoint identity, authorization, host lease/generation, and publicly usable session stages. It is read-only and exits unsuccessfully unless every stage is ready; credentials and remote response bodies are never printed. It uses a restricted local diagnostic request; if the running supervisor does not support that request, the local stage is unavailable and the CLI does not send a legacy maintenance probe.
 
 Linux uses the same model with Linux paths. On Windows 11, run the supervisor and agent inside WSL2 and use WSL paths such as `/mnt/d/Developer`:
 
 ```sh
 export TEMOTE_ROOTS='{"src":"/mnt/d/Developer"}'
 temote-mcp supervisor
-temote fabric connect --host-id win-main --platform wsl2
+temote fabric link --host-id win-main --platform wsl2
 ```
 
 The existing host-level `gateway-agent --host-id` automatically sends bounded observation batches over its authenticated channel: at most 32 records or 512 KiB per batch, on a five-second loop with an eight-second sync request timeout. It writes locally first, so a Fabric timeout or authorization failure does not fail a delegated task or replay its backend operation. The agent scans retained session journals, including terminal observations created when the ordinary `task_get` polling observes completion, and persists an owner-only per-host, per-Fabric-endpoint, per-session cursor. It does not independently poll a backend after its caller stops polling. `committed_through_revision` records the highest source revision confirmed committed to D1; `acked_through_revision` is the contiguous source revision D1 can confirm. The delivered cursor can advance across a known gap so later retained records still sync, while the gap remains visible and `complete=false`. The source revision cursors are not cloud sequence numbers.

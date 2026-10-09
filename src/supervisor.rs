@@ -148,6 +148,55 @@ fn validate_repository_clone_destination(root: &Path, destination: &str) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "network")]
+fn fabric_session_id(arguments: &Value) -> Result<&str> {
+    let object = arguments
+        .as_object()
+        .context("browser session arguments must be an object")?;
+    anyhow::ensure!(
+        object.keys().all(|key| key == "session_id"),
+        "browser session operation accepts only session_id"
+    );
+    let session_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("browser session operation requires session_id")?;
+    config::validate_session_id(session_id)?;
+    Ok(session_id)
+}
+
+#[cfg(feature = "network")]
+fn validate_fabric_path_syntax(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !path.is_empty()
+            && path.len() <= 4096
+            && !path.starts_with('/')
+            && !path.contains('\\')
+            && !path.contains('\0')
+            && !path.to_ascii_lowercase().contains("%2f")
+            && !path.to_ascii_lowercase().contains("%5c"),
+        "browser session path is ambiguous or not root-relative"
+    );
+    let mut components = Path::new(path).components();
+    let first = components
+        .next()
+        .context("browser session path must start with a named root")?;
+    let Component::Normal(root) = first else {
+        anyhow::bail!("browser session path must start with a named root");
+    };
+    let root = root
+        .to_str()
+        .context("browser named root is not valid UTF-8")?;
+    crate::named_roots::validate_root_name(root)?;
+    for component in components {
+        anyhow::ensure!(
+            matches!(component, Component::Normal(_)),
+            "browser session path cannot contain . or .. components"
+        );
+    }
+    Ok(())
+}
+
 fn validate_repository_clone_session(
     snapshot: &config::Session,
     canonical_root: &Path,
@@ -606,6 +655,37 @@ async fn run_cloud_pending_observer(
     }
 }
 
+#[cfg(feature = "network")]
+fn validate_fabric_session_binding(
+    expected: &crate::fabric_browser::BrowserSessionBinding,
+    session_id: &str,
+    current_instance: Uuid,
+) -> Result<()> {
+    anyhow::ensure!(
+        expected.session_id == session_id,
+        "Worker session binding does not match the routed session_id"
+    );
+    anyhow::ensure!(
+        expected.session_instance == current_instance.to_string(),
+        "browser request targets a replaced session instance"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "network")]
+async fn run_fabric_session_operation<F, T>(
+    expected: &crate::fabric_browser::BrowserSessionBinding,
+    session_id: &str,
+    current_instance: Uuid,
+    operation: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    validate_fabric_session_binding(expected, session_id, current_instance)?;
+    operation.await
+}
+
 impl SessionSupervisor {
     #[cfg(feature = "network")]
     async fn stop_cloud_pending_observer(&self) {
@@ -658,6 +738,434 @@ impl SessionSupervisor {
 
     pub fn named_root_names(&self) -> Vec<String> {
         self.roots.names()
+    }
+
+    #[cfg(feature = "network")]
+    pub(crate) fn fabric_inventory(
+        &self,
+    ) -> Result<crate::fabric_browser::LocalSupervisorInventory> {
+        let mut roots = Vec::new();
+        for name in self.roots.names() {
+            let canonical_path = self
+                .roots
+                .canonical_root(&name)
+                .context("Supervisor named-root inventory is inconsistent")?
+                .to_owned();
+            let metadata = std::fs::metadata(&canonical_path)
+                .context("Supervisor named-root inventory is unavailable")?;
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "Supervisor named root is not a directory"
+            );
+            #[cfg(unix)]
+            let (device, inode) = {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            };
+            #[cfg(not(unix))]
+            let (device, inode) = (0, 0);
+            roots.push(crate::fabric_browser::LocalRootIdentity {
+                name,
+                canonical_path,
+                device,
+                inode,
+            });
+        }
+        Ok(crate::fabric_browser::LocalSupervisorInventory {
+            host_id: crate::host_identity::resolve()?,
+            boot_generation: crate::boot_identity::generation().to_owned(),
+            control_protocol: crate::session_control::CONTROL_PROTOCOL_VERSION,
+            roots,
+        })
+    }
+
+    #[cfg(feature = "network")]
+    fn validate_fabric_authority(
+        &self,
+        authority: &crate::fabric_browser::FabricAuthority,
+    ) -> Result<()> {
+        crate::fabric_browser::validate_fabric_authority_proof(authority)?;
+        anyhow::ensure!(
+            authority.host_id == crate::host_identity::resolve()?,
+            "browser Host scope belongs to a different local Host"
+        );
+        anyhow::ensure!(
+            authority.supervisor_boot_generation == crate::boot_identity::generation(),
+            "Supervisor instance changed; reconnect the browser Link"
+        );
+        let inventory = self.fabric_inventory()?;
+        let current = crate::fabric_browser::inventory_root_fingerprints(
+            &inventory,
+            &authority.local_hmac_key,
+        )?;
+        anyhow::ensure!(
+            current == authority.root_fingerprints,
+            "named-root identity changed; reconnect and explicitly reapprove root scope"
+        );
+        let registry =
+            crate::fabric_browser::root_registry_fingerprint(&authority.local_hmac_key, &current)?;
+        anyhow::ensure!(
+            registry == authority.root_registry_fingerprint,
+            "Supervisor root registry changed; reconnect and explicitly reapprove root scope"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    fn authorize_fabric_root(
+        &self,
+        authority: &crate::fabric_browser::FabricAuthority,
+        logical_path: &str,
+        canonical_path: &Path,
+    ) -> Result<String> {
+        let actual = self
+            .roots
+            .reverse_resolve(canonical_path)?
+            .context("session path is outside the current named-root inventory")?;
+        let root = actual
+            .split('/')
+            .next()
+            .context("session root identity is invalid")?;
+        anyhow::ensure!(
+            authority
+                .approved_roots
+                .iter()
+                .any(|approved| approved == root),
+            "actual nested named root is not in the browser-approved scope"
+        );
+        anyhow::ensure!(
+            authority.root_fingerprints.contains_key(root),
+            "actual named-root identity is not present in the browser scope"
+        );
+        let requested_root = Path::new(logical_path)
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .context("session path must start with a named root")?;
+        anyhow::ensure!(
+            requested_root == root,
+            "requested root differs from the most-specific canonical named root"
+        );
+        Ok(actual)
+    }
+
+    #[cfg(feature = "network")]
+    async fn authorize_fabric_session(
+        &self,
+        authority: &crate::fabric_browser::FabricAuthority,
+        session_id: &str,
+    ) -> Result<(config::Session, String, Uuid)> {
+        config::validate_session_id(session_id)?;
+        let runtime = self.sessions.lock().await;
+        let handle = runtime.get(session_id).context(
+            "browser-scoped operation requires a session owned by this Supervisor instance",
+        )?;
+        anyhow::ensure!(
+            !handle.is_finished(),
+            "browser-scoped session is not active"
+        );
+        let instance = handle
+            .activity_session_instance()
+            .context("Supervisor cannot prove the session instance")?;
+        let owned = handle.session_metadata();
+        drop(runtime);
+        anyhow::ensure!(
+            !owned.yolo(),
+            "browser-scoped operations cannot address local yolo sessions"
+        );
+        let stored = config::read_session_metadata(session_id).await?;
+        anyhow::ensure!(
+            stored.id == owned.id
+                && stored.process_id == owned.process_id
+                && stored.started_at == owned.started_at
+                && stored.cwd == owned.cwd,
+            "session instance changed during browser admission"
+        );
+        let cwd = config::canonical_directory(&stored.cwd)?;
+        anyhow::ensure!(cwd == stored.cwd, "session workspace identity changed");
+        let logical = self
+            .roots
+            .reverse_resolve(&cwd)?
+            .context("session is not classifiable under a configured named root")?;
+        let root = logical
+            .split('/')
+            .next()
+            .context("session root identity is invalid")?;
+        anyhow::ensure!(
+            authority
+                .approved_roots
+                .iter()
+                .any(|approved| approved == root)
+                && authority.root_fingerprints.contains_key(root),
+            "session is outside the browser-approved root scope"
+        );
+        Ok((stored, logical, instance))
+    }
+
+    #[cfg(feature = "network")]
+    pub(crate) async fn fabric_tool(
+        &self,
+        authority: crate::fabric_browser::FabricAuthority,
+        tool: &str,
+        arguments: Value,
+        expected_session: Option<crate::fabric_browser::BrowserSessionBinding>,
+    ) -> Result<Value> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        self.validate_fabric_authority(&authority)?;
+        let requires_binding = matches!(
+            tool,
+            "session_info"
+                | "session_stop"
+                | "session_restart"
+                | "codex_status"
+                | "codex_task_start"
+                | "codex_task_get"
+                | "codex_task_control"
+                | "evidence_read"
+                | "task_list"
+                | "poll_job"
+                | "job_list"
+                | "stop_job"
+        );
+        if requires_binding {
+            let expected = expected_session
+                .as_ref()
+                .context("Worker omitted the live session instance binding")?;
+            let session_id = arguments
+                .get("session_id")
+                .and_then(Value::as_str)
+                .context("browser-scoped operation requires session_id")?;
+            anyhow::ensure!(
+                expected.session_id == session_id,
+                "Worker session binding does not match the routed session_id"
+            );
+        } else {
+            anyhow::ensure!(
+                expected_session.is_none(),
+                "unexpected session instance binding"
+            );
+        }
+        match tool {
+            "session_list" => {
+                anyhow::ensure!(
+                    arguments
+                        .as_object()
+                        .is_some_and(|object| object.is_empty()),
+                    "session_list accepts no local arguments"
+                );
+                let sessions = self.sessions.lock().await;
+                let mut result = Vec::new();
+                for (session_id, handle) in sessions.iter() {
+                    if handle.is_finished() {
+                        continue;
+                    }
+                    let session = handle.session_metadata();
+                    let Some(instance) = handle.activity_session_instance() else {
+                        continue;
+                    };
+                    if session.yolo()
+                        || !config::session_is_active(session_id).await.unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let Ok(cwd) = config::canonical_directory(&session.cwd) else {
+                        continue;
+                    };
+                    if cwd != session.cwd {
+                        continue;
+                    }
+                    let Ok(Some(logical)) = self.roots.reverse_resolve(&cwd) else {
+                        continue;
+                    };
+                    let root = logical.split('/').next().unwrap_or_default();
+                    if !authority
+                        .approved_roots
+                        .iter()
+                        .any(|approved| approved == root)
+                        || !authority.root_fingerprints.contains_key(root)
+                    {
+                        continue;
+                    }
+                    result.push(json!({
+                        "session_id": session.id,
+                        "status": "active",
+                        "root_name": root,
+                        "logical_path": logical,
+                        "session_instance": instance,
+                    }));
+                }
+                result.sort_by(|left, right| {
+                    left["session_id"]
+                        .as_str()
+                        .cmp(&right["session_id"].as_str())
+                });
+                Ok(json!(result))
+            }
+            "session_start" => {
+                let object = arguments
+                    .as_object()
+                    .context("session_start arguments must be an object")?;
+                anyhow::ensure!(
+                    object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "path" | "session_id")),
+                    "browser session_start accepts only path and session_id"
+                );
+                let path = object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("session_start path is required")?;
+                validate_fabric_path_syntax(path)?;
+                let cwd = self.roots.resolve(path)?;
+                self.validate_fabric_authority(&authority)?;
+                let logical = self.authorize_fabric_root(&authority, path, &cwd)?;
+                let session_id = object
+                    .get("session_id")
+                    .map(|value| value.as_str().context("session_id must be a string"))
+                    .transpose()?;
+                let id = config::session_id(session_id)?;
+                let info = self
+                    .start_resolved_with_authority(
+                        cwd,
+                        id,
+                        config::PermissionMode::Agent,
+                        Some(logical.clone()),
+                        approvals::CapturedStartEnvironment::default(),
+                        true,
+                        Uuid::new_v4(),
+                        Some(&authority),
+                    )
+                    .await?;
+                Ok(json!({
+                    "session_id": info.session_id,
+                    "status": info.status,
+                    "permission_mode": info.permission_mode,
+                    "yolo": false,
+                    "root_name": logical.split('/').next().unwrap_or_default(),
+                    "logical_path": logical,
+                }))
+            }
+            "session_info" => {
+                let session_id = fabric_session_id(&arguments)?;
+                let (session, logical, instance) = self
+                    .authorize_fabric_session(&authority, session_id)
+                    .await?;
+                let expected = expected_session
+                    .as_ref()
+                    .context("Worker omitted the live session instance binding")?;
+                run_fabric_session_operation(expected, session_id, instance, async {
+                    let view =
+                        crate::session_control::inspect_session_read_only(session_id).await?;
+                    anyhow::ensure!(
+                        view.process_id == session.process_id && view.cwd == session.cwd,
+                        "session instance changed during browser admission"
+                    );
+                    Ok(json!({
+                        "session_id": session.id,
+                        "status": view.status,
+                        "root_name": logical.split('/').next().unwrap_or_default(),
+                        "logical_path": logical,
+                        "session_instance": instance,
+                        "permission_mode": view.permission_mode,
+                        "yolo": false,
+                        "started_at": view.started_at,
+                    }))
+                })
+                .await
+            }
+            "session_stop" => {
+                let session_id = fabric_session_id(&arguments)?;
+                let (_, _, instance) = self
+                    .authorize_fabric_session(&authority, session_id)
+                    .await?;
+                let expected = expected_session
+                    .as_ref()
+                    .context("Worker omitted the live session instance binding")?;
+                run_fabric_session_operation(expected, session_id, instance, async {
+                    self.stop_owned_validated(session_id, false).await?;
+                    Ok(json!({"session_id": session_id, "status": "stopped"}))
+                })
+                .await
+            }
+            "session_restart" => {
+                let session_id = fabric_session_id(&arguments)?;
+                let (session, logical, instance) = self
+                    .authorize_fabric_session(&authority, session_id)
+                    .await?;
+                let expected = expected_session
+                    .as_ref()
+                    .context("Worker omitted the live session instance binding")?;
+                run_fabric_session_operation(expected, session_id, instance, async {
+                    let cwd = config::canonical_directory(&session.cwd)?;
+                    self.validate_fabric_authority(&authority)?;
+                    self.authorize_fabric_root(&authority, &logical, &cwd)?;
+                    begin_agent_session_shutdown(&session);
+                    self.stop_owned_validated(session_id, false).await?;
+                    let info = self
+                        .start_resolved_with_authority(
+                            cwd,
+                            session_id.to_owned(),
+                            session.permission_mode,
+                            Some(logical.clone()),
+                            approvals::CapturedStartEnvironment::default(),
+                            true,
+                            Uuid::new_v4(),
+                            Some(&authority),
+                        )
+                        .await?;
+                    Ok(json!({
+                        "session_id": info.session_id,
+                        "status": info.status,
+                        "permission_mode": info.permission_mode,
+                        "yolo": false,
+                        "root_name": logical.split('/').next().unwrap_or_default(),
+                        "logical_path": logical,
+                    }))
+                })
+                .await
+            }
+            "codex_status" | "codex_task_start" | "codex_task_get" | "codex_task_control"
+            | "evidence_read" | "task_list" | "poll_job" | "job_list" | "stop_job" => {
+                let session_id = arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .context("browser-scoped operation requires session_id")?
+                    .to_owned();
+                let (session, _, instance) = self
+                    .authorize_fabric_session(&authority, &session_id)
+                    .await?;
+                let expected = expected_session
+                    .as_ref()
+                    .context("Worker omitted the live session instance binding")?;
+                // Keep the Supervisor transition lock held across the exact
+                // binding check and dispatch so a reused id cannot start work.
+                run_fabric_session_operation(expected, &session_id, instance, async move {
+                    self.validate_fabric_authority(&authority)?;
+                    crate::mcp::dispatch_browser_scoped_tool(tool, arguments, &session).await
+                })
+                .await
+            }
+            _ => anyhow::bail!("tool is unavailable for browser-enrolled Hosts"),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub(crate) async fn fabric_verify_session(
+        &self,
+        authority: crate::fabric_browser::FabricAuthority,
+        expected: crate::fabric_browser::BrowserSessionBinding,
+    ) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        self.validate_fabric_authority(&authority)?;
+        let (_, _, instance) = self
+            .authorize_fabric_session(&authority, &expected.session_id)
+            .await?;
+        validate_fabric_session_binding(&expected, &expected.session_id, instance)?;
+        Ok(())
     }
 
     pub fn approval_sender(&self) -> ApprovalSender {
@@ -1728,6 +2236,32 @@ impl SessionSupervisor {
         public: bool,
         activity_instance_id: Uuid,
     ) -> Result<ManagedSessionInfo> {
+        self.start_resolved_with_authority(
+            cwd,
+            id,
+            permission_mode,
+            logical_path,
+            environment,
+            public,
+            activity_instance_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_resolved_with_authority(
+        &self,
+        cwd: std::path::PathBuf,
+        id: String,
+        permission_mode: config::PermissionMode,
+        logical_path: Option<String>,
+        environment: approvals::CapturedStartEnvironment,
+        public: bool,
+        activity_instance_id: Uuid,
+        #[cfg(feature = "network")] authority: Option<&crate::fabric_browser::FabricAuthority>,
+        #[cfg(not(feature = "network"))] _authority: Option<&()>,
+    ) -> Result<ManagedSessionInfo> {
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
             "session supervisor is shutting down; new sessions are disabled"
@@ -1809,6 +2343,17 @@ impl SessionSupervisor {
                 self.roots.resolve(path)? == cwd,
                 "session named root changed during admission"
             );
+        }
+        #[cfg(feature = "network")]
+        if let Some(authority) = authority {
+            self.validate_fabric_authority(authority)?;
+            self.authorize_fabric_root(
+                authority,
+                logical_path
+                    .as_deref()
+                    .context("browser session start has no named-root path")?,
+                &cwd,
+            )?;
         }
 
         let spec = RestartSpec {
@@ -3161,6 +3706,53 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn browser_session_binding_rejects_reused_id_before_dispatch_and_before_response() {
+        let old_instance = Uuid::new_v4();
+        let replacement_instance = Uuid::new_v4();
+        let binding = crate::fabric_browser::BrowserSessionBinding {
+            session_id: "same-session-id".to_owned(),
+            session_instance: old_instance.to_string(),
+        };
+        let mut backend_starts = 0;
+        let captured_before_replacement = run_fabric_session_operation(
+            &binding,
+            "same-session-id",
+            replacement_instance,
+            async {
+                backend_starts += 1;
+                Ok("started")
+            },
+        )
+        .await;
+        assert!(captured_before_replacement.is_err());
+        assert_eq!(
+            backend_starts, 0,
+            "a reused id must fail admission before task backend side effects"
+        );
+
+        // Dispatch is admitted against the captured instance, but a replacement
+        // before response upload prevents the result from reaching the caller.
+        let accepted =
+            run_fabric_session_operation(&binding, "same-session-id", old_instance, async {
+                backend_starts += 1;
+                Ok(json!({"text":"result for original instance"}))
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend_starts, 1);
+        let response_valid =
+            validate_fabric_session_binding(&binding, "same-session-id", replacement_instance)
+                .is_ok();
+        assert!(!response_valid);
+        let returned = response_valid.then_some(accepted);
+        assert!(
+            returned.is_none(),
+            "stale result must be discarded before upload"
+        );
+    }
 
     #[test]
     fn provisioning_model_uses_visible_catalog_default_and_advertised_effort() {

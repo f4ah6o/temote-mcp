@@ -1584,6 +1584,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "seccompiler",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",

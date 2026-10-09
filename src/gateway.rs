@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -112,7 +112,7 @@ type CompletedGatewayRequest =
 
 enum PollOutcome {
     Idle,
-    Request(PollEnvelope),
+    Request(Box<PollEnvelope>),
     Exit(GenerationExit),
 }
 
@@ -143,6 +143,8 @@ struct AgentGeneration {
     generation: u64,
     capacity: AgentCapacity,
     admission: Arc<AtomicBool>,
+    browser_authority: Option<crate::fabric_browser::FabricAuthority>,
+    worker_auth: Option<crate::fabric_browser::WorkerAuthSnapshot>,
 }
 
 struct GenerationAdmissionGuard(Arc<AtomicBool>);
@@ -166,6 +168,15 @@ pub(crate) struct GatewayClient {
     pub(crate) host_token: String,
     pub(crate) access_client_id: Option<String>,
     pub(crate) access_client_secret: Option<String>,
+    pub(crate) browser_auth: Option<Arc<RwLock<BrowserWireAuth>>>,
+    pub(crate) browser_auth_blocked: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserWireAuth {
+    access_token: String,
+    host_grant: String,
+    access_expires_at: u64,
 }
 
 #[derive(Serialize)]
@@ -209,6 +220,8 @@ struct HostConnectRequest<'a> {
     control_protocol: u64,
     capabilities: &'a [&'static str],
     named_roots: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _fabric_auth: Option<&'a crate::fabric_browser::WorkerAuthSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +245,8 @@ struct HostGenerationRequest<'a> {
     host_id: &'a str,
     instance_id: &'a str,
     generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _fabric_auth: Option<&'a crate::fabric_browser::WorkerAuthSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -243,6 +258,8 @@ struct HostPollRequest<'a> {
     session_availability: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     accept_requests: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _fabric_auth: Option<&'a crate::fabric_browser::WorkerAuthSnapshot>,
 }
 
 /// Bounded, non-secret session availability the host agent reports to the
@@ -296,6 +313,10 @@ async fn current_host_session_availability() -> HostSessionAvailability {
 struct PollEnvelope {
     request_id: String,
     request: Value,
+    #[serde(default)]
+    _fabric_auth: Option<crate::fabric_browser::WorkerAuthSnapshot>,
+    #[serde(default)]
+    _fabric_session: Option<crate::fabric_browser::BrowserSessionBinding>,
 }
 
 #[derive(Serialize)]
@@ -314,6 +335,10 @@ struct HostResponseRequest<'a> {
     generation: u64,
     request_id: &'a str,
     response: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _fabric_auth: Option<&'a crate::fabric_browser::WorkerAuthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _fabric_session: Option<&'a crate::fabric_browser::BrowserSessionBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +376,8 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
         host_token: options.host_token,
         access_client_id: options.access_client_id,
         access_client_secret: options.access_client_secret,
+        browser_auth: None,
+        browser_auth_blocked: None,
     };
     let reconnect_delay = if options.reconnect_delay.is_zero() {
         DEFAULT_RECONNECT_DELAY
@@ -361,7 +388,15 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
     let instance_id = Uuid::new_v4().to_string();
 
     if let Some(host_id) = options.host_id {
-        return run_host_agent(&gateway, &host_id, &instance_id, platform, reconnect_delay).await;
+        return run_host_agent(
+            &gateway,
+            &host_id,
+            &instance_id,
+            platform,
+            reconnect_delay,
+            None,
+        )
+        .await;
     }
 
     run_legacy_agent(
@@ -375,6 +410,146 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
         reconnect_delay,
     )
     .await
+}
+
+pub(crate) async fn run_browser_link_with_lease(
+    protocol: crate::fabric_browser::BrowserOAuth,
+    prepared: crate::fabric_browser::PreparedBrowserLink,
+    _link_lease: crate::fabric_browser::ProfileLock,
+) -> Result<()> {
+    prepared
+        .record
+        .validate_for_link(&prepared.record.gateway_origin)?;
+    validate_federated_platform(detected_platform())?;
+    let browser_auth = Arc::new(RwLock::new(BrowserWireAuth {
+        access_token: prepared.record.oauth_access_token.clone(),
+        host_grant: prepared.record.grant_secret.clone(),
+        access_expires_at: prepared.record.access_expires_at,
+    }));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let gateway = GatewayClient {
+        client: Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to create browser Link HTTP client")?,
+        sync_client: Client::builder()
+            .timeout(OBSERVATION_SYNC_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to create browser Link sync client")?,
+        base_url: normalize_gateway_url(&protocol.options.gateway_url)?,
+        host_token: String::new(),
+        access_client_id: None,
+        access_client_secret: None,
+        browser_auth: Some(browser_auth.clone()),
+        browser_auth_blocked: Some(blocked.clone()),
+    };
+    let refresh_task = tokio::spawn(run_browser_refresh_manager(
+        protocol,
+        prepared.profile.clone(),
+        prepared.record.owner_key.clone(),
+        prepared.record.host_id.clone(),
+        prepared.record.grant_id.clone(),
+        prepared.authority.grant_generation,
+        browser_auth,
+        blocked,
+    ));
+    let result = run_host_agent(
+        &gateway,
+        &prepared.record.host_id,
+        &Uuid::new_v4().to_string(),
+        detected_platform(),
+        DEFAULT_RECONNECT_DELAY,
+        Some(prepared.authority),
+    )
+    .await;
+    refresh_task.abort();
+    let _ = refresh_task.await;
+    result
+}
+
+// Keep each refresh authority and lifecycle signal explicit in this security boundary.
+#[allow(clippy::too_many_arguments)]
+async fn run_browser_refresh_manager(
+    protocol: crate::fabric_browser::BrowserOAuth,
+    profile: String,
+    owner_key: String,
+    host_id: String,
+    grant_id: String,
+    grant_generation: u64,
+    browser_auth: Arc<RwLock<BrowserWireAuth>>,
+    blocked: Arc<AtomicBool>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if blocked.load(Ordering::SeqCst) {
+            return;
+        }
+        let should_refresh = browser_auth
+            .read()
+            .map(|auth| {
+                auth.access_expires_at <= crate::fabric_browser::unix_now().saturating_add(90)
+            })
+            .unwrap_or(true);
+        if !should_refresh {
+            continue;
+        }
+        let transition = match crate::fabric_browser::ProfileLock::transition(&profile) {
+            Ok(lock) => lock,
+            Err(_) => {
+                blocked.store(true, Ordering::SeqCst);
+                eprintln!("browser OAuth refresh halted: code=credential_lock");
+                return;
+            }
+        };
+        let store = match crate::fabric_browser::OsCredentialStore::open_profile(&profile) {
+            Ok(store) => store,
+            Err(_) => {
+                blocked.store(true, Ordering::SeqCst);
+                eprintln!("browser OAuth refresh halted: code=secure_store_unavailable");
+                return;
+            }
+        };
+        let mut record = match crate::fabric_browser::CredentialStore::load(&store) {
+            Ok(Some(record)) => record,
+            _ => {
+                blocked.store(true, Ordering::SeqCst);
+                eprintln!("browser OAuth refresh halted: code=credential_record_unavailable");
+                return;
+            }
+        };
+        if record.owner_key != owner_key
+            || record.host_id != host_id
+            || record.grant_id != grant_id
+            || record.grant_generation != grant_generation
+        {
+            blocked.store(true, Ordering::SeqCst);
+            eprintln!("browser OAuth refresh halted: code=grant_snapshot_changed");
+            return;
+        }
+        if crate::fabric_browser::refresh_record_for_link(&mut record, &store, &protocol)
+            .await
+            .is_err()
+        {
+            blocked.store(true, Ordering::SeqCst);
+            eprintln!("browser OAuth refresh halted: code=refresh_or_commit_failed");
+            return;
+        }
+        match browser_auth.write() {
+            Ok(mut auth) => {
+                auth.access_token = record.oauth_access_token;
+                auth.host_grant = record.grant_secret;
+                auth.access_expires_at = record.access_expires_at;
+            }
+            Err(_) => {
+                blocked.store(true, Ordering::SeqCst);
+                eprintln!("browser OAuth refresh halted: code=credential_state_unavailable");
+                return;
+            }
+        }
+        drop(transition);
+    }
 }
 
 async fn run_legacy_agent(
@@ -468,31 +643,44 @@ async fn run_host_agent(
     instance_id: &str,
     platform: &str,
     reconnect_delay: Duration,
+    browser_authority: Option<crate::fabric_browser::FabricAuthority>,
 ) -> Result<()> {
     validate_federated_platform(platform)?;
     let host_id = host_identity::validate(host_id)?;
+    let worker_auth =
+        browser_authority
+            .as_ref()
+            .map(|authority| crate::fabric_browser::WorkerAuthSnapshot {
+                mode: "browser".to_owned(),
+                owner_key: authority.owner_key.clone(),
+                grant_id: authority.grant_id.clone(),
+                grant_generation: authority.grant_generation,
+                approved_roots: authority.approved_roots.clone(),
+            });
     let sessions = session_control::SessionBackend::local_control().await?;
     let (activity_sender, mut activity_receiver) = tokio::sync::mpsc::channel(128);
-    let activity_host_id = host_id.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) =
-                session_control::follow_lifecycle_activity(activity_sender.clone()).await
-            {
-                eprintln!("Fabric lifecycle activity reconnecting: {error:#}");
+    if browser_authority.is_none() {
+        let activity_host_id = host_id.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) =
+                    session_control::follow_lifecycle_activity(activity_sender.clone()).await
+                {
+                    eprintln!("Fabric lifecycle activity reconnecting: {error:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-    tokio::spawn(async move {
-        while let Some(event) = activity_receiver.recv().await {
-            if let Err(error) =
-                crate::events_host::record_lifecycle(&event, &activity_host_id).await
-            {
-                eprintln!("Fabric lifecycle transition deferred: {error:#}");
+        });
+        tokio::spawn(async move {
+            while let Some(event) = activity_receiver.recv().await {
+                if let Err(error) =
+                    crate::events_host::record_lifecycle(&event, &activity_host_id).await
+                {
+                    eprintln!("Fabric lifecycle transition deferred: {error:#}");
+                }
             }
-        }
-    });
+        });
+    }
 
     eprintln!(
         "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
@@ -503,6 +691,15 @@ async fn run_host_agent(
     tokio::pin!(ctrl_c);
     let mut requests = GatewayRequests::new();
     loop {
+        if gateway
+            .browser_auth_blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.load(Ordering::SeqCst))
+        {
+            anyhow::bail!(
+                "browser OAuth state is uncertain; Link has halted and requires interactive recovery"
+            );
+        }
         let metadata = tokio::select! {
             result = sessions.status() => result
                 .context("local supervisor is unavailable")
@@ -531,6 +728,7 @@ async fn run_host_agent(
                 instance_id,
                 platform,
                 &metadata,
+                worker_auth.as_ref(),
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -554,10 +752,17 @@ async fn run_host_agent(
             connection.host_id,
             connection.generation,
             connection.lease_seconds,
-            if metadata.named_roots.is_empty() {
+            if worker_auth
+                .as_ref()
+                .map_or(&metadata.named_roots, |auth| &auth.approved_roots)
+                .is_empty()
+            {
                 "(none)".to_owned()
             } else {
-                metadata.named_roots.join(",")
+                worker_auth
+                    .as_ref()
+                    .map_or(&metadata.named_roots, |auth| &auth.approved_roots)
+                    .join(",")
             }
         );
         let connection_record =
@@ -580,6 +785,8 @@ async fn run_host_agent(
                     generation: connection.generation,
                     capacity: AgentCapacity::negotiated(connection.concurrent_requests),
                     admission: Arc::new(AtomicBool::new(true)),
+                    browser_authority: browser_authority.clone(),
+                    worker_auth: worker_auth.clone(),
                 },
                 &mut requests,
             ) => result,
@@ -590,6 +797,7 @@ async fn run_host_agent(
                     &host_id,
                     instance_id,
                     connection.generation,
+                    worker_auth.as_ref(),
                 ).await;
                 eprintln!("Stopping gateway agent for host {host_id}");
                 return Ok(());
@@ -597,6 +805,15 @@ async fn run_host_agent(
         };
 
         log_generation_outcome(outcome, connection.generation);
+        if gateway
+            .browser_auth_blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.load(Ordering::SeqCst))
+        {
+            anyhow::bail!(
+                "browser OAuth state is uncertain; Link has halted and requires interactive recovery"
+            );
+        }
         if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
             return Ok(());
         }
@@ -798,6 +1015,7 @@ async fn connect_host(
     instance_id: &str,
     platform: &str,
     metadata: &HostSupervisorMetadata,
+    worker_auth: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
 ) -> Result<HostConnectResponse> {
     let response = gateway
         .request(Method::POST, "/v1/hosts/connect", Some(host_id))
@@ -806,6 +1024,7 @@ async fn connect_host(
             instance_id,
             platform,
             metadata,
+            worker_auth,
         ))
         .send()
         .await
@@ -840,6 +1059,8 @@ async fn run_legacy_generation(
             generation,
             capacity,
             admission: Arc::new(AtomicBool::new(true)),
+            browser_authority: None,
+            worker_auth: None,
         },
         requests,
     )
@@ -853,41 +1074,48 @@ async fn run_host_generation(
     let AgentRoute::Host { host_id, .. } = &context.route else {
         anyhow::bail!("host generation requires a host route");
     };
-    let gateway_for_sync = context.gateway.clone();
-    let host_id_for_sync = host_id.clone();
-    let generation = context.generation;
-    let sync_task = tokio::spawn(async move {
-        run_host_observation_sync(&gateway_for_sync, &host_id_for_sync).await;
-    });
-    let gateway_for_events = context.gateway.clone();
-    let host_id_for_events = host_id.clone();
-    let instance_id_for_events = context.instance_id.clone();
-    let event_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
-        loop {
-            interval.tick().await;
-            match tokio::time::timeout(
-                Duration::from_secs(8),
-                crate::events_host::deliver_pending(
-                    &gateway_for_events,
-                    &host_id_for_events,
-                    &instance_id_for_events,
-                    generation,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("Fabric event delivery deferred: {error:#}"),
-                Err(_) => eprintln!("Fabric event delivery deferred: batch_timeout"),
+    let side_tasks = if context.browser_authority.is_none() {
+        let gateway_for_sync = context.gateway.clone();
+        let host_id_for_sync = host_id.clone();
+        let generation = context.generation;
+        let sync_task = tokio::spawn(async move {
+            run_host_observation_sync(&gateway_for_sync, &host_id_for_sync).await;
+        });
+        let gateway_for_events = context.gateway.clone();
+        let host_id_for_events = host_id.clone();
+        let instance_id_for_events = context.instance_id.clone();
+        let event_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    crate::events_host::deliver_pending(
+                        &gateway_for_events,
+                        &host_id_for_events,
+                        &instance_id_for_events,
+                        generation,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("Fabric event delivery deferred: {error:#}"),
+                    Err(_) => eprintln!("Fabric event delivery deferred: batch_timeout"),
+                }
             }
-        }
-    });
+        });
+        Some((sync_task, event_task))
+    } else {
+        None
+    };
     let result = run_agent_generation(context, requests).await;
-    sync_task.abort();
-    let _ = sync_task.await;
-    event_task.abort();
-    let _ = event_task.await;
+    if let Some((sync_task, event_task)) = side_tasks {
+        sync_task.abort();
+        let _ = sync_task.await;
+        event_task.abort();
+        let _ = event_task.await;
+    }
     result
 }
 
@@ -989,7 +1217,7 @@ where
                     accept_requests,
                     "gateway sent a request to a saturated agent"
                 );
-                let request = dispatch(envelope);
+                let request = dispatch(*envelope);
                 requests.spawn(async move { (generation, request.await) });
             }
             PollOutcome::Exit(exit) => return Ok(exit),
@@ -1079,6 +1307,14 @@ impl AgentGeneration {
                 sessions,
                 metadata,
             } => {
+                if self
+                    .gateway
+                    .browser_auth_blocked
+                    .as_ref()
+                    .is_some_and(|blocked| blocked.load(Ordering::SeqCst))
+                {
+                    return Ok(Some(GenerationExit::Disconnected));
+                }
                 verify_host_generation_metadata(
                     &self.gateway,
                     sessions,
@@ -1086,6 +1322,7 @@ impl AgentGeneration {
                     &self.instance_id,
                     self.generation,
                     metadata,
+                    self.worker_auth.as_ref(),
                 )
                 .await
             }
@@ -1093,6 +1330,14 @@ impl AgentGeneration {
     }
 
     async fn poll(&self, accept_requests: bool) -> Result<PollOutcome> {
+        if self
+            .gateway
+            .browser_auth_blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.load(Ordering::SeqCst))
+        {
+            return Ok(PollOutcome::Exit(GenerationExit::Disconnected));
+        }
         if let Some(exit) = self.verify().await? {
             return Ok(PollOutcome::Exit(exit));
         }
@@ -1111,13 +1356,33 @@ impl AgentGeneration {
                 accept_requests,
             }),
             AgentRoute::Host { host_id, .. } => {
-                let availability = current_host_session_availability().await;
+                let availability = if let (Some(authority), AgentRoute::Host { sessions, .. }) =
+                    (self.browser_authority.as_ref(), &self.route)
+                {
+                    match sessions
+                        .fabric_tool(authority.clone(), "session_list", json!({}), None)
+                        .await
+                    {
+                        Ok(value)
+                            if value
+                                .as_array()
+                                .is_some_and(|sessions| !sessions.is_empty()) =>
+                        {
+                            HostSessionAvailability::Ready
+                        }
+                        Ok(_) => HostSessionAvailability::SessionUnavailable,
+                        Err(_) => HostSessionAvailability::Unavailable,
+                    }
+                } else {
+                    current_host_session_availability().await
+                };
                 request.json(&HostPollRequest {
                     host_id,
                     instance_id: &self.instance_id,
                     generation: self.generation,
                     session_availability: Some(availability.as_str()),
                     accept_requests,
+                    _fabric_auth: self.worker_auth.as_ref(),
                 })
             }
         };
@@ -1166,16 +1431,69 @@ impl AgentGeneration {
         let response = match &self.route {
             AgentRoute::Legacy { .. } => dispatch_response(&envelope.request).await,
             AgentRoute::Host { sessions, .. } => {
-                dispatch_host_response(&envelope.request, sessions).await
+                if let Some(authority) = &self.browser_authority {
+                    anyhow::ensure!(
+                        same_worker_grant(
+                            envelope._fabric_auth.as_ref(),
+                            self.worker_auth.as_ref()
+                        ),
+                        "Worker authorization snapshot changed during the long poll"
+                    );
+                    dispatch_browser_host_response(
+                        &envelope.request,
+                        sessions,
+                        authority,
+                        envelope._fabric_session.as_ref(),
+                    )
+                    .await
+                } else {
+                    dispatch_host_response(&envelope.request, sessions).await
+                }
             }
         };
-        self.upload_response(&envelope.request_id, &response).await
+        if let (Some(authority), Some(binding), AgentRoute::Host { sessions, .. }) = (
+            self.browser_authority.as_ref(),
+            envelope._fabric_session.as_ref(),
+            &self.route,
+        ) {
+            let name = envelope
+                .request
+                .pointer("/params/name")
+                .and_then(Value::as_str);
+            // Stop and restart intentionally retire the bound instance. Their
+            // admission and mutation are one Supervisor-locked transaction;
+            // every other result is discarded if the same instance cannot be
+            // revalidated immediately before response upload.
+            if !matches!(name, Some("session_stop" | "session_restart"))
+                && sessions
+                    .fabric_verify_session(authority.clone(), binding.clone())
+                    .await
+                    .is_err()
+            {
+                return self.upload_response(
+                    &envelope.request_id,
+                    &json!({"jsonrpc":"2.0","id":envelope.request.get("id").cloned().unwrap_or(Value::Null),
+                        "error":{"code":-32000,"message":"browser session changed during request"}}),
+                    envelope._fabric_auth.as_ref(),
+                    envelope._fabric_session.as_ref(),
+                ).await;
+            }
+        }
+        self.upload_response(
+            &envelope.request_id,
+            &response,
+            envelope._fabric_auth.as_ref(),
+            envelope._fabric_session.as_ref(),
+        )
+        .await
     }
 
     async fn upload_response(
         &self,
         request_id: &str,
         rpc_response: &Value,
+        worker_auth: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
+        browser_session: Option<&crate::fabric_browser::BrowserSessionBinding>,
     ) -> Result<Option<GenerationExit>> {
         for attempt in 0..RESPONSE_UPLOAD_ATTEMPTS {
             let request = self
@@ -1195,6 +1513,8 @@ impl AgentGeneration {
                     generation: self.generation,
                     request_id,
                     response: rpc_response,
+                    _fabric_auth: worker_auth,
+                    _fabric_session: browser_session,
                 }),
             };
             match request.send().await {
@@ -1280,23 +1600,24 @@ async fn verify_host_generation_metadata(
     instance_id: &str,
     generation: u64,
     connected_metadata: &HostSupervisorMetadata,
+    worker_auth: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
 ) -> Result<Option<GenerationExit>> {
     let status = match sessions.status().await {
         Ok(status) => status,
         Err(error) => {
-            disconnect_host(gateway, host_id, instance_id, generation).await;
+            disconnect_host(gateway, host_id, instance_id, generation, worker_auth).await;
             return Err(error).context("local supervisor is unavailable");
         }
     };
     let changed = match supervisor_metadata_changed(&status, connected_metadata) {
         Ok(changed) => changed,
         Err(error) => {
-            disconnect_host(gateway, host_id, instance_id, generation).await;
+            disconnect_host(gateway, host_id, instance_id, generation, worker_auth).await;
             return Err(error);
         }
     };
     if changed {
-        disconnect_host(gateway, host_id, instance_id, generation).await;
+        disconnect_host(gateway, host_id, instance_id, generation, worker_auth).await;
         return Ok(Some(GenerationExit::SupervisorChanged));
     }
     Ok(None)
@@ -1335,7 +1656,7 @@ async fn poll_envelope(response: Response, poll_started: Instant) -> Result<Poll
         !envelope.request_id.is_empty() && envelope.request_id.len() <= 256,
         "gateway poll returned invalid request identity"
     );
-    Ok(PollOutcome::Request(envelope))
+    Ok(PollOutcome::Request(Box::new(envelope)))
 }
 
 fn empty_poll_delay(elapsed: Duration) -> Duration {
@@ -1369,6 +1690,143 @@ async fn dispatch_host_response(
     }
 }
 
+async fn dispatch_browser_host_response(
+    request: &Value,
+    sessions: &session_control::SessionBackend,
+    authority: &crate::fabric_browser::FabricAuthority,
+    binding: Option<&crate::fabric_browser::BrowserSessionBinding>,
+) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let routed = async {
+        anyhow::ensure!(
+            request.get("jsonrpc").and_then(Value::as_str) == Some("2.0"),
+            "invalid JSON-RPC request"
+        );
+        anyhow::ensure!(
+            request.get("method").and_then(Value::as_str) == Some("tools/call"),
+            "method is unavailable for browser-enrolled Hosts"
+        );
+        let params = request
+            .get("params")
+            .and_then(Value::as_object)
+            .context("invalid tool request")?;
+        let (name, args) = browser_tool_request(params)?;
+        anyhow::ensure!(
+            matches!(
+                name.as_str(),
+                "session_list"
+                    | "session_start"
+                    | "session_info"
+                    | "session_stop"
+                    | "session_restart"
+                    | "codex_status"
+                    | "codex_task_start"
+                    | "codex_task_get"
+                    | "codex_task_control"
+                    | "evidence_read"
+                    | "task_list"
+                    | "poll_job"
+                    | "job_list"
+                    | "stop_job"
+            ),
+            "tool is unavailable for browser-enrolled Hosts"
+        );
+        let session_bound = !matches!(name.as_str(), "session_list" | "session_start");
+        let binding = if session_bound {
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .context("browser-scoped tool requires session_id")?;
+            let binding = binding.context("Worker omitted the live session instance binding")?;
+            anyhow::ensure!(
+                binding.session_id == session_id
+                    && Uuid::parse_str(&binding.session_instance).is_ok(),
+                "Worker session instance binding does not match the request"
+            );
+            Some(binding.clone())
+        } else {
+            anyhow::ensure!(binding.is_none(), "unexpected session instance binding");
+            None
+        };
+        let result = sessions
+            .fabric_tool(authority.clone(), &name, args, binding)
+            .await?;
+        Ok::<_, anyhow::Error>((name, result))
+    }
+    .await;
+    match routed {
+        Ok((name, result)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": browser_tool_mcp_result(&name, result),
+        }),
+        // Supervisor errors may include local filesystem paths or other
+        // diagnostics. The public browser channel returns a stable bounded
+        // denial and keeps those details in local logs only.
+        Err(_) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": "browser-scoped request denied"}
+        }),
+    }
+}
+
+fn browser_tool_request(params: &serde_json::Map<String, Value>) -> Result<(String, Value)> {
+    anyhow::ensure!(
+        params
+            .keys()
+            .all(|key| matches!(key.as_str(), "name" | "arguments" | "_meta")),
+        "invalid tool request"
+    );
+    if let Some(metadata) = params.get("_meta") {
+        anyhow::ensure!(metadata.is_object(), "invalid protocol metadata");
+    }
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .context("missing tool name")?
+        .to_owned();
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    anyhow::ensure!(args.is_object(), "tool arguments must be an object");
+    Ok((name, args))
+}
+
+fn browser_tool_mcp_result(name: &str, value: serde_json::Value) -> serde_json::Value {
+    if matches!(
+        name,
+        "session_list" | "session_start" | "session_info" | "session_stop" | "session_restart"
+    ) {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": value.to_string(),
+            }],
+        })
+    } else {
+        value
+    }
+}
+
+fn same_worker_grant(
+    incoming: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
+    expected: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
+) -> bool {
+    match (incoming, expected) {
+        (Some(incoming), Some(expected)) => {
+            incoming.mode == expected.mode
+                && incoming.owner_key == expected.owner_key
+                && incoming.grant_id == expected.grant_id
+                && incoming.grant_generation == expected.grant_generation
+                && incoming.approved_roots == expected.approved_roots
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 async fn disconnect_legacy(
     gateway: &GatewayClient,
     session_id: &str,
@@ -1394,6 +1852,7 @@ async fn disconnect_host(
     host_id: &str,
     instance_id: &str,
     generation: u64,
+    worker_auth: Option<&crate::fabric_browser::WorkerAuthSnapshot>,
 ) {
     let result = gateway
         .request(Method::POST, "/v1/hosts/disconnect", Some(host_id))
@@ -1401,6 +1860,7 @@ async fn disconnect_host(
             host_id,
             instance_id,
             generation,
+            _fabric_auth: worker_auth,
         })
         .send()
         .await;
@@ -1439,6 +1899,7 @@ fn host_connect_request<'a>(
     instance_id: &'a str,
     platform: &'a str,
     metadata: &'a HostSupervisorMetadata,
+    worker_auth: Option<&'a crate::fabric_browser::WorkerAuthSnapshot>,
 ) -> HostConnectRequest<'a> {
     HostConnectRequest {
         host_id,
@@ -1448,7 +1909,8 @@ fn host_connect_request<'a>(
         runtime_version: &metadata.runtime_version,
         control_protocol: metadata.control_protocol,
         capabilities: HOST_CAPABILITIES,
-        named_roots: &metadata.named_roots,
+        named_roots: worker_auth.map_or(&metadata.named_roots, |auth| &auth.approved_roots),
+        _fabric_auth: worker_auth,
     }
 }
 
@@ -1485,16 +1947,28 @@ impl GatewayClient {
         path: &str,
         host_id: Option<&str>,
     ) -> RequestBuilder {
-        let mut request = client
-            .request(method, format!("{}{}", self.base_url, path))
-            .bearer_auth(&self.host_token);
+        let mut request = client.request(method, format!("{}{}", self.base_url, path));
+        if let Some(browser_auth) = &self.browser_auth {
+            match browser_auth.read() {
+                Ok(auth) => {
+                    request = request
+                        .bearer_auth(&auth.access_token)
+                        .header("X-Temote-Fabric-Host-Grant", &auth.host_grant);
+                }
+                Err(_) => request = request.bearer_auth("invalid-browser-credential-state"),
+            }
+        } else {
+            request = request.bearer_auth(&self.host_token);
+        }
         if let Some(host_id) = host_id {
             request = request.header("X-Temote-Host-Id", host_id);
         }
-        if let (Some(client_id), Some(client_secret)) = (
-            self.access_client_id.as_deref(),
-            self.access_client_secret.as_deref(),
-        ) {
+        if self.browser_auth.is_none()
+            && let (Some(client_id), Some(client_secret)) = (
+                self.access_client_id.as_deref(),
+                self.access_client_secret.as_deref(),
+            )
+        {
             request = request
                 .header("CF-Access-Client-Id", client_id)
                 .header("CF-Access-Client-Secret", client_secret);
@@ -1664,11 +2138,101 @@ mod tests {
     use super::*;
     use crate::test_support;
 
+    #[cfg(feature = "network")]
+    #[test]
+    fn browser_link_uses_distinct_oauth_and_host_grant_headers() {
+        let client = Client::builder().build().unwrap();
+        let gateway = GatewayClient {
+            client: client.clone(),
+            sync_client: client,
+            base_url: "https://fabric.example".to_owned(),
+            host_token: String::new(),
+            access_client_id: Some("must-not-be-used".to_owned()),
+            access_client_secret: Some("must-not-be-used".to_owned()),
+            browser_auth: Some(Arc::new(RwLock::new(BrowserWireAuth {
+                access_token: "oauth:fake-access".to_owned(),
+                host_grant: "fake-host-grant".to_owned(),
+                access_expires_at: 1,
+            }))),
+            browser_auth_blocked: Some(Arc::new(AtomicBool::new(false))),
+        };
+        let request = gateway
+            .request(Method::POST, "/v1/hosts/poll", Some("host-a"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers()["authorization"],
+            "Bearer oauth:fake-access"
+        );
+        assert_eq!(
+            request.headers()["x-temote-fabric-host-grant"],
+            "fake-host-grant"
+        );
+        assert_eq!(request.headers()["x-temote-host-id"], "host-a");
+        assert!(!request.headers().contains_key("cf-access-client-id"));
+        assert!(!request.headers().contains_key("cf-access-client-secret"));
+    }
+
+    #[test]
+    fn browser_tool_response_uses_worker_session_list_mcp_content_envelope() {
+        let raw_supervisor_value = json!([{
+            "session_id": "session-a",
+            "session_instance": "00000000-0000-4000-8000-000000000001",
+            "root_name": "src",
+            "logical_path": "repo",
+        }]);
+        let response = browser_tool_mcp_result("session_list", raw_supervisor_value);
+        let text = response["content"][0]["text"].as_str().unwrap();
+        let sessions: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(sessions[0]["session_id"], "session-a");
+        assert_eq!(sessions[0]["root_name"], "src");
+    }
+
+    #[test]
+    fn browser_typed_tool_result_keeps_mcp_error_metadata_and_content() {
+        let typed = json!({
+            "content": [{"type":"text","text":"task failed"}],
+            "isError": true,
+            "_meta": {"diagnosticCode":"backend-denied"}
+        });
+        assert_eq!(
+            browser_tool_mcp_result("codex_task_get", typed.clone()),
+            typed
+        );
+    }
+
+    #[test]
+    fn browser_dispatch_accepts_protocol_meta_but_never_promotes_it_to_authority() {
+        let params = json!({
+            "name": "codex_status",
+            "arguments": {"session_id": "session-a"},
+            "_meta": {
+                "progressToken": 42,
+                "owner_key": "forged-owner",
+                "approved_roots": ["outside"],
+                "session_instance": "forged-instance"
+            }
+        });
+        let parsed = browser_tool_request(params.as_object().unwrap()).unwrap();
+        assert_eq!(parsed.0, "codex_status");
+        assert_eq!(parsed.1, json!({"session_id":"session-a"}));
+        assert!(
+            browser_tool_request(
+                json!({"name":"codex_status","_meta":[]})
+                    .as_object()
+                    .unwrap()
+            )
+            .is_err()
+        );
+    }
+
     fn request_envelope(id: u64) -> PollOutcome {
-        PollOutcome::Request(PollEnvelope {
+        PollOutcome::Request(Box::new(PollEnvelope {
             request_id: id.to_string(),
             request: json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }),
-        })
+            _fabric_auth: None,
+            _fabric_session: None,
+        }))
     }
 
     #[test]
@@ -2029,6 +2593,8 @@ mod tests {
                 host_token: Uuid::new_v4().to_string(),
                 access_client_id: None,
                 access_client_secret: None,
+                browser_auth: None,
+                browser_auth_blocked: None,
             },
             route: AgentRoute::Legacy {
                 session_id: "upload-fixture".to_owned(),
@@ -2037,11 +2603,15 @@ mod tests {
             generation: 7,
             capacity: AgentCapacity::negotiated(Some(8)),
             admission: Arc::new(AtomicBool::new(true)),
+            browser_authority: None,
+            worker_auth: None,
         };
         let result = context
             .upload_response(
                 "same-request",
                 &json!({"jsonrpc":"2.0","id":42,"result":{}}),
+                None,
+                None,
             )
             .await;
         shutdown.send(()).unwrap();
@@ -2218,6 +2788,7 @@ mod tests {
             "instance-a",
             "macos",
             &before,
+            None,
         ))
         .unwrap();
         let after_payload = serde_json::to_value(host_connect_request(
@@ -2225,6 +2796,7 @@ mod tests {
             "instance-a",
             "macos",
             &after,
+            None,
         ))
         .unwrap();
         assert_eq!(before_payload["runtime_version"], "2026.9.0");
@@ -2289,6 +2861,7 @@ mod tests {
             generation: 2,
             session_availability: Some("session_unavailable"),
             accept_requests: Some(false),
+            _fabric_auth: None,
         })
         .unwrap();
         assert_eq!(payload["session_availability"], "session_unavailable");
@@ -2302,6 +2875,7 @@ mod tests {
             generation: 2,
             session_availability: None,
             accept_requests: None,
+            _fabric_auth: None,
         })
         .unwrap();
         assert!(omitted.get("session_availability").is_none());

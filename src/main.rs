@@ -23,6 +23,8 @@ mod environment_prepare_cli;
 #[cfg(feature = "network")]
 mod events_host;
 mod evidence;
+#[cfg(feature = "network")]
+mod fabric_browser;
 mod friction;
 #[cfg(feature = "network")]
 mod gateway;
@@ -359,6 +361,10 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "network")]
+        cli::Command::FabricConnect { options } => fabric_browser::run_connect(options).await,
+        #[cfg(feature = "network")]
+        cli::Command::FabricLogout { options } => fabric_browser::run_logout(options).await,
         #[cfg(feature = "network")]
         cli::Command::EventsSender { addr } => {
             load_public_env()?;

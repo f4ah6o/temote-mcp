@@ -1,4 +1,4 @@
-import { authorizeFederatedHost } from "../access.js";
+import { authorizeLegacyFederatedHost } from "../enrollment.js";
 import { jsonResponse, readJson, unauthorizedHost, withCors } from "../http.js";
 import { validateHostId, validateSessionId } from "../protocol.js";
 import {
@@ -78,7 +78,7 @@ export async function handleObservationSync(request, env, hostId) {
   if (
     authenticatedHost !== hostId
     || !validateHostId(authenticatedHost)
-    || !authorizeFederatedHost(request, env, authenticatedHost)
+    || !await authorizeLegacyFederatedHost(request, env, authenticatedHost)
   ) {
     return unauthorizedHost();
   }

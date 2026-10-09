@@ -596,6 +596,55 @@ test("host-level reconnect fences the stale agent generation", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("browser Host authority survives expiry and clearHost and cannot downgrade to static auth", async () => {
+  const storage = new MemoryStorage();
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const owner = "a".repeat(64);
+  const grant = crypto.randomUUID();
+  const connectBody = (instanceId, auth = {
+    mode: "browser", owner_key: owner, grant_id: grant,
+    grant_generation: 1, approved_roots: ["src"],
+  }) => ({
+    host_id: "browser-host",
+    instance_id: instanceId,
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+    ...(auth ? { _fabric_auth: auth } : {}),
+  });
+
+  const first = await session.fetch(post("connect", connectBody("browser-instance")));
+  assert.equal(first.status, 200);
+  assert.deepEqual(await storage.get("browser_authority"), { version: 1, owner_key: owner });
+
+  const live = await storage.get("host");
+  live.expires_at = Date.now() - 1;
+  await storage.put("host", live);
+  let legacy = await session.fetch(post("connect", connectBody("static-instance", null)));
+  assert.equal(legacy.status, 409, "expired browser lease cannot be re-registered as legacy");
+
+  await session.clearHost(live, "host_lease_expired");
+  assert.equal(await storage.get("host"), undefined);
+  assert.deepEqual(await storage.get("browser_authority"), { version: 1, owner_key: owner });
+  legacy = await session.fetch(post("connect", connectBody("static-instance", null)));
+  assert.equal(legacy.status, 409, "clearing the live lease retains the browser-only marker");
+
+  const differentOwner = await session.fetch(post("connect", connectBody("other-owner", {
+    mode: "browser", owner_key: "b".repeat(64), grant_id: crypto.randomUUID(),
+    grant_generation: 1, approved_roots: ["src"],
+  })));
+  assert.equal(differentOwner.status, 409, "durable Host identity cannot be taken over by another browser owner");
+
+  const reconnect = await session.fetch(post("connect", connectBody("browser-instance-2")));
+  assert.equal(reconnect.status, 200, "the same browser owner can reconnect after expiry");
+});
+
 test("host status is read-only and reports bounded registration metadata", async () => {
   const session = new GatewaySession(
     { storage: new MemoryStorage() },

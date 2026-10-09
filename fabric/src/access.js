@@ -27,6 +27,29 @@ export function federatedHostToken(env, hostId) {
   }
 }
 
+// Browser enrollment is intentionally stricter than legacy token lookup: an
+// absent, malformed, or partially invalid static inventory disables all new
+// enrollments. This prevents a typo in HOST_TOKENS_JSON from creating a
+// browser credential for an already-reserved legacy host id.
+export function validateLegacyHostInventory(env) {
+  if (typeof env?.HOST_TOKENS_JSON !== "string") return { ok: false, ids: new Set() };
+  try {
+    const value = JSON.parse(env.HOST_TOKENS_JSON);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { ok: false, ids: new Set() };
+    }
+    const entries = Object.entries(value);
+    for (const [hostId, token] of entries) {
+      if (!validateHostId(hostId) || typeof token !== "string" || token.length === 0 || token.length > 4096) {
+        return { ok: false, ids: new Set() };
+      }
+    }
+    return { ok: true, ids: new Set(entries.map(([hostId]) => hostId)) };
+  } catch {
+    return { ok: false, ids: new Set() };
+  }
+}
+
 export function authorizeFederatedHost(request, env, hostId) {
   const token = federatedHostToken(env, hostId);
   if (!token) return false;
@@ -46,6 +69,12 @@ export async function authorizeDashboard(request, env) {
   return authorizeClientWithMode(request, env, "access_only");
 }
 
+export async function authorizeAccessIdentity(request, env) {
+  const identity = await authorizeClientWithMode(request, env, "access_only");
+  if (!identity || identity.auth_mode !== "browser_owner") return null;
+  return identity;
+}
+
 async function authorizeClientWithMode(request, env, mode) {
   if (mode !== "client_or_access" && mode !== "access_only") return null;
   const authorization = request.headers.get("authorization") || "";
@@ -54,12 +83,18 @@ async function authorizeClientWithMode(request, env, mode) {
     && env.CLIENT_TOKEN
     && authorization === `Bearer ${env.CLIENT_TOKEN}`
   ) {
-    return { subject: "client-token", email: "-" };
+    return { subject: "client-token", email: "-", auth_mode: "client_token" };
   }
   const assertion = request.headers.get("cf-access-jwt-assertion");
   if (!assertion) return null;
   try {
-    return await verifyAccessJwt(assertion, env);
+    const identity = await verifyAccessJwt(assertion, env);
+    // Authorization is only a carrier for the opaque OAuth access token. It
+    // is not an authenticated mode claim: Cloudflare's signed assertion is
+    // the identity proof, regardless of whether Authorization is absent,
+    // opaque, or begins with the literal "oauth:" prefix.
+    identity.auth_mode = "browser_owner";
+    return identity;
   } catch {
     // JWT parsing and key lookup errors can contain attacker-controlled input.
     // Do not copy them into logs; the endpoint response is intentionally generic.
@@ -111,7 +146,12 @@ async function verifyAccessJwt(token, env) {
     throw new Error("email is not allowed or ACCESS_ALLOWED_EMAILS is empty");
   }
   if (typeof claims.sub !== "string" || !claims.sub) throw new Error("JWT subject missing");
-  return { subject: claims.sub, email: claims.email || "-" };
+  return {
+    subject: claims.sub,
+    email: claims.email || "-",
+    issuer,
+    auth_mode: "browser_owner",
+  };
 }
 
 export function boundedLogField(value, fallback = "-") {

@@ -247,7 +247,7 @@ test("a verified Access JWT reaches the real configured Static Assets binding", 
       "/dash/unknown/index.html",
     ]) {
       const result = await requestWith(accessRuntime, alias, { headers: validHeaders });
-      assert.equal(result.response.status, 404, `${alias}: aliases and direct index paths must not fall through to an asset`);
+      assert.equal(result.response.status, 403, `${alias}: aliases and direct index paths must not fall through to an asset`);
       assert.doesNotMatch(result.body, /Temote Fabric dashboard|REFRESH_FOREGROUND_MS|color-scheme:\s*light/);
       assertDashboardResponseIsPrivate(result.response, alias);
     }
@@ -256,7 +256,7 @@ test("a verified Access JWT reaches the real configured Static Assets binding", 
       method: "OPTIONS",
       headers: validHeaders,
     });
-    assert.equal(authorizedOptions.response.status, 405);
+    assert.equal(authorizedOptions.response.status, 403);
     assertDashboardResponseIsPrivate(authorizedOptions.response, "authorized dashboard OPTIONS");
 
     const assertionParts = assertion.split(".");

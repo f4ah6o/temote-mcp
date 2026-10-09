@@ -1,4 +1,4 @@
-import { authorizeFederatedHost } from "../access.js";
+import { authorizeLegacyFederatedHost } from "../enrollment.js";
 import { jsonResponse, readJson, unauthorizedHost, withCors } from "../http.js";
 import { validateHostId, validateSessionId } from "../protocol.js";
 import { currentSession } from "./service.js";
@@ -23,7 +23,7 @@ export function transitionHostId(pathname) {
 
 export async function handleHostTransition(request, env, hostId) {
   if (request.method !== "POST") return withCors(new Response(null, { status: 405 }));
-  if (request.headers.get("x-temote-host-id") !== hostId || !authorizeFederatedHost(request, env, hostId)) return unauthorizedHost();
+  if (request.headers.get("x-temote-host-id") !== hostId || !await authorizeLegacyFederatedHost(request, env, hostId)) return unauthorizedHost();
   if (!await durableReady(env)) return withCors(jsonResponse({ error: "events_unavailable" }, 503));
   const parsed = await readJson(request, 4096);
   if (!parsed.ok) return withCors(jsonResponse({ error: "invalid_json" }, 400));
