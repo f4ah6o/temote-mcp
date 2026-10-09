@@ -1472,11 +1472,19 @@ test("mismatched host response preserves pending RPC for a correct retry", async
   assert.equal((await dispatched).status, 200);
 });
 
-test("session status reflects the current host lease", async () => {
+test("session status reads expired leases without mutation while dispatch rejects them", async () => {
   const storage = new MemoryStorage();
+  const registryWrites = [];
+  const registry = {
+    idFromName: (name) => name,
+    get: () => ({ fetch: async (request) => {
+      registryWrites.push(new URL(request).pathname);
+      return new Response(null, { status: 204 });
+    } }),
+  };
   const session = new GatewaySession(
     { storage },
-    { GATEWAY_REGISTRY: noOpRegistry() },
+    { GATEWAY_REGISTRY: registry },
   );
   const connectedResponse = await session.fetch(post("connect", {
     session_id: "status-check",
@@ -1493,6 +1501,7 @@ test("session status reflects the current host lease", async () => {
     lease: "active",
     session_availability: "not_checked",
   });
+  const writesAfterConnect = [...registryWrites];
 
   const host = await storage.get("host");
   host.expires_at = Date.now() - 1;
@@ -1500,7 +1509,15 @@ test("session status reflects the current host lease", async () => {
   const expiredStatus = await session.fetch(new Request("https://session.internal/status"));
   assert.equal(expiredStatus.status, 404);
   assert.deepEqual(await expiredStatus.json(), { status: "lease_expired" });
+  assert.equal((await storage.get("host")).expires_at, host.expires_at);
+  assert.deepEqual(registryWrites, writesAfterConnect);
+
+  const rejected = await body(await session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "ping" },
+  })));
+  assert.equal(rejected.error, "host_offline");
   assert.equal(await storage.get("host"), undefined);
+  assert.ok(registryWrites.length > writesAfterConnect.length);
 });
 
 test("host respond budget covers maximum binary payload without widening other host APIs", async () => {

@@ -13,7 +13,7 @@ cargo install --path . --locked
 temote doctor
 ```
 
-[Prebuilt releases](https://github.com/f4ah6o/temote-mcp/releases) are also available through `cargo-binstall`. This source uses canonical package and command `temote`, with `temote-mcp` retained as an executable compatibility alias. Existing releases keep their published names until the next CalVer release. See [migration](docs/naming-migration.md).
+[Prebuilt releases](https://github.com/f4ah6o/temote-mcp/releases) are also available through `cargo-binstall`. Existing releases keep the `temote-mcp` package name until the next CalVer release; after that, install `temote` with `cargo binstall temote` or pin the matching release with `cargo binstall temote@<version>`. This source uses canonical package and command `temote`, with `temote-mcp` retained as an executable compatibility alias. See [migration](docs/naming-migration.md).
 
 ## First session
 

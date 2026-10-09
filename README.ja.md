@@ -13,7 +13,7 @@ cargo install --path . --locked
 temote doctor
 ```
 
-[ビルド済みリリース](https://github.com/f4ah6o/temote-mcp/releases) は `cargo-binstall` でも導入できます。このソースの正規 package / command 名は `temote` で、`temote-mcp` executable は互換 alias として残ります。既存リリースの公開名は次の CalVer リリースまで維持されます。[移行ガイド](docs/naming-migration.md)を参照してください。
+[ビルド済みリリース](https://github.com/f4ah6o/temote-mcp/releases) は `cargo-binstall` でも導入できます。次の CalVer リリースまでは既存の `temote-mcp` package 名が維持され、その後は `cargo binstall temote` で導入できます。特定の版に固定する場合は `cargo binstall temote@<version>` を使います。このソースの正規 package / command 名は `temote` で、`temote-mcp` executable は互換 alias として残ります。[移行ガイド](docs/naming-migration.md)を参照してください。
 
 ## 最初の session
 

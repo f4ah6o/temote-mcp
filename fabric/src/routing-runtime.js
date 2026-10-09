@@ -32,6 +32,7 @@ const HOST_CONTROL_PROTOCOL_VERSION = 2;
 const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
+const MAX_CONCURRENT_AGENT_REQUESTS = 8;
 const MAX_REQUEST_ID_ATTEMPTS = 8;
 const MAX_REGISTRY_SESSIONS = 1024;
 const MAX_REGISTRY_HOSTS = 256;
@@ -108,10 +109,15 @@ async function readRegistryCollection(env, action, maxEntries) {
   return { ok: true, value: values };
 }
 
-async function readOnlineHosts(env) {
+async function readOnlineHosts(env, hostId = null) {
   const hosts = await readRegistryCollection(env, "hosts", MAX_REGISTRY_HOSTS);
   if (!hosts.ok) return hosts;
-  const filtered = await filterOnlineRegistryHosts(hosts.value, env);
+  // A qualified lookup must not wait for, or probe, unrelated host leases.
+  // Aggregate discovery still checks every host and fails closed above it.
+  const candidates = hostId === null
+    ? hosts.value
+    : hosts.value.filter((host) => host?.host_id === hostId);
+  const filtered = await filterOnlineRegistryHosts(candidates, env);
   return { ok: true, value: filtered.online, unavailable: filtered.unavailable };
 }
 
@@ -170,7 +176,7 @@ async function collectHostSessions(env, hosts) {
 }
 
 async function listGatewaySessions(env, hostId) {
-  const hosts = await readOnlineHosts(env);
+  const hosts = await readOnlineHosts(env, hostId ?? null);
   if (!hosts.ok) return hosts;
   if (hostId) {
     if (hosts.unavailable.includes(hostId)) {
@@ -353,7 +359,6 @@ export class GatewaySession {
     const host = await this.currentHost();
     if (!host) return jsonResponse({ status: "not_registered" }, 404);
     if (!Number.isSafeInteger(host.expires_at) || host.expires_at <= Date.now()) {
-      await this.clearHost(host, "host_lease_expired");
       return jsonResponse({ status: "lease_expired" }, 404);
     }
     return jsonResponse({
@@ -422,10 +427,13 @@ export class GatewaySession {
         ...(registry.status ? { gateway_status: registry.status } : {}),
       }, registry.status ?? 503);
     }
+    const replaced = verifyGeneration(await this.currentHost(), host);
+    if (replaced) return replaced;
     return jsonResponse({
       ...route,
       generation,
       lease_seconds: Math.floor(HOST_LEASE_MS / 1000),
+      concurrent_requests: MAX_CONCURRENT_AGENT_REQUESTS,
       ...(route.host_id ? { agent_protocol: HOST_AGENT_PROTOCOL_VERSION } : {}),
     });
   }
@@ -441,6 +449,9 @@ export class GatewaySession {
     if (availability === null || (availability !== undefined && !host.host_id)) {
       return jsonResponse({ error: "invalid_session_availability" }, 400);
     }
+    if (Object.hasOwn(body, "accept_requests") && typeof body.accept_requests !== "boolean") {
+      return jsonResponse({ error: "invalid_accept_requests" }, 400);
+    }
 
     const now = Date.now();
     host.last_seen = now;
@@ -455,6 +466,11 @@ export class GatewaySession {
         ...(registry.status ? { gateway_status: registry.status } : {}),
       }, registry.status ?? 503);
     }
+    const replaced = verifyGeneration(await this.currentHost(), host);
+    if (replaced) return replaced;
+    // A saturated agent can renew its lease without dequeuing another request.
+    // Existing agents omit this flag and keep the original long-poll behavior.
+    if (body.accept_requests === false) return new Response(null, { status: 204 });
 
     const queued = this.takeQueuedRequest(host.generation);
     if (queued) return jsonResponse(queued);
@@ -620,6 +636,9 @@ export class GatewaySession {
   }
 
   async clearHost(host, reason) {
+    // Registry I/O can yield to a newer connect. A failed renewal from an old
+    // generation must not clear the replacement host or its pending requests.
+    if (verifyGeneration(await this.currentHost(), host)) return;
     this.failAllPending(503, reason);
     this.queue.length = 0;
     this.replaceWaitingPoll(reason);

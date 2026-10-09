@@ -19,6 +19,8 @@ native Windows 実行は後続 milestone です。現時点の Windows 11 federa
 
 host reconnect ごとに generation を進めます。古い generation または古い process `instance_id` からの request/response は拒否します。routed operation には非 idempotent なものがあるため、timeout や disconnect 後の自動 replay は行いません。
 
+新しい host agent は最大8件の同時 RPC を negotiation します。capacity を広告しない旧 gateway には従来どおり直列 protocol を使います。全 slot が埋まると、新しい request を受け取らず lease heartbeat を送信します。受理済み RPC は transport reconnect を越えて保持し、response upload の失敗時は同一 envelope だけを再送します。generation replacement は引き続き旧 response を fence し、RPC 自体は自動 replay しません。
+
 ## Host identity と認証
 
 `host_id` は `mac-main`、`linux-main`、`win-main` のような安定した non-secret routing identity です。credential ではありません。
@@ -243,23 +245,25 @@ supervisor を動かすマシンごとに named root を設定します。gatewa
 macOS 例:
 
 ```sh
-export TEMOTE_MCP_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
-export TEMOTE_MCP_GATEWAY_HOST_ID=mac-main
-export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
-export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<mac-main に割り当てた token>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
+export TEMOTE_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
+export TEMOTE_FABRIC_HOST_ID=mac-main
+export TEMOTE_FABRIC_URL=https://<gateway-host>
+export TEMOTE_FABRIC_HOST_TOKEN='<mac-main に割り当てた token>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_ID='<Access service-token ID>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_SECRET='<Access service-token secret>'
 
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id mac-main
+temote fabric connect --host-id mac-main
 ```
+
+supervisor と `fabric connect` は別々の foreground terminal で動かします。`fabric connect` は既存の `temote-mcp gateway-agent` と同じ reconnecting Host protocol を使います。既存の `TEMOTE_MCP_GATEWAY_*` environment 名も fallback alias として使えますが、`TEMOTE_FABRIC_*` が優先されます。`temote fabric status` は configuration、supervisor、remote endpoint identity、authorization、host lease/generation、public に利用可能な session を stage 別に表示します。read-only で、全 stage が ready でなければ失敗 exit code を返します。credential と remote response body は表示しません。local supervisor には制限された diagnostic request を使い、未対応の実行中 supervisor は local stage を unavailable として報告します。legacy maintenance probe には fallback しません。
 
 Linux も同じ構成で Linux path を使います。Windows 11 では WSL2 内で supervisor と agent を動かし、`/mnt/d/Developer` のような WSL path を named root にします。
 
 ```sh
 export TEMOTE_MCP_ROOTS='{"src":"/mnt/d/Developer"}'
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id win-main --platform wsl2
+temote fabric connect --host-id win-main --platform wsl2
 ```
 
 既存の host-level `gateway-agent --host-id` は、認証済み channel から observation batch を自動送信します。
@@ -306,7 +310,7 @@ conflict が起きた場合、当初の preview policy に従う送信が引き�
 認可されていない場合は対象 host agent を停止し、source を診断状態のままにしてください。
 設定を off にしても、すでに D1 へ commit された preview は取り消せません。
 
-`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。network-enabled build では read-only の `/healthz` identity check と認証付き `/v1/hosts/status` probe も実行し、remote endpoint、Access 認証、この host の active lease を分類します。doctor は `session_availability` も local supervisor の read-only な session inventory から `listed_sessions`/`active_sessions` の件数として報告します。これは supervisor control protocol を再利用し、MCP tool を dispatch せず、session や lease を変更しません。live（`active`/`starting`）な session が 1 件もないと確定した inventory は `ready` ではなく `failed` とし、inventory を列挙できない場合は `unavailable` とします。local の host-level `gateway-agent` generation が記録されている場合、doctor は認証済み gateway の `generation` と比較し、remote の generation が新しいときは `generation_replaced` として報告するため、置き換えられた古い local agent を healthy と誤認しません。host-level `gateway-agent` は bounded で non-secret な `session_availability`（`ready`、`session_unavailable`、`unavailable`）を poll ごとに報告し、認証付き `/v1/hosts/status` は最新の報告値を返します。未報告の値は `ready` として扱わず `not_checked` のままにします。この remote 値は supervisor inventory から read-only で導出され、session ID、path、credential を含みません。root path や token 値は表示しません。
+`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_FABRIC_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。network-enabled build では Access 認証付き `/healthz` identity check と `/v1/hosts/status` probe を redirect せず実行し、remote endpoint、authorization、この host の active lease と generation を分類します。doctor は `session_availability` も local supervisor の read-only な session inventory から `listed_sessions`/`active_sessions`/`publicly_usable_sessions` の件数として報告します。yolo/local-only session と起動中 session は publicly usable に数えません。制限された supervisor diagnostic request を再利用し、MCP tool を dispatch せず、session や lease を変更しません。この request に未対応の実行中 supervisor は legacy maintenance probe を受け取らず、unavailable と報告されます。active な非-yolo session がない inventory は `ready` ではなく `failed` とし、inventory を列挙できない場合は `unavailable` とします。doctor は gateway の active lease と generation が local host-agent record に一致した場合だけ登録済みとして報告します。host agent は bounded な `session_availability`（`ready`、`session_unavailable`、`unavailable`）を poll ごとに報告し、未報告値は `not_checked` のままにします。root path、credential、remote response body は表示しません。
 
 ## MCP workflow
 

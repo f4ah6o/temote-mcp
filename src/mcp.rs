@@ -1316,7 +1316,7 @@ async fn call_tool(
             rendered["server_contract_fingerprint"] = json!(public_contract_fingerprint());
             return text_result(serde_json::to_string_pretty(&rendered)?);
         }
-        let view = crate::session_control::inspect_session(&session_id).await?;
+        let view = crate::session_control::inspect_session_read_only(&session_id).await?;
         if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
             approvals::activity(&view.session_id, "Read session info", None).await;
         }

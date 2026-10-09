@@ -121,7 +121,16 @@ test("stale, deferred, unknown, tampered, rotated, and expired state never contr
   const { env, state } = fixture();
   const first = (await read(env)).body.result.requestState;
   const base = state.calls.length;
-  assert.equal((await retry(env, first.slice(0, -1) + "x")).body.error.code, -32602);
+  const separator = first.lastIndexOf(".");
+  const body = first.slice(0, separator);
+  const mac = first.slice(separator + 1);
+  const macBytes = Buffer.from(mac, "base64url");
+  assert.equal(macBytes.length, 32);
+  const tamperedMacBytes = Buffer.from(macBytes);
+  tamperedMacBytes[0] ^= 1;
+  assert.notDeepEqual(tamperedMacBytes, macBytes);
+  const tampered = `${body}.${tamperedMacBytes.toString("base64url")}`;
+  assert.equal((await retry(env, tampered)).body.error.code, -32602);
   assert.equal(state.calls.length, base);
   env.HOST_TOKENS_JSON = JSON.stringify({ "host-a": "rotated-token" });
   assert.equal((await retry(env, first)).body.error.code, -32602);

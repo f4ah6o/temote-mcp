@@ -491,7 +491,7 @@ async fn dispatch_direct_upgrade(
                         emitter,
                     )
                 });
-            let preflight_result = crate::upgrade_coordinator::preflight()
+            let preflight_result = crate::upgrade_coordinator::preflight_for_apply()
                 .await
                 .map_err(|_| anyhow::anyhow!("upgrade preflight failed"));
             let (executable, preflight) = match preflight_result {

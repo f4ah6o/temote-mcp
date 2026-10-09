@@ -2,6 +2,10 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,6 +30,9 @@ const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_CONCURRENT_GATEWAY_REQUESTS: usize = 8;
+const CAPACITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const RESPONSE_UPLOAD_ATTEMPTS: usize = 3;
 const HOST_AGENT_PROTOCOL_VERSION: u64 = 1;
 const HOST_CAPABILITIES: &[&str] = &["session_lifecycle", "session_tools", "named_roots"];
 const HOST_AGENT_RECORD_SCHEMA_VERSION: u64 = 1;
@@ -81,50 +88,74 @@ pub struct AgentOptions {
     pub reconnect_delay: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct AgentCapacity {
+    limit: usize,
+    heartbeat_supported: bool,
+}
+
+impl AgentCapacity {
+    fn negotiated(advertised: Option<usize>) -> Self {
+        Self {
+            limit: advertised
+                .unwrap_or(1)
+                .clamp(1, MAX_CONCURRENT_GATEWAY_REQUESTS),
+            heartbeat_supported: advertised.is_some(),
+        }
+    }
+}
+
+type GatewayRequestResult = (u64, Result<Option<GenerationExit>>);
+type GatewayRequests = tokio::task::JoinSet<GatewayRequestResult>;
+type CompletedGatewayRequest =
+    Option<std::result::Result<GatewayRequestResult, tokio::task::JoinError>>;
+
+enum PollOutcome {
+    Idle,
+    Request(PollEnvelope),
+    Exit(GenerationExit),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayConflict {
+    StaleRequest,
+    PollReplaced,
+    Replaced,
+}
+
+#[derive(Clone)]
+enum AgentRoute {
+    Legacy {
+        session_id: String,
+    },
+    Host {
+        host_id: String,
+        sessions: session_control::SessionBackend,
+        metadata: HostSupervisorMetadata,
+    },
+}
+
+#[derive(Clone)]
+struct AgentGeneration {
+    gateway: GatewayClient,
+    route: AgentRoute,
+    instance_id: String,
+    generation: u64,
+    capacity: AgentCapacity,
+    admission: Arc<AtomicBool>,
+}
+
+struct GenerationAdmissionGuard(Arc<AtomicBool>);
+
+impl Drop for GenerationAdmissionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A bounded diagnostic projection. It never starts a Link or reconciles a task.
 pub async fn fabric_status() -> Result<serde_json::Value> {
-    let host_id = temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_HOST_ID")
-        .ok()
-        .map(|value| host_identity::validate(&value))
-        .transpose()?;
-    let origin = temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_URL")
-        .ok()
-        .map(|value| normalize_gateway_url(&value))
-        .transpose()?;
-    let generation = host_id.as_deref().and_then(read_host_agent_generation);
-    let mut health = serde_json::json!({"status":"not_configured"});
-    if let Some(origin) = &origin {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()?;
-        let mut request = client.get(format!("{origin}/healthz"));
-        if let (Ok(id), Ok(secret)) = (
-            temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID"),
-            temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET"),
-        ) {
-            request = request
-                .header("CF-Access-Client-Id", id)
-                .header("CF-Access-Client-Secret", secret);
-        }
-        // Do not deserialize or copy remote error bodies into diagnostics.
-        health = match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                serde_json::json!({"status":"reachable", "http_status":response.status().as_u16()})
-            }
-            Ok(response) => {
-                serde_json::json!({"status":"unavailable", "http_status":response.status().as_u16()})
-            }
-            Err(_) => {
-                serde_json::json!({"status":"unavailable", "error_code":"health_probe_failed"})
-            }
-        };
-    }
-    Ok(
-        serde_json::json!({"service":"temote-fabric", "host_id":host_id, "endpoint":origin,
-        "last_local_generation":generation, "remote_health":health}),
-    )
+    Ok(crate::doctor::fabric_status_projection().await)
 }
 
 #[derive(Clone)]
@@ -149,6 +180,8 @@ struct LegacyConnectResponse {
     session_id: String,
     generation: u64,
     lease_seconds: u64,
+    #[serde(default)]
+    concurrent_requests: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -156,6 +189,14 @@ struct LegacyGenerationRequest<'a> {
     session_id: &'a str,
     instance_id: &'a str,
     generation: u64,
+}
+
+#[derive(Serialize)]
+struct LegacyPollRequest<'a> {
+    #[serde(flatten)]
+    identity: LegacyGenerationRequest<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accept_requests: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -182,6 +223,8 @@ struct HostConnectResponse {
     host_id: String,
     generation: u64,
     lease_seconds: u64,
+    #[serde(default)]
+    concurrent_requests: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -198,6 +241,8 @@ struct HostPollRequest<'a> {
     generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_availability: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accept_requests: Option<bool>,
 }
 
 /// Bounded, non-secret session availability the host agent reports to the
@@ -220,27 +265,28 @@ impl HostSessionAvailability {
     }
 }
 
-fn classify_host_session_availability(statuses: &[&str]) -> HostSessionAvailability {
-    let has_live_session = statuses
+fn classify_host_session_availability(sessions: &[(&str, bool)]) -> HostSessionAvailability {
+    let has_public_session = sessions
         .iter()
-        .any(|status| matches!(*status, "active" | "starting"));
-    if has_live_session {
+        .any(|(status, yolo)| *status == "active" && !yolo);
+    if has_public_session {
         HostSessionAvailability::Ready
     } else {
         HostSessionAvailability::SessionUnavailable
     }
 }
 
-/// Reads the local supervisor's session inventory read-only. Enumeration
-/// failure is reported as `unavailable`; it is never presented as ready.
+/// Refreshes the local supervisor's session inventory through its
+/// legacy-compatible operational control path. Enumeration failure is
+/// reported as `unavailable`; it is never presented as ready.
 async fn current_host_session_availability() -> HostSessionAvailability {
-    match session_control::request_session_views().await {
+    match session_control::request_session_views_operational().await {
         Ok(views) => {
-            let statuses = views
+            let sessions = views
                 .iter()
-                .map(|view| view.status.as_str())
+                .map(|view| (view.status.as_str(), view.yolo))
                 .collect::<Vec<_>>();
-            classify_host_session_availability(&statuses)
+            classify_host_session_availability(&sessions)
         }
         Err(_) => HostSessionAvailability::Unavailable,
     }
@@ -359,6 +405,9 @@ async fn run_legacy_agent(
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    // Keep accepted work alive, and bounded, across transport reconnections.
+    // A new generation must never restart or abort an accepted operation.
+    let mut requests = GatewayRequests::new();
     loop {
         let connected = tokio::select! {
             result = connect_legacy(gateway, &session.id, instance_id, platform) => result,
@@ -390,6 +439,8 @@ async fn run_legacy_agent(
                 &session.id,
                 instance_id,
                 connection.generation,
+                AgentCapacity::negotiated(connection.concurrent_requests),
+                &mut requests,
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -450,6 +501,7 @@ async fn run_host_agent(
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let mut requests = GatewayRequests::new();
     loop {
         let metadata = tokio::select! {
             result = sessions.status() => result
@@ -517,12 +569,19 @@ async fn run_host_agent(
 
         let outcome = tokio::select! {
             result = run_host_generation(
-                gateway,
-                &sessions,
-                &host_id,
-                instance_id,
-                connection.generation,
-                &metadata,
+                AgentGeneration {
+                    gateway: gateway.clone(),
+                    route: AgentRoute::Host {
+                        host_id: host_id.clone(),
+                        sessions: sessions.clone(),
+                        metadata: metadata.clone(),
+                    },
+                    instance_id: instance_id.to_owned(),
+                    generation: connection.generation,
+                    capacity: AgentCapacity::negotiated(connection.concurrent_requests),
+                    admission: Arc::new(AtomicBool::new(true)),
+                },
+                &mut requests,
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -768,69 +827,41 @@ async fn run_legacy_generation(
     session_id: &str,
     instance_id: &str,
     generation: u64,
+    capacity: AgentCapacity,
+    requests: &mut GatewayRequests,
 ) -> Result<GenerationExit> {
-    loop {
-        if !config::session_is_active(session_id).await? {
-            disconnect_legacy(gateway, session_id, instance_id, generation).await;
-            return Ok(GenerationExit::Disconnected);
-        }
-
-        let poll_started = Instant::now();
-        let response = gateway
-            .request(Method::POST, "/v1/hosts/poll", None)
-            .json(&LegacyGenerationRequest {
-                session_id,
-                instance_id,
-                generation,
-            })
-            .send()
-            .await
-            .context("gateway poll request failed")?;
-
-        let Some(envelope) = poll_envelope(response, poll_started).await? else {
-            continue;
-        };
-        if envelope.1 {
-            return Ok(GenerationExit::Replaced);
-        }
-        let envelope = envelope.0.context("gateway poll returned no envelope")?;
-        let rpc_response = dispatch_response(&envelope.request).await;
-
-        let response = gateway
-            .request(Method::POST, "/v1/hosts/respond", None)
-            .json(&LegacyResponseRequest {
-                session_id,
-                instance_id,
-                generation,
-                request_id: &envelope.request_id,
-                response: &rpc_response,
-            })
-            .send()
-            .await
-            .context("gateway response upload failed")?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(GenerationExit::Replaced);
-        }
-        require_success(response, "gateway response upload").await?;
-    }
+    run_agent_generation(
+        AgentGeneration {
+            gateway: gateway.clone(),
+            route: AgentRoute::Legacy {
+                session_id: session_id.to_owned(),
+            },
+            instance_id: instance_id.to_owned(),
+            generation,
+            capacity,
+            admission: Arc::new(AtomicBool::new(true)),
+        },
+        requests,
+    )
+    .await
 }
 
 async fn run_host_generation(
-    gateway: &GatewayClient,
-    sessions: &session_control::SessionBackend,
-    host_id: &str,
-    instance_id: &str,
-    generation: u64,
-    connected_metadata: &HostSupervisorMetadata,
+    context: AgentGeneration,
+    requests: &mut GatewayRequests,
 ) -> Result<GenerationExit> {
-    let gateway_for_sync = gateway.clone();
-    let host_id_for_sync = host_id.to_owned();
+    let AgentRoute::Host { host_id, .. } = &context.route else {
+        anyhow::bail!("host generation requires a host route");
+    };
+    let gateway_for_sync = context.gateway.clone();
+    let host_id_for_sync = host_id.clone();
+    let generation = context.generation;
     let sync_task = tokio::spawn(async move {
         run_host_observation_sync(&gateway_for_sync, &host_id_for_sync).await;
     });
-    let gateway_for_events = gateway.clone();
-    let host_id_for_events = host_id.to_owned();
-    let instance_id_for_events = instance_id.to_owned();
+    let gateway_for_events = context.gateway.clone();
+    let host_id_for_events = host_id.clone();
+    let instance_id_for_events = context.instance_id.clone();
     let event_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
@@ -852,15 +883,7 @@ async fn run_host_generation(
             }
         }
     });
-    let result = run_host_generation_poll(
-        gateway,
-        sessions,
-        host_id,
-        instance_id,
-        generation,
-        connected_metadata,
-    )
-    .await;
+    let result = run_agent_generation(context, requests).await;
     sync_task.abort();
     let _ = sync_task.await;
     event_task.abort();
@@ -901,86 +924,353 @@ async fn run_host_observation_sync(gateway: &GatewayClient, host_id: &str) {
     }
 }
 
-async fn run_host_generation_poll(
-    gateway: &GatewayClient,
-    sessions: &session_control::SessionBackend,
-    host_id: &str,
-    instance_id: &str,
-    generation: u64,
-    connected_metadata: &HostSupervisorMetadata,
+async fn run_agent_generation(
+    context: AgentGeneration,
+    requests: &mut GatewayRequests,
 ) -> Result<GenerationExit> {
+    let _admission = GenerationAdmissionGuard(context.admission.clone());
+    let poll_context = context.clone();
+    run_concurrent_generation(
+        requests,
+        context.generation,
+        context.capacity,
+        move |accept_requests| {
+            let context = poll_context.clone();
+            async move { context.poll(accept_requests).await }
+        },
+        move |envelope| {
+            let context = context.clone();
+            async move { context.dispatch(envelope).await }
+        },
+    )
+    .await
+}
+
+/// Keep one poll future pinned while accepted requests finish. This prevents a
+/// fast completion from cancelling and duplicating an in-flight long poll.
+async fn run_concurrent_generation<P, PF, D, DF>(
+    requests: &mut GatewayRequests,
+    generation: u64,
+    capacity: AgentCapacity,
+    mut poll: P,
+    mut dispatch: D,
+) -> Result<GenerationExit>
+where
+    P: FnMut(bool) -> PF,
+    PF: std::future::Future<Output = Result<PollOutcome>>,
+    D: FnMut(PollEnvelope) -> DF,
+    DF: std::future::Future<Output = Result<Option<GenerationExit>>> + Send + 'static,
+{
     loop {
-        if let Some(exit) = verify_host_generation_metadata(
-            gateway,
-            sessions,
-            host_id,
-            instance_id,
-            generation,
-            connected_metadata,
-        )
-        .await?
-        {
-            return Ok(exit);
-        }
-
-        let poll_started = Instant::now();
-        let session_availability = current_host_session_availability().await;
-        let response = gateway
-            .request(Method::POST, "/v1/hosts/poll", Some(host_id))
-            .json(&HostPollRequest {
-                host_id,
-                instance_id,
-                generation,
-                session_availability: Some(session_availability.as_str()),
-            })
-            .send()
-            .await
-            .context("gateway host poll request failed")?;
-
-        let Some(envelope) = poll_envelope(response, poll_started).await? else {
+        let accept_requests = requests.len() < capacity.limit;
+        if !accept_requests && !capacity.heartbeat_supported {
+            if let Some(exit) = completed_request(requests.join_next().await, generation)? {
+                return Ok(exit);
+            }
             continue;
+        }
+
+        let polling = poll(accept_requests);
+        tokio::pin!(polling);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                completed = requests.join_next(), if !requests.is_empty() => {
+                    if let Some(exit) = completed_request(completed, generation)? {
+                        return Ok(exit);
+                    }
+                }
+                outcome = &mut polling => break outcome?,
+            }
         };
-        if envelope.1 {
-            return Ok(GenerationExit::Replaced);
+        match outcome {
+            PollOutcome::Request(envelope) => {
+                anyhow::ensure!(
+                    accept_requests,
+                    "gateway sent a request to a saturated agent"
+                );
+                let request = dispatch(envelope);
+                requests.spawn(async move { (generation, request.await) });
+            }
+            PollOutcome::Exit(exit) => return Ok(exit),
+            PollOutcome::Idle if requests.len() >= capacity.limit => {
+                tokio::select! {
+                    completed = requests.join_next() => {
+                        if let Some(exit) = completed_request(completed, generation)? {
+                            return Ok(exit);
+                        }
+                    }
+                    _ = tokio::time::sleep(CAPACITY_HEARTBEAT_INTERVAL) => {}
+                }
+            }
+            PollOutcome::Idle => {}
         }
-        let envelope = envelope
-            .0
-            .context("gateway host poll returned no envelope")?;
-
-        // The supervisor can stop or change while the long poll is waiting. Revalidate
-        // before dispatch so a dequeued request is never executed by a stale host generation.
-        if let Some(exit) = verify_host_generation_metadata(
-            gateway,
-            sessions,
-            host_id,
-            instance_id,
-            generation,
-            connected_metadata,
-        )
-        .await?
-        {
-            return Ok(exit);
-        }
-
-        let rpc_response = dispatch_host_response(&envelope.request, sessions).await;
-
-        let response = gateway
-            .request(Method::POST, "/v1/hosts/respond", Some(host_id))
-            .json(&HostResponseRequest {
-                host_id,
-                instance_id,
-                generation,
-                request_id: &envelope.request_id,
-                response: &rpc_response,
-            })
-            .send()
-            .await
-            .context("gateway host response upload failed")?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(GenerationExit::Replaced);
-        }
-        require_success(response, "gateway host response upload").await?;
     }
+}
+
+fn completed_request(
+    completed: CompletedGatewayRequest,
+    generation: u64,
+) -> Result<Option<GenerationExit>> {
+    let Some(completed) = completed else {
+        return Ok(None);
+    };
+    let (request_generation, outcome) = completed.context("gateway request worker failed")?;
+    match outcome {
+        Ok(exit) if request_generation == generation => Ok(exit),
+        Ok(_) => Ok(None),
+        Err(_) if request_generation != generation => {
+            // Work accepted by a retired generation may finish after its
+            // replacement connects. Its failure must not retire that newer
+            // generation.
+            eprintln!(
+                "gateway request failure ignored: code=retired_generation request_generation={request_generation} current_generation={generation}"
+            );
+            Ok(None)
+        }
+        Err(error) if gateway_transport_error(&error) => {
+            // Delivery uncertainty says nothing about execution. Keep the
+            // generation connected and let the caller reconcile the operation.
+            eprintln!(
+                "gateway request outcome unavailable: code=transport generation={request_generation}; reconcile the original operation"
+            );
+            Ok(None)
+        }
+        Err(_) => {
+            // Unknown conflicts and other non-transient protocol failures
+            // cannot be treated as successful delivery. Retire this generation
+            // without logging any remote response body.
+            eprintln!(
+                "gateway request failed: code=protocol_or_local_error generation={request_generation}; reconnecting"
+            );
+            Err(anyhow::anyhow!(
+                "gateway request failed in generation {request_generation}: protocol_or_local_error"
+            ))
+        }
+    }
+}
+
+impl AgentGeneration {
+    fn host_id(&self) -> Option<&str> {
+        match &self.route {
+            AgentRoute::Legacy { .. } => None,
+            AgentRoute::Host { host_id, .. } => Some(host_id),
+        }
+    }
+
+    async fn verify(&self) -> Result<Option<GenerationExit>> {
+        match &self.route {
+            AgentRoute::Legacy { session_id } => {
+                if config::session_is_active(session_id).await? {
+                    Ok(None)
+                } else {
+                    disconnect_legacy(
+                        &self.gateway,
+                        session_id,
+                        &self.instance_id,
+                        self.generation,
+                    )
+                    .await;
+                    Ok(Some(GenerationExit::Disconnected))
+                }
+            }
+            AgentRoute::Host {
+                host_id,
+                sessions,
+                metadata,
+            } => {
+                verify_host_generation_metadata(
+                    &self.gateway,
+                    sessions,
+                    host_id,
+                    &self.instance_id,
+                    self.generation,
+                    metadata,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn poll(&self, accept_requests: bool) -> Result<PollOutcome> {
+        if let Some(exit) = self.verify().await? {
+            return Ok(PollOutcome::Exit(exit));
+        }
+        let accept_requests = self.capacity.heartbeat_supported.then_some(accept_requests);
+        let poll_started = Instant::now();
+        let request = self
+            .gateway
+            .request(Method::POST, "/v1/hosts/poll", self.host_id());
+        let request = match &self.route {
+            AgentRoute::Legacy { session_id } => request.json(&LegacyPollRequest {
+                identity: LegacyGenerationRequest {
+                    session_id,
+                    instance_id: &self.instance_id,
+                    generation: self.generation,
+                },
+                accept_requests,
+            }),
+            AgentRoute::Host { host_id, .. } => {
+                let availability = current_host_session_availability().await;
+                request.json(&HostPollRequest {
+                    host_id,
+                    instance_id: &self.instance_id,
+                    generation: self.generation,
+                    session_availability: Some(availability.as_str()),
+                    accept_requests,
+                })
+            }
+        };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => {
+                eprintln!(
+                    "gateway poll deferred: code=transport; retaining generation {}",
+                    self.generation
+                );
+                tokio::time::sleep(DEFAULT_RECONNECT_DELAY).await;
+                return Ok(PollOutcome::Idle);
+            }
+        };
+        if transient_gateway_status(response.status()) {
+            eprintln!(
+                "gateway poll deferred: code=remote_unavailable status={}; retaining generation {}",
+                response.status().as_u16(),
+                self.generation
+            );
+            tokio::time::sleep(DEFAULT_RECONNECT_DELAY).await;
+            return Ok(PollOutcome::Idle);
+        }
+        match poll_envelope(response, poll_started).await {
+            Err(error) if gateway_transport_error(&error) => {
+                eprintln!(
+                    "gateway poll deferred: code=response_transport; retaining generation {}",
+                    self.generation
+                );
+                tokio::time::sleep(DEFAULT_RECONNECT_DELAY).await;
+                Ok(PollOutcome::Idle)
+            }
+            outcome => outcome,
+        }
+    }
+
+    async fn dispatch(&self, envelope: PollEnvelope) -> Result<Option<GenerationExit>> {
+        // Revalidate after the long poll and immediately before local admission.
+        // Session ownership and full-instance fencing remain in public dispatch.
+        if let Some(exit) = self.verify().await? {
+            return Ok(Some(exit));
+        }
+        if !self.admission.load(Ordering::SeqCst) {
+            return Ok(Some(GenerationExit::Replaced));
+        }
+        let response = match &self.route {
+            AgentRoute::Legacy { .. } => dispatch_response(&envelope.request).await,
+            AgentRoute::Host { sessions, .. } => {
+                dispatch_host_response(&envelope.request, sessions).await
+            }
+        };
+        self.upload_response(&envelope.request_id, &response).await
+    }
+
+    async fn upload_response(
+        &self,
+        request_id: &str,
+        rpc_response: &Value,
+    ) -> Result<Option<GenerationExit>> {
+        for attempt in 0..RESPONSE_UPLOAD_ATTEMPTS {
+            let request = self
+                .gateway
+                .request(Method::POST, "/v1/hosts/respond", self.host_id());
+            let request = match &self.route {
+                AgentRoute::Legacy { session_id } => request.json(&LegacyResponseRequest {
+                    session_id,
+                    instance_id: &self.instance_id,
+                    generation: self.generation,
+                    request_id,
+                    response: rpc_response,
+                }),
+                AgentRoute::Host { host_id, .. } => request.json(&HostResponseRequest {
+                    host_id,
+                    instance_id: &self.instance_id,
+                    generation: self.generation,
+                    request_id,
+                    response: rpc_response,
+                }),
+            };
+            match request.send().await {
+                Ok(response) if response.status().is_success() => return Ok(None),
+                Ok(response) if response.status() == StatusCode::CONFLICT => {
+                    match read_gateway_conflict(response).await {
+                        Ok(GatewayConflict::StaleRequest) => {
+                            eprintln!(
+                                "gateway response no longer awaited: code=stale_request generation={}; operation is not replayed",
+                                self.generation
+                            );
+                            return Ok(None);
+                        }
+                        Ok(GatewayConflict::Replaced) => {
+                            return Ok(Some(GenerationExit::Replaced));
+                        }
+                        Ok(GatewayConflict::PollReplaced) => {
+                            anyhow::bail!("unexpected poll conflict during response delivery")
+                        }
+                        Err(error) if gateway_transport_error(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(response) if !transient_gateway_status(response.status()) => {
+                    require_success(response, "gateway response upload").await?;
+                    return Ok(None);
+                }
+                Ok(_) | Err(_) => {}
+            }
+            if attempt + 1 < RESPONSE_UPLOAD_ATTEMPTS {
+                // Only resend this exact response envelope, never local dispatch.
+                tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
+            }
+        }
+        eprintln!(
+            "gateway response delivery unavailable: code=transport_or_remote_unavailable generation={}; reconcile the original operation",
+            self.generation
+        );
+        Ok(None)
+    }
+}
+
+fn transient_gateway_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+fn gateway_transport_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
+}
+
+fn gateway_conflict(value: &Value) -> Result<GatewayConflict> {
+    match value.get("error").and_then(Value::as_str) {
+        Some("stale_request") => Ok(GatewayConflict::StaleRequest),
+        Some("poll_replaced") => Ok(GatewayConflict::PollReplaced),
+        Some(
+            "stale_generation"
+            | "generation_replaced"
+            | "host_offline"
+            | "host_disconnected"
+            | "host_lease_expired"
+            | "registry_registration_failed"
+            | "registry_renewal_failed",
+        ) => Ok(GatewayConflict::Replaced),
+        _ => anyhow::bail!("gateway returned an unrecognized conflict"),
+    }
+}
+
+async fn read_gateway_conflict(response: Response) -> Result<GatewayConflict> {
+    let bytes = read_bounded_body(response, MAX_GATEWAY_ERROR_BYTES, "gateway conflict").await?;
+    gateway_conflict(
+        &serde_json::from_slice(&bytes).context("gateway conflict returned invalid JSON")?,
+    )
 }
 
 async fn verify_host_generation_metadata(
@@ -1019,26 +1309,33 @@ fn supervisor_metadata_changed(
     Ok(host_supervisor_metadata(status)? != *connected_metadata)
 }
 
-async fn poll_envelope(
-    response: Response,
-    poll_started: Instant,
-) -> Result<Option<(Option<PollEnvelope>, bool)>> {
+async fn poll_envelope(response: Response, poll_started: Instant) -> Result<PollOutcome> {
     if response.status() == StatusCode::NO_CONTENT {
         let delay = empty_poll_delay(poll_started.elapsed());
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        return Ok(None);
+        return Ok(PollOutcome::Idle);
     }
     if response.status() == StatusCode::CONFLICT {
-        return Ok(Some((None, true)));
+        return match read_gateway_conflict(response).await? {
+            GatewayConflict::Replaced => Ok(PollOutcome::Exit(GenerationExit::Replaced)),
+            GatewayConflict::PollReplaced => Ok(PollOutcome::Idle),
+            GatewayConflict::StaleRequest => {
+                anyhow::bail!("unexpected request conflict during poll")
+            }
+        };
     }
     let response = require_success(response, "gateway poll").await?;
     let bytes =
         read_bounded_body(response, MAX_GATEWAY_POLL_RESPONSE_BYTES, "gateway poll").await?;
     let envelope: PollEnvelope =
         serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
-    Ok(Some((Some(envelope), false)))
+    anyhow::ensure!(
+        !envelope.request_id.is_empty() && envelope.request_id.len() <= 256,
+        "gateway poll returned invalid request identity"
+    );
+    Ok(PollOutcome::Request(envelope))
 }
 
 fn empty_poll_delay(elapsed: Duration) -> Duration {
@@ -1367,6 +1664,396 @@ mod tests {
     use super::*;
     use crate::test_support;
 
+    fn request_envelope(id: u64) -> PollOutcome {
+        PollOutcome::Request(PollEnvelope {
+            request_id: id.to_string(),
+            request: json!({ "jsonrpc": "2.0", "id": id, "method": "ping" }),
+        })
+    }
+
+    #[test]
+    fn gateway_parallel_capacity_is_bounded_and_old_gateways_remain_compatible() {
+        for (advertised, expected) in [
+            (None, 1),
+            (Some(0), 1),
+            (Some(1), 1),
+            (Some(8), 8),
+            (Some(1024), 8),
+        ] {
+            let capacity = AgentCapacity::negotiated(advertised);
+            assert_eq!(capacity.limit, expected);
+            assert_eq!(capacity.heartbeat_supported, advertised.is_some());
+        }
+    }
+
+    #[test]
+    fn a_stale_request_is_not_evidence_of_a_replaced_generation() {
+        assert_eq!(
+            gateway_conflict(&json!({"error":"stale_request"})).unwrap(),
+            GatewayConflict::StaleRequest
+        );
+        assert_eq!(
+            gateway_conflict(&json!({"error":"poll_replaced"})).unwrap(),
+            GatewayConflict::PollReplaced
+        );
+        for code in [
+            "stale_generation",
+            "generation_replaced",
+            "host_offline",
+            "host_disconnected",
+            "host_lease_expired",
+        ] {
+            assert_eq!(
+                gateway_conflict(&json!({"error":code})).unwrap(),
+                GatewayConflict::Replaced
+            );
+        }
+        for value in [
+            json!({}),
+            json!({"error":false}),
+            json!({"error":"unknown"}),
+        ] {
+            assert!(gateway_conflict(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn generation_retirement_closes_new_admission() {
+        let admission = Arc::new(AtomicBool::new(true));
+        let retired = GenerationAdmissionGuard(admission.clone());
+        assert!(admission.load(Ordering::SeqCst));
+        drop(retired);
+        assert!(!admission.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn current_generation_protocol_failure_propagates_to_runner() {
+        let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let runner = tokio::spawn(async move {
+            let mut requests = GatewayRequests::new();
+            run_concurrent_generation(
+                &mut requests,
+                7,
+                AgentCapacity::negotiated(Some(2)),
+                move |_| {
+                    let receiver = receiver.clone();
+                    async move {
+                        receiver
+                            .lock()
+                            .await
+                            .recv()
+                            .await
+                            .context("protocol failure fixture input closed")
+                    }
+                },
+                |_envelope| async { anyhow::bail!("unrecognized gateway response conflict") },
+            )
+            .await
+        });
+        input.send(request_envelope(1)).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("runner did not receive the protocol failure")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    struct PollCancellationCounter {
+        cancelled: Arc<std::sync::atomic::AtomicUsize>,
+        completed: bool,
+    }
+
+    impl Drop for PollCancellationCounter {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_gateway_request_does_not_block_fast_work_or_cancel_a_pending_poll() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+            let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+            let (finished, mut finishes) = tokio::sync::mpsc::unbounded_channel();
+            let slow = Arc::new(tokio::sync::Notify::new());
+            let fast = Arc::new(tokio::sync::Notify::new());
+            let heartbeat = Arc::new(tokio::sync::Notify::new());
+            let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let poll_cancelled = cancelled.clone();
+            let poll_heartbeat = heartbeat.clone();
+            let worker_slow = slow.clone();
+            let worker_fast = fast.clone();
+            let runner = tokio::spawn(async move {
+                let mut requests = GatewayRequests::new();
+                let result = run_concurrent_generation(
+                    &mut requests,
+                    1,
+                    AgentCapacity {
+                        limit: 2,
+                        heartbeat_supported: true,
+                    },
+                    move |accept| {
+                        let receiver = receiver.clone();
+                        let heartbeat = poll_heartbeat.clone();
+                        let cancelled = poll_cancelled.clone();
+                        async move {
+                            if !accept {
+                                heartbeat.notify_one();
+                                return Ok(PollOutcome::Idle);
+                            }
+                            let mut guard = PollCancellationCounter {
+                                cancelled,
+                                completed: false,
+                            };
+                            let result = receiver
+                                .lock()
+                                .await
+                                .recv()
+                                .await
+                                .context("fixture input closed");
+                            guard.completed = true;
+                            result
+                        }
+                    },
+                    move |envelope| {
+                        let slow = worker_slow.clone();
+                        let fast = worker_fast.clone();
+                        let started = started.clone();
+                        let finished = finished.clone();
+                        async move {
+                            let id = envelope.request["id"].as_u64().unwrap();
+                            started.send(id).unwrap();
+                            if id == 1 {
+                                slow.notified().await
+                            } else {
+                                fast.notified().await
+                            }
+                            finished.send(id).unwrap();
+                            Ok(None)
+                        }
+                    },
+                )
+                .await;
+                while let Some(completed) = requests.join_next().await {
+                    completed.unwrap().1.unwrap();
+                }
+                result
+            });
+            input.send(request_envelope(1)).unwrap();
+            input.send(request_envelope(2)).unwrap();
+            let mut ids = [starts.recv().await.unwrap(), starts.recv().await.unwrap()];
+            ids.sort();
+            assert_eq!(ids, [1, 2]);
+            heartbeat.notified().await;
+            fast.notify_one();
+            assert_eq!(finishes.recv().await, Some(2));
+            slow.notify_one();
+            assert_eq!(finishes.recv().await, Some(1));
+            input
+                .send(PollOutcome::Exit(GenerationExit::Disconnected))
+                .unwrap();
+            assert_eq!(runner.await.unwrap().unwrap(), GenerationExit::Disconnected);
+            assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        })
+        .await
+        .expect("bounded concurrent gateway scenario stalled");
+    }
+
+    #[tokio::test]
+    async fn retired_generation_keeps_accepted_work_and_shares_capacity_with_its_replacement() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut requests = GatewayRequests::new();
+            let capacity = AgentCapacity {
+                limit: 2,
+                heartbeat_supported: true,
+            };
+            let first = Arc::new(tokio::sync::Notify::new());
+            let second = Arc::new(tokio::sync::Notify::new());
+            let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let poll_started = started.clone();
+            let worker_started = started.clone();
+            let first_worker = first.clone();
+            let second_worker = second.clone();
+            let mut next_id = 0;
+            let retired = run_concurrent_generation(
+                &mut requests,
+                1,
+                capacity,
+                move |accept| {
+                    next_id += 1;
+                    let id = next_id;
+                    let started = poll_started.clone();
+                    async move {
+                        if accept {
+                            return Ok(request_envelope(id));
+                        }
+                        while started.load(Ordering::SeqCst) < 2 {
+                            tokio::task::yield_now().await;
+                        }
+                        Ok(PollOutcome::Exit(GenerationExit::Replaced))
+                    }
+                },
+                move |envelope| {
+                    let first = first_worker.clone();
+                    let second = second_worker.clone();
+                    let started = worker_started.clone();
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        if envelope.request["id"] == 1 {
+                            first.notified().await;
+                            anyhow::bail!("unrecognized gateway response conflict")
+                        } else {
+                            second.notified().await;
+                            Ok(None)
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(retired, GenerationExit::Replaced);
+            assert_eq!(requests.len(), 2);
+
+            let heartbeat = Arc::new(tokio::sync::Notify::new());
+            let poll_heartbeat = heartbeat.clone();
+            let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+            let (new_started, new_start) = tokio::sync::oneshot::channel();
+            let mut new_started = Some(new_started);
+            let runner = tokio::spawn(async move {
+                let result = run_concurrent_generation(
+                    &mut requests,
+                    2,
+                    capacity,
+                    move |accept| {
+                        let heartbeat = poll_heartbeat.clone();
+                        let receiver = receiver.clone();
+                        async move {
+                            if !accept {
+                                heartbeat.notify_one();
+                                return Ok(PollOutcome::Idle);
+                            }
+                            receiver
+                                .lock()
+                                .await
+                                .recv()
+                                .await
+                                .context("replacement fixture input closed")
+                        }
+                    },
+                    move |_envelope| {
+                        let started = new_started.take().unwrap();
+                        async move {
+                            started.send(()).unwrap();
+                            Ok(None)
+                        }
+                    },
+                )
+                .await;
+                (result, requests)
+            });
+            heartbeat.notified().await;
+            input.send(request_envelope(3)).unwrap();
+            first.notify_one();
+            new_start.await.unwrap();
+            // A protocol failure from generation 1 must not retire generation 2.
+            input
+                .send(PollOutcome::Exit(GenerationExit::Disconnected))
+                .unwrap();
+            let (result, mut requests) = runner.await.unwrap();
+            assert_eq!(result.unwrap(), GenerationExit::Disconnected);
+            assert!(
+                !requests.is_empty(),
+                "the other accepted old request must remain owned"
+            );
+            second.notify_one();
+            while let Some(completed) = requests.join_next().await {
+                completed.unwrap().1.unwrap();
+            }
+            assert_eq!(started.load(Ordering::SeqCst), 2);
+        })
+        .await
+        .expect("generation replacement scenario stalled");
+    }
+
+    #[tokio::test]
+    async fn response_retry_resends_the_same_envelope_and_stale_request_keeps_the_generation() {
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let observed = received.clone();
+        let app = axum::Router::new().route(
+            "/v1/hosts/respond",
+            axum::routing::post(move |axum::Json(value): axum::Json<Value>| {
+                let observed = observed.clone();
+                async move {
+                    let mut requests = observed.lock().await;
+                    requests.push(value);
+                    if requests.len() == 1 {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            axum::Json(json!({"error":"temporary"})),
+                        )
+                    } else {
+                        (
+                            StatusCode::CONFLICT,
+                            axum::Json(json!({"error":"stale_request"})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, stopping) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopping.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let context = AgentGeneration {
+            gateway: GatewayClient {
+                client: client.clone(),
+                sync_client: client,
+                base_url: format!("http://{address}"),
+                host_token: Uuid::new_v4().to_string(),
+                access_client_id: None,
+                access_client_secret: None,
+            },
+            route: AgentRoute::Legacy {
+                session_id: "upload-fixture".to_owned(),
+            },
+            instance_id: "same-agent".to_owned(),
+            generation: 7,
+            capacity: AgentCapacity::negotiated(Some(8)),
+            admission: Arc::new(AtomicBool::new(true)),
+        };
+        let result = context
+            .upload_response(
+                "same-request",
+                &json!({"jsonrpc":"2.0","id":42,"result":{}}),
+            )
+            .await;
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), None);
+        let received = received.lock().await;
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0], received[1]);
+        assert_eq!(received[0]["generation"], 7);
+        assert_eq!(received[0]["request_id"], "same-request");
+    }
+
     #[test]
     fn gateway_url_requires_a_secure_origin() {
         assert_eq!(
@@ -1569,13 +2256,20 @@ mod tests {
     fn host_session_availability_classifies_live_inventory_without_paths() {
         let ready = HostSessionAvailability::Ready;
         let no_live = HostSessionAvailability::SessionUnavailable;
-        assert_eq!(classify_host_session_availability(&["active"]), ready);
         assert_eq!(
-            classify_host_session_availability(&["stopped", "starting"]),
+            classify_host_session_availability(&[("active", false)]),
             ready
         );
         assert_eq!(
-            classify_host_session_availability(&["stopped", "failed"]),
+            classify_host_session_availability(&[("stopped", false), ("starting", false)]),
+            no_live
+        );
+        assert_eq!(
+            classify_host_session_availability(&[("stopped", false), ("failed", false)]),
+            no_live
+        );
+        assert_eq!(
+            classify_host_session_availability(&[("active", true)]),
             no_live
         );
         assert_eq!(classify_host_session_availability(&[]), no_live);
@@ -1594,20 +2288,24 @@ mod tests {
             instance_id: "instance-a",
             generation: 2,
             session_availability: Some("session_unavailable"),
+            accept_requests: Some(false),
         })
         .unwrap();
         assert_eq!(payload["session_availability"], "session_unavailable");
         assert_eq!(payload["generation"], 2);
         assert_eq!(payload["host_id"], "mac-main");
+        assert_eq!(payload["accept_requests"], false);
 
         let omitted = serde_json::to_value(HostPollRequest {
             host_id: "mac-main",
             instance_id: "instance-a",
             generation: 2,
             session_availability: None,
+            accept_requests: None,
         })
         .unwrap();
         assert!(omitted.get("session_availability").is_none());
+        assert!(omitted.get("accept_requests").is_none());
     }
 
     #[tokio::test]

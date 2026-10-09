@@ -351,9 +351,11 @@ async fn main() -> Result<()> {
         #[cfg(feature = "network")]
         cli::Command::FabricStatus => {
             load_public_env()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&gateway::fabric_status().await?)?
+            let status = gateway::fabric_status().await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            anyhow::ensure!(
+                status.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+                "Fabric is not ready; review the stage diagnostics above."
             );
             Ok(())
         }
