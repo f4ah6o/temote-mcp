@@ -184,3 +184,16 @@ git push -f origin latest
 `dist-workspace.toml` is the source of truth for binary distribution. `dist generate` refreshes `.github/workflows/release.yml`; do not hand-edit the generated workflow. Releases currently build `.tar.xz` archives for Apple Silicon macOS plus ARM64 and x64 GNU/Linux, then publish them to GitHub Releases. Intel macOS is not supported.
 
 The existing crates.io package remains `temote-mcp`. `cargo binstall temote-mcp@<version>` uses its `pkg-url` to select the matching prefixless CalVer release tag and the `temote-mcp-<target>.tar.xz` archive with its `.sha256` sidecar, rather than redirecting to `latest`. Each archive contains the canonical `temote` CLI, the compatible `temote-mcp` executable, and the `temote-linux-sandbox` helper. Source installs use `cargo install --path . --locked`.
+
+Alpha releases use the same `Allocate Release` workflow and Trusted Publishing identity. A manual `workflow_dispatch` is the alpha path; the required `expected_alpha_version` and `expected_source_sha` inputs must match the next candidate and the exact workflow source commit. The workflow still requires that source commit to be in `main`. The `#98` feature branch is not eligible until it is merged to `main` and a release owner approves the exact version and source SHA. Alpha versions use the same CalVer base as the next stable candidate with an immutable `-alpha.N` suffix, for example `YYYY.M.P-alpha.1`; the month is not zero-padded. The allocator serializes with stable releases, considers only matching alpha tags, and pushes tags without force. It never moves `latest`, edits the generated `release.yml`, or changes the baseline package version on `main`.
+
+To install an already-published alpha, replace the placeholder with the exact version from its GitHub prerelease and then hand the installed binary to the existing supervisor upgrade flow:
+
+```sh
+ALPHA_VERSION='YYYY.M.P-alpha.N' # replace with an exact published version
+cargo binstall "temote-mcp@${ALPHA_VERSION}" --force
+temote upgrade --dry-run
+temote upgrade
+```
+
+Cargo and cargo-binstall do not select prereleases by default; the exact version is required. If validation fails before the immutable tag is pushed, no alpha version is reserved. Once the tag is pushed, that version stays reserved even if a later publish step fails: do not rerun the allocator with that version, move the tag, or publish different contents under it. If crates.io publication succeeded but the GitHub Release was not created, dispatch the generated `Release` workflow at the same immutable tag (`gh workflow run release.yml --ref "$ALPHA_VERSION" -f "tag=$ALPHA_VERSION"`). If a GitHub Release already exists, the generated workflow refuses to replace it; preserve it and request approval for a new alpha number after checking the partial release.

@@ -19,6 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Test alpha release allocation and workflow contract
+        run: python3 -B scripts/test_alpha_release.py
+
       - name: Set up Node
         uses: actions/setup-node@v6
         with:

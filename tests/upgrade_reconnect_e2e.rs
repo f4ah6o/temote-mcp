@@ -22,17 +22,11 @@ const UPGRADE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SOURCE_FILES: usize = 512;
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
+#[path = "support/upgrade_version.rs"]
+mod upgrade_version;
+
 fn distinct_target_version() -> String {
-    let mut components = SOURCE_VERSION
-        .split('.')
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    assert_eq!(components.len(), 3, "package version is not CalVer");
-    let patch = components[2]
-        .parse::<u64>()
-        .expect("package patch version is not numeric");
-    components[2] = (patch + 1).to_string();
-    components.join(".")
+    upgrade_version::distinct_target_version_for(SOURCE_VERSION)
 }
 
 fn socket_namespace() -> String {

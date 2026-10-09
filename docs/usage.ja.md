@@ -29,6 +29,17 @@ supervisor の bounded local activity stream は `temote-mcp activity [SESSION_I
 
 installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。dry-run の `blocked_sessions` には復元不能な session と理由が一覧され、`temote-mcp upgrade --force` はそれらを停止して続行します(復元されません)が、互換性 gate は回避しません。通常の upgrade が blocked の場合は件数 summary を維持し、検証済み session ID と安全化した理由を bounded に表示します。restart context の key として表示されるのは `LANG`、`LC_ALL`、`PATH` のみです。dry-run は制限された read-only supervisor request を使い、session reaper、lifecycle metadata の reconcile、終了済み session の cleanup、restart 予約を実行しません。installed binary の同一性を保つため private な一時 executable snapshot と capability check subprocess は実行します。この一時 file は check 終了時に削除され、supervisor の通常の background maintenance は従来どおり独立して動きます。read-only diagnostic request に未対応の supervisor は dry-run を fail closed にし、legacy Ping/Upgrade request へ fallback しません。authenticated direct HTTP の `upgrade_preflight` も同じ経路です。upgrade apply の maintenance preflight は互換性を保ちます。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
 
+公開済み alpha を試す場合は、正確な CalVer prerelease version を明示して install し、同じ upgrade handoff を使います。
+
+```sh
+ALPHA_VERSION='YYYY.M.P-alpha.N' # 公開済みの正確な version に置き換える
+cargo binstall "temote-mcp@${ALPHA_VERSION}" --force
+temote-mcp upgrade --dry-run
+temote-mcp upgrade
+```
+
+`upgrade` command は release channel を選択したり download したりしません。`cargo binstall` に alpha version を明示してください。
+
 CLI の `session list` / `session info` と gateway readiness diagnostic は制限された read-only request を使います。古い実行中 supervisor では置き換えまたは restart まで unavailable と報告される場合があり、legacy maintenance request へ fallback しません。MCP `session_list` は既存の `serve` と `fabric connect` で古い supervisor 経由の session discovery を維持するため operational list request を使います。この互換経路には CLI diagnostic と同じ厳密な no-maintenance 保証はありません。
 
 `session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` に加え、durable metadata は残っているが canonical な working directory または permitted workspace root が解決できなくなった session を `degraded` として確認できます。degraded entry は保存済みの ID、path、lifecycle timestamp を保持したまま返し、listing 全体を失敗させません。消失した path を stopped / crashed runtime と読み替えることはなく、`session info` も同じ bounded な degraded view を返します。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。working directory が対応する標準 Git worktree 配下にある場合は、configured な `src` named root から導出した非 secret の `workspace` identity(`canonical_checkout` / `managed_worktree` / `legacy_worktree` の `workspace_type` と、判明していれば `repository_root`、`workspace_root`、`repository`、`branch`、managed task 名)も返します。identity は read-only で、workspace が解決できなくなると表示されません。bare repository または `.git` 以外の common directory を使う標準 linked worktree では、lifecycle admission とこの bounded view は検証済み canonical common directory を repository identity として使います。managed-worktree authority と Git mutation access の strict な primary-checkout 要件は緩和しません。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。restart は old full session instance を fence し、replacement の開始前に登録済み Codex runtime を shutdown します。replacement の開始に失敗しても old child runtime は残しません。
