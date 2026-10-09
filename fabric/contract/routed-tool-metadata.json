@@ -1,0 +1,1513 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List currently leased federated hosts.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "host_list",
+    "title": "List federated Temote hosts"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Show one currently leased federated host.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id"
+      ],
+      "type": "object"
+    },
+    "name": "host_info",
+    "title": "Inspect a federated Temote host"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "session_list",
+    "title": "List federated Temote sessions"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Start from exactly one existing named-root path or repository source. Repository provisioning requires a caller-generated operation_id and returns a pending receipt until its delegated preparation is ready. Public sessions remain normal and never yolo.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "required": [
+            "source",
+            "operation_id"
+          ]
+        }
+      ],
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "source": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "base": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "repository"
+                },
+                "repository": {
+                  "type": "string"
+                },
+                "vcs": {
+                  "enum": [
+                    "auto",
+                    "jujutsu",
+                    "git"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "repository"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "host_id"
+      ],
+      "type": "object"
+    },
+    "name": "session_start",
+    "title": "Start a managed Temote MCP session"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "session_stop",
+    "title": "Stop a managed Temote MCP session"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "session_restart",
+    "title": "Restart a managed Temote MCP session"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "session_info",
+    "title": "Inspect a Temote MCP session"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently delegate one bare Git clone into a non-existing root-relative destination. The lifecycle supervisor must admit an active non-yolo session whose cwd is exactly the configured named root. Source may be a path under that same logical root or an HTTPS Git URL without credentials, query, or fragment. The clone runs in Codex with networkAccess=false and existing command/network approvals.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "destination": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "effort": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "root": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "source": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "root",
+        "source",
+        "destination",
+        "model",
+        "effort"
+      ],
+      "type": "object"
+    },
+    "name": "repository_clone_bare",
+    "title": "Clone a bare repository under a named root"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Resolve bounded repository or session context from the authenticated cloud replica: observed tasks and instructions, derived knowledge, support references, and source/worker freshness. Repository requests work with offline execution hosts. Session requests without cloud mapping fall back to the owning host. Replicated observations and derived knowledge are distinct from authoritative live host state. Raw observation bodies are not returned.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "session_id"
+          ]
+        },
+        {
+          "required": [
+            "repository"
+          ]
+        }
+      ],
+      "properties": {
+        "at_least_cloud_seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "at_least_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "budget_bytes": {
+          "default": 16384,
+          "maximum": 65536,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "limit": {
+          "default": 16,
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "repository": {
+          "description": "Stable repository key, for example github:owner/repository. Resolves from the authenticated cloud replica even when execution hosts are offline.",
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "workspace_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "context_resolve",
+    "title": "Resolve repository or session context"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Inspect authenticated repository or session source cursors, gaps, synchronization freshness, and memory-worker readiness, errors and lag. Repository requests do not require an online host. Unmapped session requests retain the owning-host fallback.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "session_id"
+          ]
+        },
+        {
+          "required": [
+            "repository"
+          ]
+        }
+      ],
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "repository": {
+          "description": "Stable repository key, for example github:owner/repository. Resolves from the authenticated cloud replica even when execution hosts are offline.",
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "context_status",
+    "title": "Inspect repository or session context freshness"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 16384,
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset_bytes": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "evidence_id"
+      ],
+      "type": "object"
+    },
+    "name": "evidence_read",
+    "title": "Read scoped Temote evidence"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Check the locally installed Codex app-server through stdio, validate the concrete protocol response shapes Temote consumes, and return bounded model/effort plus best-effort version diagnostics without a release-number allowlist.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "codex_status",
+    "title": "Check Codex app-server compatibility"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. An optional typed continuation resumes a retained terminal Codex task's conversation in a new task. operation_id is mandatory; no sandbox escape option is exposed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "continuation": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "new"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "task_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "previous_task"
+                }
+              },
+              "required": [
+                "type",
+                "task_id"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "effort": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "task",
+        "model",
+        "effort"
+      ],
+      "type": "object"
+    },
+    "name": "codex_task_start",
+    "title": "Start a scoped Codex task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "wait_ms": {
+          "default": 0,
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "codex_task_get",
+    "title": "Read a scoped Codex task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "steer",
+            "resume",
+            "interrupt"
+          ],
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "input": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "operation_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "codex_task_control",
+    "title": "Control a scoped Codex task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Probe the locally installed OpenCode binary by starting a short-lived opencode serve on loopback, validate health and provider inventory, and return bounded diagnostics without a release-number allowlist.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "opencode_status",
+    "title": "Check OpenCode serve compatibility"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Accept an idempotent scoped OpenCode task mutation. workspace_requirement=managed_commands requires the host-authorized managed checkout and a safe command sandbox; unsupported command capability returns a structured blocker before acceptance. operation_id is mandatory; no sandbox escape option is exposed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "variant": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "workspace_requirement": {
+          "enum": [
+            "managed_commands"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "opencode_task_start",
+    "title": "Start a scoped OpenCode task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read and reconcile a retained OpenCode task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "wait_ms": {
+          "default": 0,
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "opencode_task_get",
+    "title": "Read a scoped OpenCode task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently steer, resume, interrupt, or answer one exact pending OpenCode permission/question interaction. answer uses interaction_id plus a structured answer object and never injects ordinary prompt text. Acceptance is persisted before the serve side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "steer",
+            "resume",
+            "interrupt",
+            "answer"
+          ],
+          "type": "string"
+        },
+        "answer": {
+          "additionalProperties": false,
+          "properties": {
+            "answers": {
+              "items": {
+                "items": {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              "maxItems": 64,
+              "type": "array"
+            },
+            "message": {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            "reply": {
+              "enum": [
+                "once",
+                "always",
+                "reject"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "input": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "interaction_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "operation_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "opencode_task_control",
+    "title": "Control a scoped OpenCode task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Probe the locally installed Devin CLI by starting a short-lived devin acp on stdio, validate the initialize response shape Temote consumes, and return bounded agent capability diagnostics without a release-number allowlist.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "devin_status",
+    "title": "Check Devin ACP compatibility"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Accept an idempotent scoped Devin task mutation, persist acceptance before child side effects, then start a per-task devin acp child process over stdio and create its ACP session. operation_id is mandatory; no sandbox escape option is exposed. Set cloud=true to relay through `devin acp --cloud` to Devin Cloud instead of running the local agent; model and agent are ignored in cloud mode and must be omitted.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "cloud": {
+          "type": "boolean"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "devin_task_start",
+    "title": "Start a scoped Devin task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read and reconcile a retained Devin task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "wait_ms": {
+          "default": 0,
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "devin_task_get",
+    "title": "Read a scoped Devin task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently steer, resume, or interrupt a retained scoped Devin task. Acceptance is persisted before the acp side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly. Resume requires the agent's advertised loadSession capability and fails closed without it.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "steer",
+            "resume",
+            "interrupt"
+          ],
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "input": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "operation_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "devin_task_control",
+    "title": "Control a scoped Devin task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Verify the configured Devin Cloud API v3 credential by calling /v3/self and return the authenticated principal, organization, and API base URL. The credential value itself is never returned.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "devin_cloud_status",
+    "title": "Check Devin Cloud API access"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "devin_mode": {
+          "description": "Devin session mode. The swe-2-medium/high/max values select SWE-2 reasoning effort only; they do not by themselves select promo or priority.",
+          "enum": [
+            "normal",
+            "fast",
+            "lite",
+            "ultra",
+            "fusion",
+            "swe-2-medium",
+            "swe-2-high",
+            "swe-2-max"
+          ],
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "max_acu_limit": {
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "repos": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "swe_tier": {
+          "description": "Optional SWE-2 service tier. promo preserves the selected SWE-2 mode and lets upstream account eligibility determine promotional pricing; priority resolves one exact account-visible SWE-2 priority/fast UID from the local Devin model catalog and fails closed if unavailable or ambiguous.",
+          "enum": [
+            "promo",
+            "priority"
+          ],
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "devin_cloud_task_start",
+    "title": "Start a Devin Cloud session task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "wait_ms": {
+          "default": 0,
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id"
+      ],
+      "type": "object"
+    },
+    "name": "devin_cloud_task_get",
+    "title": "Read a Devin Cloud session task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "steer",
+            "resume",
+            "interrupt"
+          ],
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "input": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "task_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "task_id",
+        "operation_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "devin_cloud_task_control",
+    "title": "Control a Devin Cloud session task"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Poll a legacy background sandbox job owned by the session. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "output_limit_bytes": {
+          "maximum": 1048576,
+          "minimum": 256,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "status_only": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "job_id"
+      ],
+      "type": "object"
+    },
+    "name": "poll_job",
+    "title": "Poll a sandbox job"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 128,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "job_list",
+    "title": "List current-session sandbox jobs"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Return a bounded read-only projection of the delegated tasks owned by this full session instance and canonical scope, merged across every delegation backend. Each item carries backend and task_id for use with the matching *_task_get tool. A backend whose retained store cannot be read is reported per-backend as unavailable instead of failing the whole list. Listing reads retained records only; it never reconciles or mutates tasks.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 128,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "task_list",
+    "title": "List session delegated tasks"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Stop a legacy background sandbox job owned by the session.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "job_id"
+      ],
+      "type": "object"
+    },
+    "name": "stop_job",
+    "title": "Stop a sandbox job"
+  },
+  {
+    "_meta": {
+      "openai/ui": {
+        "entrypoints": [
+          {
+            "type": "global"
+          }
+        ]
+      },
+      "ui": {
+        "resourceUri": "ui://temote-fabric/overview",
+        "visibility": [
+          "model",
+          "app"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read Fabric service information and configured hosts with live availability and replica freshness. No session or task mutations.",
+    "icons": [
+      {
+        "mimeType": "image/svg+xml",
+        "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.33'%3E%3Crect x='3' y='2.5' width='14' height='6' rx='1.5'/%3E%3Crect x='3' y='11.5' width='14' height='6' rx='1.5'/%3E%3Cpath d='M6 5.5h.01M6 14.5h.01M10 5.5h4M10 14.5h4'/%3E%3C/svg%3E"
+      }
+    ],
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "fabric_overview",
+    "title": "Temote Fabric"
+  },
+  {
+    "_meta": {
+      "ui": {
+        "visibility": [
+          "model",
+          "app"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read the bounded redacted session list for one explicitly selected configured Fabric host.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id"
+      ],
+      "type": "object"
+    },
+    "name": "fabric_session_list",
+    "title": "List Fabric host sessions"
+  },
+  {
+    "_meta": {
+      "ui": {
+        "visibility": [
+          "model",
+          "app"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read redacted session details and bounded retained task state for an explicit host and session. Does not reconcile tasks or return transcripts, output, approval details, or filesystem paths.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "fabric_session_read",
+    "title": "Read a Fabric session and retained tasks"
+  }
+]

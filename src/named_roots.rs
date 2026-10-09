@@ -13,12 +13,12 @@ pub struct NamedRoots {
 
 impl NamedRoots {
     pub fn from_env() -> Result<Self> {
-        let Some(value) = std::env::var_os("TEMOTE_MCP_ROOTS") else {
+        let Some(value) = temote_mcp::environment::var_os("TEMOTE_MCP_ROOTS") else {
             return Ok(Self::default());
         };
         let value = value
             .into_string()
-            .map_err(|_| anyhow::anyhow!("TEMOTE_MCP_ROOTS must be valid UTF-8"))?;
+            .map_err(|_| anyhow::anyhow!("TEMOTE_ROOTS must be valid UTF-8"))?;
         Self::parse(&value)
     }
 
@@ -32,9 +32,9 @@ impl NamedRoots {
             parse_json_roots(value)?
         } else {
             let (name, path) = value.split_once('=').context(
-                "TEMOTE_MCP_ROOTS must be either a single name=path mapping or a JSON object",
+                "TEMOTE_ROOTS must be either a single name=path mapping or a JSON object",
             )?;
-            anyhow::ensure!(!path.is_empty(), "TEMOTE_MCP_ROOTS path must not be empty");
+            anyhow::ensure!(!path.is_empty(), "TEMOTE_ROOTS path must not be empty");
             BTreeMap::from([(name.to_owned(), path.to_owned())])
         };
 
@@ -53,6 +53,12 @@ impl NamedRoots {
                 "configured named root {name} is not a directory: {}",
                 canonical.display()
             );
+            if let Some((other, _)) = roots.iter().find(|(_, path)| **path == canonical) {
+                anyhow::bail!(
+                    "named roots {other} and {name} resolve to the same directory: {}",
+                    canonical.display()
+                );
+            }
             roots.insert(name, canonical);
         }
         Ok(Self { roots })
@@ -84,10 +90,10 @@ impl NamedRoots {
             .get(&root_name)
             .with_context(|| {
                 if self.roots.is_empty() {
-                    "no named roots are configured; set TEMOTE_MCP_ROOTS on the host before starting temote-mcp (a single mapping like TEMOTE_MCP_ROOTS='src=~/src' or a JSON object like {\"src\":\"~/src\"}) and restart temote-mcp, then retry session_start".to_owned()
+                    "no named roots are configured; set TEMOTE_ROOTS on the host before starting temote-mcp (a single mapping like TEMOTE_ROOTS='src=~/src' or a JSON object like {\"src\":\"~/src\"}) and restart temote-mcp, then retry session_start".to_owned()
                 } else {
                     format!(
-                        "unknown named root: {root_name} (configured: {}; to add a root, include it in TEMOTE_MCP_ROOTS on the host and restart temote-mcp)",
+                        "unknown named root: {root_name} (configured: {}; to add a root, include it in TEMOTE_ROOTS on the host and restart temote-mcp)",
                         self.roots
                             .keys()
                             .cloned()
@@ -116,10 +122,49 @@ impl NamedRoots {
         Ok(target)
     }
 
+    /// Resolve a physical cwd back to its most specific logical named root.
+    pub fn reverse_resolve(&self, cwd: &Path) -> Result<Option<String>> {
+        let cwd = crate::config::canonical_directory(cwd)?;
+        let mut best: Option<(&str, &Path, usize)> = None;
+        let mut tied_with = None;
+        for (name, root) in &self.roots {
+            if cwd != *root && !cwd.starts_with(root) {
+                continue;
+            }
+            let depth = root.components().count();
+            match best {
+                Some((_, _, best_depth)) if depth == best_depth => tied_with = Some(name.as_str()),
+                Some((_, _, best_depth)) if depth < best_depth => {}
+                _ => {
+                    best = Some((name, root, depth));
+                    tied_with = None;
+                }
+            }
+        }
+        let Some((name, root, _)) = best else {
+            return Ok(None);
+        };
+        if let Some(other) = tied_with {
+            anyhow::bail!(
+                "named roots {name} and {other} ambiguously match {}",
+                cwd.display()
+            );
+        }
+        let relative = cwd.strip_prefix(root)?;
+        if relative.as_os_str().is_empty() {
+            Ok(Some(name.to_owned()))
+        } else {
+            let relative = relative
+                .to_str()
+                .context("session cwd must be valid UTF-8")?;
+            Ok(Some(format!("{name}/{relative}")))
+        }
+    }
+
     /// Canonical physical path of the configured named root called `name`.
     ///
     /// Callers use this for policy anchors (for example the managed-worktree
-    /// `src` root) so the physical root always comes from `TEMOTE_MCP_ROOTS`
+    /// `src` root) so the physical root always comes from `TEMOTE_ROOTS`
     /// rather than from `HOME` or a client-supplied path.
     pub fn canonical_root(&self, name: &str) -> Option<&Path> {
         self.roots.get(name).map(PathBuf::as_path)
@@ -170,12 +215,12 @@ fn parse_json_roots(value: &str) -> Result<BTreeMap<String, String>> {
                 }
                 if roots.insert(name.clone(), path.to_owned()).is_some() {
                     return Err(de::Error::custom(format!(
-                        "duplicate named root in TEMOTE_MCP_ROOTS JSON: {name}"
+                        "duplicate named root in TEMOTE_ROOTS JSON: {name}"
                     )));
                 }
             }
             if roots.is_empty() {
-                return Err(de::Error::custom("TEMOTE_MCP_ROOTS JSON must not be empty"));
+                return Err(de::Error::custom("TEMOTE_ROOTS JSON must not be empty"));
             }
             Ok(roots)
         }
@@ -184,10 +229,10 @@ fn parse_json_roots(value: &str) -> Result<BTreeMap<String, String>> {
     let mut deserializer = serde_json::Deserializer::from_str(value);
     let roots = deserializer
         .deserialize_map(UniqueRootMapVisitor)
-        .context("invalid TEMOTE_MCP_ROOTS JSON")?;
+        .context("invalid TEMOTE_ROOTS JSON")?;
     deserializer
         .end()
-        .context("invalid trailing TEMOTE_MCP_ROOTS JSON content")?;
+        .context("invalid trailing TEMOTE_ROOTS JSON content")?;
     Ok(roots)
 }
 
@@ -237,15 +282,82 @@ mod tests {
     #[test]
     fn parses_single_mapping_and_json_object() {
         let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
         let single = NamedRoots::parse(&format!("src={}", root.path().display())).unwrap();
         assert!(!single.is_empty());
 
         let json = serde_json::json!({
             "src": root.path().to_string_lossy(),
-            "work": root.path().to_string_lossy(),
+            "work": other.path().to_string_lossy(),
         });
         let multiple = NamedRoots::parse(&json.to_string()).unwrap();
         assert!(!multiple.is_empty());
+    }
+
+    #[test]
+    fn rejects_distinct_names_for_the_same_canonical_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, fixture.path().join("alias")).unwrap();
+        let config = serde_json::json!({"first":real,"second":fixture.path().join("alias")});
+        let error = NamedRoots::parse(&config.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("first") && error.contains("second"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reverse_resolves_longest_root_and_canonicalizes_symlinks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let outer = fixture.path().join("outer");
+        let nested = outer.join("nested");
+        let leaf = nested.join("repo");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&leaf, fixture.path().join("inside-link")).unwrap();
+        symlink(&outside, fixture.path().join("outside-link")).unwrap();
+        let roots =
+            NamedRoots::parse(&serde_json::json!({"outer":outer,"inner":nested}).to_string())
+                .unwrap();
+        assert_eq!(
+            roots.reverse_resolve(&leaf).unwrap().as_deref(),
+            Some("inner/repo")
+        );
+        assert_eq!(
+            roots
+                .reverse_resolve(&fixture.path().join("inside-link"))
+                .unwrap()
+                .as_deref(),
+            Some("inner/repo")
+        );
+        assert_eq!(
+            roots
+                .reverse_resolve(&fixture.path().join("outside-link"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            roots.reverse_resolve(&outer).unwrap().as_deref(),
+            Some("outer")
+        );
+    }
+
+    #[test]
+    fn reverse_resolution_fails_on_defensive_equal_depth_tie() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let roots = NamedRoots {
+            roots: BTreeMap::from([
+                ("a".to_owned(), root.clone()),
+                ("b".to_owned(), root.clone()),
+            ]),
+        };
+        assert!(roots.reverse_resolve(&root).is_err());
     }
 
     #[test]

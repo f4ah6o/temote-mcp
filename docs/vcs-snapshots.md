@@ -1,0 +1,13 @@
+# Task-correlated VCS snapshots
+
+The concrete `VcsManager::open_for_session` path uses the execution session's workspace and the managed workspace registry under its named root. A ready provisioning marker is checked before its workspace is registered with the exact bound task ID. The Change owner stores only the allocation link; each execution session retains its own path and permission boundary.
+
+For an explicitly bound Change, the first snapshot runs before the mutating task starts. Later snapshots run only at a terminal, quiescent task boundary. Running and waiting task views do not start jj helpers or advance the Change's recorded TaskRecord revision. The operation ID is stable for the Change, execution, and TaskRecord revision. A repeated ID cannot be rebound to another execution or workspace. Ordinary tasks without a binding do not acquire snapshot or Change state.
+
+Production Change snapshots reserve a VCS receipt before dispatching a fixed server-derived jj task to the scoped Codex agent. The task reads jj state before and after one `jj status`, then returns a native structured report. Temote imports only a completed report with the exact operation, task, execution, and workspace identity; it never runs jj for this path. An Accepted receipt is never blindly dispatched again. An exact retry reads the retained helper task; missing or uncertain task evidence remains `reconciliation_required`. Completed receipts retain before/after state and jj operation ID and act as a durable observation outbox. Replaying a completed snapshot retries only the journal append. Observations contain identifiers and revisions, not diffs or transcripts.
+
+The generic VCS manager retains its direct-command snapshot adapter for nonproduction tests and legacy core callers. Production Change `snapshot`, `reconcile_snapshot`, and automatic boundaries use the delegated receipt path. Release checks metadata for Accepted receipts and pending observations and fails closed.
+
+The Change records the resulting logical and materialized revision, then the observed TaskRecord revision. Verification is retained only when the task's current verification target is that exact materialized commit. Release checks the execution workspace's receipts and refuses Accepted snapshots, pending observations, and unavailable adapters. `auto` Jujutsu selection never silently falls back to Git.
+
+Read-only local probes saw jj 0.37.0 and no tracked `.gitmodules` or `.gitattributes` in this checkout; `git lfs` was unavailable. These observations do not establish submodule, LFS, or required-hook compatibility for arbitrary repositories. Those capabilities remain unknown until separate acceptance gates run.

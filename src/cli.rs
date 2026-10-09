@@ -5,11 +5,14 @@ use std::{net::SocketAddr, str::FromStr};
 #[path = "codex.rs"]
 pub(crate) mod codex;
 
+use crate::change_cli;
 use crate::config;
+use crate::environment_prepare_cli;
 #[cfg(feature = "network")]
 use crate::gateway;
 use crate::observation;
 use crate::profile;
+use crate::task_cli;
 
 pub struct Cli {
     pub command: Option<Command>,
@@ -41,6 +44,18 @@ pub enum Command {
     Observation {
         command: observation::cli::ObservationCommand,
     },
+    #[cfg(unix)]
+    PromptIngress,
+    #[cfg(unix)]
+    PromptLink {
+        prompt_id: uuid::Uuid,
+        session_id: String,
+        task_id: uuid::Uuid,
+    },
+    #[cfg(unix)]
+    Friction {
+        command: FrictionCommand,
+    },
     UpgradeCoordinator {
         transaction_id: String,
         commit_fd: i32,
@@ -49,6 +64,15 @@ pub enum Command {
     },
     Session {
         command: SessionCommand,
+    },
+    Task {
+        request: task_cli::TaskInvocation,
+    },
+    Change {
+        request: change_cli::ChangeInvocation,
+    },
+    EnvironmentPrepare {
+        request: environment_prepare_cli::Invocation,
     },
     Mcp,
     #[cfg(feature = "network")]
@@ -86,6 +110,12 @@ pub enum Command {
         platform: gateway::Platform,
         reconnect_delay_seconds: u64,
     },
+    #[cfg(feature = "network")]
+    EventsSender {
+        addr: SocketAddr,
+    },
+    #[cfg(feature = "network")]
+    FabricStatus,
 }
 
 #[cfg(feature = "network")]
@@ -104,6 +134,12 @@ pub enum SessionCommand {
     Start {
         session_id: String,
         path: String,
+    },
+    StartManaged {
+        source: String,
+        operation_id: String,
+        base: Option<String>,
+        vcs: String,
     },
     List,
     Info {
@@ -152,9 +188,53 @@ pub enum SessionPermissionCommand {
     },
 }
 
+#[cfg(unix)]
+pub enum FrictionCommand {
+    ScanMany {
+        session_ids: Vec<String>,
+        consumer_id: String,
+        generation: u64,
+    },
+    Scan {
+        session_id: String,
+        consumer_id: String,
+        generation: u64,
+    },
+    Preview {
+        fingerprint: String,
+    },
+    KnownIssue {
+        fingerprint: String,
+        issue_ref: String,
+        consumer_id: String,
+        generation: u64,
+    },
+    RecordPr {
+        fingerprint: String,
+        pr_url: String,
+    },
+    ReconcilePr {
+        fingerprint: String,
+    },
+    Publish {
+        fingerprint: String,
+        publication_session_id: String,
+        temote_repo_root: PathBuf,
+        model: String,
+        effort: String,
+        authorization: crate::friction::publisher::PublicationAuthorization,
+    },
+}
+
 pub enum ParseOutcome {
-    Run(Cli),
+    Run(Box<Cli>),
     Print(String),
+}
+
+impl ParseOutcome {
+    fn run(cli: Cli) -> Self {
+        Self::Run(Box::new(cli))
+    }
 }
 
 pub fn parse_env() -> Result<ParseOutcome, String> {
@@ -164,6 +244,38 @@ pub fn parse_env() -> Result<ParseOutcome, String> {
     }
     if raw.get(1).map(String::as_str) == Some("delegate") {
         return codex::run_delegate(&raw[2..]).map(ParseOutcome::Print);
+    }
+    if raw.get(1).map(String::as_str) == Some("task") {
+        if raw.len() == 2 || raw[2..].iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(ParseOutcome::Print(task_cli::USAGE.to_owned()));
+        }
+        return task_cli::parse(&raw[2..]).map(|request| {
+            ParseOutcome::run(Cli {
+                command: Some(Command::Task { request }),
+            })
+        });
+    }
+    if raw.get(1).map(String::as_str) == Some("env-prepare") {
+        if raw.len() == 2 || raw[2..].iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(ParseOutcome::Print(
+                environment_prepare_cli::USAGE.to_owned(),
+            ));
+        }
+        return environment_prepare_cli::parse(&raw[2..]).map(|request| {
+            ParseOutcome::run(Cli {
+                command: Some(Command::EnvironmentPrepare { request }),
+            })
+        });
+    }
+    if raw.get(1).map(String::as_str) == Some("change") {
+        if raw.len() == 2 || raw[2..].iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(ParseOutcome::Print(change_cli::USAGE.to_owned()));
+        }
+        return change_cli::parse(&raw[2..]).map(|request| {
+            ParseOutcome::run(Cli {
+                command: Some(Command::Change { request }),
+            })
+        });
     }
     parse(raw.into_iter())
 }
@@ -195,7 +307,7 @@ where
     }
 
     if !args.metadata().help_mode && args.remaining_args().next().is_none() {
-        return Ok(ParseOutcome::Run(Cli {
+        return Ok(ParseOutcome::run(Cli {
             command: Some(Command::Start {
                 session_id: None,
                 yolo: false,
@@ -276,6 +388,15 @@ where
         let command = parse_observation(&mut args).map_err(format_error)?;
         return finish(args, command);
     }
+    #[cfg(unix)]
+    if noargs::cmd("friction")
+        .doc("Owner-only bounded friction scan, preview, and authorized publication")
+        .take(&mut args)
+        .is_present()
+    {
+        let command = parse_friction(&mut args).map_err(format_error)?;
+        return finish(args, Command::Friction { command });
+    }
     if noargs::cmd("upgrade-coordinator")
         .doc("Internal: continue one accepted remote upgrade transaction")
         .take(&mut args)
@@ -318,6 +439,13 @@ where
     {
         let command = parse_session(&mut args).map_err(format_error)?;
         return finish(args, Command::Session { command });
+    }
+    if noargs::cmd("task")
+        .doc("Operate retained delegated tasks in a local session (see task --help)")
+        .take(&mut args)
+        .is_present()
+    {
+        return Ok(ParseOutcome::Print(task_cli::USAGE.to_owned()));
     }
     if noargs::cmd("mcp")
         .doc("Run the session-independent MCP server over stdin/stdout")
@@ -388,6 +516,15 @@ where
         return finish(args, command);
     }
     #[cfg(feature = "network")]
+    if noargs::cmd("fabric")
+        .doc("Connect this Host to Temote Fabric or run its event sender")
+        .take(&mut args)
+        .is_present()
+    {
+        let command = parse_fabric(&mut args).map_err(format_error)?;
+        return finish(args, command);
+    }
+    #[cfg(feature = "network")]
     if noargs::cmd("gateway-agent")
         .doc("Connect an active local session to a Cloudflare gateway using outbound long polling")
         .take(&mut args)
@@ -401,6 +538,57 @@ where
         Some(help) => Ok(ParseOutcome::Print(help)),
         None => unreachable!("a command or help should have been selected"),
     }
+}
+
+#[cfg(feature = "network")]
+fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    if noargs::cmd("status")
+        .doc("Show bounded local Link and remote Fabric health")
+        .take(args)
+        .is_present()
+    {
+        return Ok(Command::FabricStatus);
+    }
+    if noargs::cmd("connect")
+        .doc("Run the outbound authenticated Fabric Link")
+        .take(args)
+        .is_present()
+    {
+        return parse_gateway_agent(args);
+    }
+    if noargs::cmd("link")
+        .doc("Run the outbound authenticated Fabric Link")
+        .take(args)
+        .is_present()
+    {
+        return parse_gateway_agent(args);
+    }
+    if noargs::cmd("events-sender")
+        .doc("Run the dedicated loopback HTTPS webhook sender behind Access/Tunnel")
+        .take(args)
+        .is_present()
+    {
+        let addr = noargs::opt("addr")
+            .ty("ADDR")
+            .default("127.0.0.1:4211")
+            .doc("Loopback address for the Access-protected Tunnel origin")
+            .take(args)
+            .then(|opt| SocketAddr::from_str(opt.value()))?;
+        if !addr.ip().is_loopback() {
+            return Err(noargs::Error::other(
+                args,
+                "event sender must bind a loopback address",
+            ));
+        }
+        return Ok(Command::EventsSender { addr });
+    }
+    if args.metadata().help_mode {
+        return Ok(Command::FabricStatus);
+    }
+    Err(noargs::Error::other(
+        args,
+        "Fabric command is not specified (expected 'connect', 'link', 'status' or 'events-sender')",
+    ))
 }
 
 fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
@@ -455,6 +643,41 @@ fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
 }
 
 fn parse_observation(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    #[cfg(unix)]
+    if noargs::cmd("prompt-listen")
+        .doc("Run the owner-only versioned local prompt ingress socket")
+        .take(args)
+        .is_present()
+    {
+        return Ok(Command::PromptIngress);
+    }
+    #[cfg(unix)]
+    if noargs::cmd("prompt-link")
+        .doc("Correlate an ingress record from a retained canonical Codex task")
+        .take(args)
+        .is_present()
+    {
+        let session_id = required_observation_session(args)?;
+        let prompt_id = noargs::opt("prompt-id")
+            .ty("UUID")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<uuid::Uuid>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--prompt-id is required"))?;
+        let task_id = noargs::opt("task-id")
+            .ty("UUID")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<uuid::Uuid>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--task-id is required"))?;
+        return Ok(Command::PromptLink {
+            prompt_id,
+            session_id,
+            task_id,
+        });
+    }
     let command = if noargs::cmd("list")
         .doc("List observation journal records for one session")
         .take(args)
@@ -557,6 +780,248 @@ fn parse_observation(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
     Ok(Command::Observation { command })
 }
 
+#[cfg(unix)]
+fn parse_friction(args: &mut noargs::RawArgs) -> noargs::Result<FrictionCommand> {
+    let local = noargs::flag("local")
+        .doc("Explicit owner-local command boundary")
+        .take(args)
+        .is_present();
+    if noargs::cmd("scan-many")
+        .doc("Consume bounded independent sources")
+        .take(args)
+        .is_present()
+    {
+        let spec = noargs::opt("session-id").ty("ID");
+        let mut session_ids = Vec::new();
+        while let Some(value) = spec.take(args).present().map(|v| v.value().to_owned()) {
+            if config::validate_session_id(&value).is_err() || session_ids.contains(&value) {
+                return Err(noargs::Error::other(
+                    args,
+                    "invalid or duplicate friction source",
+                ));
+            }
+            session_ids.push(value);
+        }
+        if session_ids.is_empty() || session_ids.len() > 16 || !local {
+            return Err(noargs::Error::other(
+                args,
+                "scan-many requires --local and 1..=16 distinct --session-id values",
+            ));
+        }
+        let consumer_id = noargs::opt("consumer-id")
+            .ty("ID")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--consumer-id is required"))?;
+        let generation = noargs::opt("generation")
+            .ty("N")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<u64>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--generation is required"))?;
+        return Ok(FrictionCommand::ScanMany {
+            session_ids,
+            consumer_id,
+            generation,
+        });
+    }
+    if noargs::cmd("scan")
+        .doc("Consume one fenced bounded episode batch")
+        .take(args)
+        .is_present()
+    {
+        let session_id = required_observation_session(args)?;
+        let consumer_id = noargs::opt("consumer-id")
+            .ty("ID")
+            .doc("Stable worker identity")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--consumer-id is required"))?;
+        let generation = noargs::opt("generation")
+            .ty("N")
+            .doc("Positive worker lease generation")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<u64>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--generation is required"))?;
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::Scan {
+            session_id,
+            consumer_id,
+            generation,
+        });
+    }
+    if noargs::cmd("preview")
+        .doc("Read bounded structural candidate metadata")
+        .take(args)
+        .is_present()
+    {
+        let fingerprint = noargs::arg("<FINGERPRINT>").take(args).value().to_owned();
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::Preview { fingerprint });
+    }
+    if noargs::cmd("known-issue")
+        .doc("Attach a verified scoped local issue identity")
+        .take(args)
+        .is_present()
+    {
+        let fingerprint = noargs::arg("<FINGERPRINT>").take(args).value().to_owned();
+        let issue_ref = noargs::opt("issue-ref")
+            .ty("PATH")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--issue-ref is required"))?;
+        let consumer_id = noargs::opt("consumer-id")
+            .ty("ID")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--consumer-id is required"))?;
+        let generation = noargs::opt("generation")
+            .ty("N")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<u64>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--generation is required"))?;
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::KnownIssue {
+            fingerprint,
+            issue_ref,
+            consumer_id,
+            generation,
+        });
+    }
+    if noargs::cmd("reconcile-pr")
+        .doc("Observe the exact Temote issue and open PR through a read-only delegated task")
+        .take(args)
+        .is_present()
+    {
+        let fingerprint = noargs::arg("<FINGERPRINT>").take(args).value().to_owned();
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::ReconcilePr { fingerprint });
+    }
+    if noargs::cmd("record-pr")
+        .doc("Record an operator-attested Temote PR URL")
+        .take(args)
+        .is_present()
+    {
+        let fingerprint = noargs::arg("<FINGERPRINT>").take(args).value().to_owned();
+        let pr_url = noargs::opt("pr-url")
+            .ty("URL")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--pr-url is required"))?;
+        if !noargs::flag("operator-attested").take(args).is_present() {
+            return Err(noargs::Error::other(
+                args,
+                "--operator-attested is required",
+            ));
+        }
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::RecordPr {
+            fingerprint,
+            pr_url,
+        });
+    }
+    if noargs::cmd("publish")
+        .doc("Authorize one durable typed Temote publication task")
+        .take(args)
+        .is_present()
+    {
+        let fingerprint = noargs::arg("<FINGERPRINT>").take(args).value().to_owned();
+        let publication_session_id = noargs::opt("publication-session-id")
+            .ty("ID")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--publication-session-id is required"))?;
+        if config::validate_session_id(&publication_session_id).is_err() {
+            return Err(noargs::Error::other(args, "invalid publication session ID"));
+        }
+        let temote_repo_root = noargs::opt("temote-repo-root")
+            .ty("PATH")
+            .take(args)
+            .present()
+            .map(|v| PathBuf::from(v.value()))
+            .ok_or_else(|| noargs::Error::other(args, "--temote-repo-root is required"))?;
+        let model = noargs::opt("model")
+            .ty("MODEL")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--model is required"))?;
+        let effort = noargs::opt("effort")
+            .ty("EFFORT")
+            .take(args)
+            .present()
+            .map(|v| v.value().to_owned())
+            .ok_or_else(|| noargs::Error::other(args, "--effort is required"))?;
+        let expires_at = noargs::opt("authorization-expires-at")
+            .ty("UNIX_SECONDS")
+            .take(args)
+            .present()
+            .map(|v| v.value().parse::<u64>())
+            .transpose()?
+            .ok_or_else(|| noargs::Error::other(args, "--authorization-expires-at is required"))?;
+        let authorization = crate::friction::publisher::PublicationAuthorization {
+            export_opt_in: noargs::flag("export-opt-in").take(args).is_present(),
+            redaction_approved: noargs::flag("redaction-approved").take(args).is_present(),
+            temote_repo_write: noargs::flag("temote-repo-write").take(args).is_present(),
+            expires_at,
+        };
+        if !local {
+            return Err(noargs::Error::other(
+                args,
+                "friction commands require --local",
+            ));
+        }
+        return Ok(FrictionCommand::Publish {
+            fingerprint,
+            publication_session_id,
+            temote_repo_root,
+            model,
+            effort,
+            authorization,
+        });
+    }
+    Err(noargs::Error::other(
+        args,
+        "expected one of: scan, preview, known-issue, publish, record-pr, reconcile-pr",
+    ))
+}
+
 fn required_observation_session(args: &mut noargs::RawArgs) -> noargs::Result<String> {
     let session_id = noargs::arg("<SESSION_ID>")
         .doc("Session ID")
@@ -630,15 +1095,66 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
         .take(args)
         .is_present()
     {
+        let source = noargs::opt("source")
+            .ty("REPOSITORY")
+            .doc("Repository source such as owner/repository")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
+        let operation_id = noargs::opt("operation-id")
+            .ty("UUID")
+            .doc("Caller-generated managed start retry key")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
+        let base = noargs::opt("base")
+            .ty("REF")
+            .doc("Repository base ref (default: main)")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
+        let vcs = noargs::opt("vcs")
+            .ty("BACKEND")
+            .doc("auto, jujutsu, or git")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
         let path = noargs::opt("path")
             .ty("PATH")
             .doc("Named-root-relative path such as src/my-project")
             .take(args)
-            .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))?;
+            .present()
+            .map(|opt| opt.value().to_owned());
         let session_id = noargs::arg("<SESSION_ID>")
             .doc("Session ID")
             .take(args)
-            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+            .present()
+            .map(|arg| arg.value().to_owned());
+        if let Some(source) = source {
+            if path.is_some() || session_id.is_some() {
+                return Err(noargs::Error::other(
+                    args,
+                    "--source cannot be combined with --path or SESSION_ID",
+                ));
+            }
+            let operation_id = operation_id
+                .ok_or_else(|| noargs::Error::other(args, "--source requires --operation-id"))?;
+            return Ok(SessionCommand::StartManaged {
+                source,
+                operation_id,
+                base,
+                vcs: vcs.unwrap_or_else(|| "auto".to_owned()),
+            });
+        }
+        if operation_id.is_some() || base.is_some() || vcs.is_some() {
+            return Err(noargs::Error::other(
+                args,
+                "--operation-id, --base, and --vcs require --source",
+            ));
+        }
+        let session_id =
+            session_id.ok_or_else(|| noargs::Error::other(args, "--path requires SESSION_ID"))?;
+        let path = path.ok_or_else(|| noargs::Error::other(args, "SESSION_ID requires --path"))?;
         return Ok(SessionCommand::Start { session_id, path });
     }
     if noargs::cmd("list")
@@ -1121,7 +1637,7 @@ fn required_string_opt(
     if let Some(env) = env {
         spec = spec.env(env);
     }
-    spec.take(args)
+    take_compatible_option(args, spec, env)
         .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))
 }
 
@@ -1145,7 +1661,9 @@ fn string_opt_env(
     if let Some(env) = env {
         spec = spec.env(env);
     }
-    Ok(spec.take(args).present().map(|opt| opt.value().to_owned()))
+    Ok(take_compatible_option(args, spec, env)
+        .present()
+        .map(|opt| opt.value().to_owned()))
 }
 
 #[cfg(feature = "network")]
@@ -1159,10 +1677,36 @@ fn path_opt(
     if let Some(env) = env {
         spec = spec.env(env);
     }
-    Ok(spec
-        .take(args)
+    Ok(take_compatible_option(args, spec, env)
         .present()
         .map(|opt| PathBuf::from(opt.value())))
+}
+
+#[cfg(feature = "network")]
+fn take_compatible_option(
+    args: &mut noargs::RawArgs,
+    spec: noargs::OptSpec,
+    env: Option<&str>,
+) -> noargs::Opt {
+    let option = spec.take(args);
+    // Explicit CLI input (including a missing value) always wins. Never put
+    // an injected credential into help text, argv, or the process environment.
+    if !args.metadata().help_mode
+        && matches!(option, noargs::Opt::Env { .. } | noargs::Opt::None { .. })
+        && let Some(value) = env.and_then(temote_mcp::environment::var_os)
+    {
+        return match value.into_string().ok().filter(|value| !value.is_empty()) {
+            Some(value) => noargs::Opt::Env {
+                spec: option.spec(),
+                metadata: args.metadata(),
+                value,
+            },
+            None => noargs::Opt::None {
+                spec: option.spec(),
+            },
+        };
+    }
+    option
 }
 
 #[cfg(feature = "network")]
@@ -1182,7 +1726,7 @@ fn repeated_string_opt(
 fn finish(args: noargs::RawArgs, command: Command) -> Result<ParseOutcome, String> {
     match args.finish().map_err(format_error)? {
         Some(help) => Ok(ParseOutcome::Print(help)),
-        None => Ok(ParseOutcome::Run(Cli {
+        None => Ok(ParseOutcome::run(Cli {
             command: Some(command),
         })),
     }
@@ -1219,6 +1763,50 @@ mod tests {
                 session_id: None,
                 yolo: false
             }
+        ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn fabric_commands_preserve_legacy_link_and_reject_public_sender_bind() {
+        for prefix in [
+            vec!["temote", "fabric", "connect"],
+            vec!["temote", "fabric", "link"],
+            vec!["temote-mcp", "gateway-agent"],
+        ] {
+            let mut args = prefix;
+            args.extend([
+                "--gateway-url",
+                "https://fabric.example",
+                "--host-id",
+                "test-host",
+                "--host-token",
+                "test-token",
+            ]);
+            assert!(
+                matches!(command(&args), Command::GatewayAgent { host_id:Some(id), .. } if id == "test-host")
+            );
+        }
+        assert!(matches!(
+            command(&["temote", "fabric", "status"]),
+            Command::FabricStatus
+        ));
+        assert!(
+            matches!(command(&["temote", "fabric", "events-sender"]), Command::EventsSender { addr } if addr.ip().is_loopback())
+        );
+        assert!(
+            parse(argv(&[
+                "temote",
+                "fabric",
+                "events-sender",
+                "--addr",
+                "0.0.0.0:4211"
+            ]))
+            .is_err()
+        );
+        assert!(matches!(
+            parse(argv(&["temote", "fabric", "--help"])).unwrap(),
+            ParseOutcome::Print(_)
         ));
     }
 
@@ -1329,6 +1917,43 @@ mod tests {
         };
         assert!(help.contains("forget"));
         assert!(help.contains("stop keeps metadata"));
+    }
+
+    #[test]
+    fn session_start_requires_source_or_path_and_managed_retry_key() {
+        assert!(matches!(
+            command(&["temote-mcp", "session", "start", "--source", "owner/repo", "--operation-id", "67bcaaae-6e3f-492e-a2a7-606203976584"]),
+            Command::Session { command: SessionCommand::StartManaged { source, operation_id, base: None, vcs } }
+                if source == "owner/repo" && operation_id == "67bcaaae-6e3f-492e-a2a7-606203976584" && vcs == "auto"
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "session", "start", "existing", "--path", "src/repo"]),
+            Command::Session { command: SessionCommand::Start { session_id, path } }
+                if session_id == "existing" && path == "src/repo"
+        ));
+        for args in [
+            vec!["temote-mcp", "session", "start", "--source", "owner/repo"],
+            vec![
+                "temote-mcp",
+                "session",
+                "start",
+                "--source",
+                "owner/repo",
+                "--path",
+                "src/repo",
+                "--operation-id",
+                "67bcaaae-6e3f-492e-a2a7-606203976584",
+            ],
+            vec![
+                "temote-mcp",
+                "session",
+                "start",
+                "--operation-id",
+                "67bcaaae-6e3f-492e-a2a7-606203976584",
+            ],
+        ] {
+            assert!(parse(argv(&args)).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]

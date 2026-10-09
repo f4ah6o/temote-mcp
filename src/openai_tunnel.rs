@@ -154,7 +154,7 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
 }
 
 pub fn configured_tunnel_id() -> Result<String> {
-    if let Ok(value) = std::env::var("CONTROL_PLANE_TUNNEL_ID") {
+    if let Ok(value) = temote_mcp::environment::var("CONTROL_PLANE_TUNNEL_ID") {
         let value = value.trim().to_owned();
         anyhow::ensure!(
             valid_tunnel_id(&value),
@@ -162,7 +162,7 @@ pub fn configured_tunnel_id() -> Result<String> {
         );
         return Ok(value);
     }
-    let path = std::env::var_os("TEMOTE_MCP_OPENAI_CONFIG_FILE")
+    let path = temote_mcp::environment::var_os("TEMOTE_MCP_OPENAI_CONFIG_FILE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or(default_config_file()?);
@@ -175,7 +175,7 @@ pub fn configured_tunnel_id() -> Result<String> {
 }
 
 fn control_plane_base_url() -> Result<String> {
-    let value = std::env::var("CONTROL_PLANE_BASE_URL")
+    let value = temote_mcp::environment::var("CONTROL_PLANE_BASE_URL")
         .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_BASE_URL.to_owned());
     let parsed = url::Url::parse(value.trim())
         .map_err(|error| anyhow::anyhow!("CONTROL_PLANE_BASE_URL is invalid: {error}"))?;
@@ -454,7 +454,7 @@ pub async fn start(origin: SocketAddr) -> Result<Child> {
 }
 
 fn tunnel_client_binary() -> OsString {
-    std::env::var_os("TUNNEL_CLIENT_BIN")
+    temote_mcp::environment::var_os("TUNNEL_CLIENT_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("tunnel-client"))
 }
@@ -498,7 +498,9 @@ fn credential_from_env_or_tty(
     prompt: &str,
     label: &str,
 ) -> Result<Zeroizing<String>> {
-    if let Some(value) = credential_from_env_value(std::env::var_os(env_name), env_name)? {
+    if let Some(value) =
+        credential_from_env_value(temote_mcp::environment::var_os(env_name), env_name)?
+    {
         return Ok(value);
     }
     credential_from_tty(prompt, label)
@@ -754,7 +756,7 @@ pub async fn doctor_control_plane() -> Result<String> {
 }
 
 pub async fn binary_version() -> Result<String> {
-    let binary = std::env::var_os("TUNNEL_CLIENT_BIN")
+    let binary = temote_mcp::environment::var_os("TUNNEL_CLIENT_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("tunnel-client"));
     let mut command = Command::new(&binary);
@@ -853,7 +855,7 @@ pub fn local_mcp_url(origin: SocketAddr) -> String {
 }
 
 fn nonempty_env(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    temote_mcp::environment::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
 fn valid_tunnel_id(value: &str) -> bool {

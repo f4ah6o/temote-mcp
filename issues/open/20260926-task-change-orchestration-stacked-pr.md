@@ -1,12 +1,107 @@
 # Task / Change graph を orchestration と stacked PR delivery の source of truth にする
 
-Status: design parent / D1 polished as `issues/polished/20261001-change-record-correlation.md`; D2-D4 remain
+Status: open
+Model: unknown
+Created: 2026-09-26
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Use durable Task and Change identities to plan independent workspaces and single or stacked PR delivery.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Agent hierarchy, durable work identity, and PR dependency topology can differ.
+
+## 目標
+
+Use durable Task and Change identities to plan independent workspaces and single or stacked PR delivery.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: 2. Decision
+
+Temote は **Task / Change dependency graph を source of truth** とし、次の2つを別々に派生させる。
+
+```text
+                        Task / Change graph
+                         /             \
+                        /               \
+              executor assignment       delivery graph
+             agent / subagent /      single / sibling /
+             replacement agent         stacked PR
+```
+
+固定する原則:
+
+> Agent hierarchy != Git hierarchy.
+>
+> Task / Change dependency -> VCS / delivery hierarchy.
+>
+> Agent is an executor assigned to a durable unit of work.
+
+## 受け入れ条件
+
+Complete source criteria from “18. Acceptance criteria” (unchecked items remain unverified):
+
+- [ ] agent/subagent hierarchy can differ from change/PR hierarchy without ambiguity
+- [ ] every independently delivered mutating unit has a stable Temote Change ID
+- [ ] same logical change survives executor/backend replacement
+- [ ] independently writable changes never share the same mutable workspace
+- [ ] stack/sibling/single-PR decision is derived from explicit change dependency
+- [ ] subagent creation does not implicitly create VCS or GitHub objects
+- [ ] jj/Git/GitHub identities remain distinct and correlated
+- [ ] `gh-stack` state is reconciled as delivery state, not used as orchestration state
+- [ ] verification is bound to the exact delivered revision
+- [ ] uncertain remote delivery does not blind-retry into duplicate PRs/stacks
+- [ ] no-local-main policy remains intact
+- [ ] existing dirty/ahead/diverged checkout is never reset/cleaned/stashed to satisfy this flow
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`change-allocation-writer-handoff`](../doing/20261005-change-allocation-writer-handoff.md)
+- [`change-delivery-planner`](../done/20261005-change-delivery-planner.md)
+- [`change-delivery-adapter`](../doing/20261005-change-delivery-adapter.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: design parent / D1 polished as `issues/done/20261001-change-record-correlation.md`; D2-D4 remain
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/done/20260925-v2-vcs-workspace-contract.md`  
-Created: 2026-09-26 (Asia/Tokyo)
-Polished first packet: `issues/polished/20261001-change-record-correlation.md` (D1, ready)
+> Historical Created: 2026-09-26 (Asia/Tokyo)
+Polished first packet: `issues/done/20261001-change-record-correlation.md` (D1, ready)
 
 ## 1. Problem
 

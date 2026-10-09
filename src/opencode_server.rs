@@ -47,10 +47,8 @@ const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_PENDING_INTERACTION_SOURCE_ITEMS: usize = 4096;
 const MAX_OPENCODE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
-const MAX_REPORT_BYTES: usize = 8 * 1024;
+use crate::report_contract::{self, MAX_TASK_REPORT_BYTES as MAX_REPORT_BYTES, ReportProfile};
 const MAX_RAW_RESULT_BYTES: usize = 16 * 1024;
-const MAX_REPORT_ARRAY_ITEMS: usize = 64;
-const MAX_SUMMARY_CHARS: usize = 1200;
 const MAX_MESSAGES_SCAN: u32 = 16;
 const SERVE_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVE_HEALTH_POLL: Duration = Duration::from_millis(150);
@@ -444,12 +442,29 @@ struct OperationTombstone {
     request_fingerprint: Uuid,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PrivateCheckReceipt {
+    operation_id: Uuid,
+    action: String,
+    codex_task_id: Uuid,
+    workspace_id: Uuid,
+    producer_epoch: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct TaskRecord {
     schema_version: u64,
     task_id: Uuid,
     owner: SessionInstance,
     scope_cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_workspace_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_codex_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_codex_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    private_check_receipts: Vec<PrivateCheckReceipt>,
     model: Option<String>,
     agent: Option<String>,
     variant: Option<String>,
@@ -463,6 +478,10 @@ struct TaskRecord {
     observed_model: Option<String>,
     #[serde(default)]
     report: Option<Value>,
+    #[serde(default)]
+    native_report_requested: bool,
+    #[serde(default)]
+    blocker: Option<Value>,
     #[serde(default)]
     last_error: Option<String>,
     #[serde(default)]
@@ -788,8 +807,9 @@ impl TaskStore {
             )?
         };
         record.pending_interaction_summary = Some(summary);
-        // This locked read-modify-write changes only the summary field. It
-        // leaves task retention, status, revision, binding, and receipts intact.
+        // The summary has its own revision and is projected by task_list.
+        // It is not part of task_view, so an observer refresh must not make
+        // an otherwise unchanged task_get cursor look modified.
         self.save_metadata_locked(&record)?;
         Ok(true)
     }
@@ -850,10 +870,18 @@ impl TaskStore {
     {
         let _guard = self.lock()?;
         let mut record = self.load_locked(session, task_id)?;
+        let before = serde_json::to_vec(&record)?;
         f(&mut record)?;
-        record.updated_at = config::unix_time();
-        self.save_locked(&record)?;
+        self.save_if_changed(&mut record, &before)?;
         Ok(record)
+    }
+
+    fn save_if_changed(&self, record: &mut TaskRecord, before: &[u8]) -> Result<()> {
+        if serde_json::to_vec(record)? != before {
+            record.updated_at = config::unix_time();
+            self.save_locked(record)?;
+        }
+        Ok(())
     }
 
     fn update_if_instance_live<F>(
@@ -874,9 +902,9 @@ impl TaskStore {
             .context("OpenCode session instance lifecycle state is unavailable")?;
         anyhow::ensure!(!entry.closing, "OpenCode session instance is closing");
         let mut record = self.load_locked(session, task_id)?;
+        let before = serde_json::to_vec(&record)?;
         f(&mut record)?;
-        record.updated_at = config::unix_time();
-        self.save_locked(&record)?;
+        self.save_if_changed(&mut record, &before)?;
         Ok(record)
     }
 
@@ -2212,7 +2240,10 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "usage": record.usage,
         "observed_model": record.observed_model,
         "report": record.report,
+        "blocker": record.blocker,
         "report_status": record.report_status.map(ReportStatus::as_str),
+        "report_source": record.report_status.map(|_| if record.native_report_requested { "native_structured_output" } else { "final_message_compat" }),
+        "report_capability": if record.native_report_requested { "v2_native_format" } else { "v1_final_message_compat" },
         "raw_result_bytes": record.raw_result.as_ref().map(String::len),
         "raw_result_truncated": record.raw_result_truncated,
         "last_error": record.last_error,
@@ -2257,6 +2288,8 @@ fn terminal_evidence_ref(
         "status": record.status.as_str(),
         "report": record.report,
         "report_status": record.report_status.map(ReportStatus::as_str),
+        "report_source": record.report_status.map(|_| if record.native_report_requested { "native_structured_output" } else { "final_message_compat" }),
+        "report_capability": if record.native_report_requested { "v2_native_format" } else { "v1_final_message_compat" },
         "raw_result": record.raw_result,
         "raw_result_truncated": record.raw_result_truncated,
         "usage": record.usage,
@@ -2278,13 +2311,9 @@ fn store_evidence_for_instance(
     {
         return None;
     }
-    evidence::store(
-        &session.id,
-        &session.cwd,
-        serde_json::to_string(response).ok()?,
-    )
-    .ok()
-    .flatten()
+    evidence::store_for_session(session, serde_json::to_string(response).ok()?)
+        .ok()
+        .flatten()
 }
 
 // ---------- opencode serve transport ----------
@@ -2341,6 +2370,7 @@ struct SdkV2Serve {
     directory: String,
     child: tokio::sync::Mutex<tokio::process::Child>,
     tail: Arc<Mutex<String>>,
+    _private_bridge: Option<Arc<crate::opencode_private_workspace::Bridge>>,
 }
 
 impl SdkV2Serve {
@@ -2546,6 +2576,68 @@ where
 }
 
 impl ServeClient {
+    fn private_runtime_instance_id(&self) -> Option<Uuid> {
+        match self {
+            Self::SdkV2(inner) => inner
+                ._private_bridge
+                .as_ref()
+                .map(|bridge| bridge.runtime_instance_id),
+            _ => None,
+        }
+    }
+
+    async fn wait_private_workspace_registered(&self) -> bool {
+        if !matches!(self, Self::SdkV2(_)) {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, self.private_workspace_registered()).await {
+                Ok(Ok(true)) => return true,
+                _ if tokio::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(SERVE_HEALTH_POLL).await,
+            }
+        }
+    }
+
+    async fn private_workspace_registered(&self) -> Result<bool> {
+        let Self::SdkV2(inner) = self else {
+            return Ok(false);
+        };
+        let status =
+            v2_get_json(&inner.client, &inner.base_url, &inner.password, "api/mcp").await?;
+        let connected = status
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| {
+                servers.iter().any(|server| {
+                    server.get("name").and_then(Value::as_str) == Some("temote_workspace")
+                        && server.pointer("/status/status").and_then(Value::as_str)
+                            == Some("connected")
+                })
+            })
+            || status
+                .get("temote_workspace")
+                .and_then(|server| server.get("status"))
+                .and_then(Value::as_str)
+                == Some("connected");
+        #[cfg(test)]
+        eprintln!(
+            "private registration: connected={connected}, catalog={}",
+            inner
+                ._private_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.catalog_observed())
+        );
+        // The builtin tool inventory excludes MCP tools. Require the owned
+        // bridge's authenticated tools/list observation as well as connection.
+        Ok(connected
+            && inner
+                ._private_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.catalog_observed()))
+    }
+
     async fn health(&self) -> Result<Value> {
         match self {
             Self::Sdk(inner) => {
@@ -2699,6 +2791,7 @@ impl ServeClient {
                     "text": text,
                     "prompt": {"text": text},
                     "delivery": "queue",
+                    "format": {"type": "json_schema", "schema": report_contract::report_json_schema()},
                 });
                 if let Some(message_id) = body.get("messageID").and_then(Value::as_str) {
                     request["id"] = json!(message_id);
@@ -3098,6 +3191,50 @@ async fn spawn_serve(
     protected_paths.push(data_dir.join("opencode/auth.json"));
     protected_paths.push(data_dir.join("opencode/opencode.db"));
     let config_content = serve_permission_config(&state_dir, &protected_paths)?;
+    let private_bridge = if store.path(task_id).exists() {
+        let record = store.read_record(task_id)?;
+        if let Some(workspace_id) = record.managed_workspace_id {
+            ensure_task_owner(&record, session)?;
+            let authority = crate::opencode_private_workspace::Authority {
+                session: session.clone(),
+                parent_task_id: task_id,
+                workspace_id,
+                model: record
+                    .private_codex_model
+                    .context("managed task lacks Codex model")?,
+                effort: record
+                    .private_codex_effort
+                    .context("managed task lacks Codex effort")?,
+                producer_epoch: record.generation.max(1),
+                runtime_instance_id: Uuid::new_v4(),
+            };
+            let bound = bind_managed_commands(session, &scope)?;
+            anyhow::ensure!(
+                private_codex_opt_in(&bound)?
+                    == (authority.model.clone(), authority.effort.clone()),
+                "private workspace Host opt-in changed"
+            );
+            Some(crate::opencode_private_workspace::start(authority)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let config_content = if let Some(bridge) = &private_bridge {
+        let mut config: Value = serde_json::from_str(&config_content)?;
+        crate::opencode_private_workspace::configure(&mut config, bridge);
+        serde_json::to_string(&config)?
+    } else {
+        config_content
+    };
+    let child_config_dir = if private_bridge.is_some() {
+        let path = state_dir.join("config");
+        ensure_private_directory(&path)?;
+        Some(path)
+    } else {
+        None
+    };
 
     let contract = serve_contract_override();
     let mut last_error = None;
@@ -3112,10 +3249,24 @@ async fn spawn_serve(
             &password,
             &config_content,
             contract,
+            private_bridge.clone(),
+            child_config_dir.as_deref(),
         )
         .await
         {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                if private_bridge.is_some() {
+                    let registered = client.wait_private_workspace_registered().await;
+                    if !registered {
+                        client.shutdown().await;
+                        last_error = Some(anyhow::anyhow!(
+                            "private workspace MCP tool did not register"
+                        ));
+                        continue;
+                    }
+                }
+                return Ok(client);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -3137,6 +3288,10 @@ fn opencode_config(auth_paths: &[PathBuf]) -> Result<Value> {
         (".git/**".to_owned(), json!("deny")),
         ("**/.git".to_owned(), json!("deny")),
         ("**/.git/**".to_owned(), json!("deny")),
+        (".jj".to_owned(), json!("deny")),
+        (".jj/**".to_owned(), json!("deny")),
+        ("**/.jj".to_owned(), json!("deny")),
+        ("**/.jj/**".to_owned(), json!("deny")),
         (".agents".to_owned(), json!("deny")),
         (".agents/**".to_owned(), json!("deny")),
         ("**/.agents".to_owned(), json!("deny")),
@@ -3145,6 +3300,11 @@ fn opencode_config(auth_paths: &[PathBuf]) -> Result<Value> {
         (".codex/**".to_owned(), json!("deny")),
         ("**/.codex".to_owned(), json!("deny")),
         ("**/.codex/**".to_owned(), json!("deny")),
+        (".opencode".to_owned(), json!("deny")),
+        (".opencode/**".to_owned(), json!("deny")),
+        ("**/.opencode/**".to_owned(), json!("deny")),
+        ("opencode.json".to_owned(), json!("deny")),
+        ("opencode.jsonc".to_owned(), json!("deny")),
     ]);
     for path in auth_paths {
         edit.insert(path_argument(path, "auth path")?, json!("deny"));
@@ -3186,6 +3346,44 @@ fn serve_permission_config(state_dir: &Path, protected_paths: &[PathBuf]) -> Res
         for action in ["read", "edit"] {
             rules.push(json!({"action":action, "resource":resource, "effect":"deny"}));
         }
+    }
+    for resource in [
+        ".jj",
+        ".jj/*",
+        "**/.jj/*",
+        ".opencode",
+        ".opencode/*",
+        "**/.opencode/*",
+        "opencode.json",
+        "opencode.jsonc",
+    ] {
+        rules.push(json!({"action":"edit", "resource":resource, "effect":"deny"}));
+    }
+    for resource in [
+        ".git",
+        ".git/**",
+        "**/.git",
+        "**/.git/**",
+        ".jj",
+        ".jj/**",
+        "**/.jj",
+        "**/.jj/**",
+        ".agents",
+        ".agents/**",
+        "**/.agents",
+        "**/.agents/**",
+        ".codex",
+        ".codex/**",
+        "**/.codex",
+        "**/.codex/**",
+        ".opencode",
+        ".opencode/**",
+        "**/.opencode",
+        "**/.opencode/**",
+        "opencode.json",
+        "opencode.jsonc",
+    ] {
+        rules.push(json!({"action":"read", "resource":resource, "effect":"deny"}));
     }
     let state = format!("{}/*", state_dir.display());
     for action in ["read", "edit"] {
@@ -3367,6 +3565,7 @@ fn serve_child_env(
     data_dir: &Path,
     password: &str,
     config_content: &str,
+    child_config_dir: Option<&Path>,
 ) -> Vec<(OsString, OsString)> {
     let mut env = crate::cli::codex::delegation::filtered_child_environment(
         std::env::vars_os(),
@@ -3376,6 +3575,13 @@ fn serve_child_env(
         OsString::from("XDG_DATA_HOME"),
         data_dir.as_os_str().to_os_string(),
     ));
+    if let Some(config_dir) = child_config_dir {
+        env.retain(|(key, _)| key != "XDG_CONFIG_HOME");
+        env.push((
+            OsString::from("XDG_CONFIG_HOME"),
+            config_dir.as_os_str().to_os_string(),
+        ));
+    }
     env.push((
         OsString::from("OPENCODE_SERVER_PASSWORD"),
         OsString::from(password),
@@ -3387,6 +3593,8 @@ fn serve_child_env(
     env
 }
 
+// Keep each typed authority and request component explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_serve_once(
     binary: &Path,
     scope: &Path,
@@ -3395,6 +3603,8 @@ async fn spawn_serve_once(
     password: &str,
     config_content: &str,
     contract_override: ServeContract,
+    private_bridge: Option<Arc<crate::opencode_private_workspace::Bridge>>,
+    child_config_dir: Option<&Path>,
 ) -> Result<ServeClient> {
     let mut command = tokio::process::Command::new(binary);
     command
@@ -3405,7 +3615,12 @@ async fn spawn_serve_once(
         .arg(port.to_string())
         .current_dir(scope)
         .env_clear()
-        .envs(serve_child_env(data_dir, password, config_content))
+        .envs(serve_child_env(
+            data_dir,
+            password,
+            config_content,
+            child_config_dir,
+        ))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3452,6 +3667,10 @@ async fn spawn_serve_once(
                 .await
             {
                 Ok(Ok(_)) => {
+                    anyhow::ensure!(
+                        private_bridge.is_none(),
+                        "private workspace requires OpenCode v2"
+                    );
                     return Ok(ServeClient::Sdk(Arc::new(SdkServe {
                         client: client_v1,
                         bounded_http: client_v2.clone(),
@@ -3489,6 +3708,7 @@ async fn spawn_serve_once(
                         directory,
                         child,
                         tail: Arc::clone(&tail),
+                        _private_bridge: private_bridge,
                     })));
                 }
                 Ok(Err(error)) => last_error = Some(error.to_string()),
@@ -3625,13 +3845,127 @@ fn runtime_registration_matches(
         })
 }
 
+async fn cleanup_private_checks(session: &config::Session, record: &TaskRecord, stale_only: bool) {
+    if record.private_check_receipts.is_empty() {
+        return;
+    }
+    let actor = crate::observation::ActorRef {
+        transport: "opencode-private-workspace-cleanup".to_owned(),
+        principal: None,
+    };
+    for receipt in &record.private_check_receipts {
+        if stale_only && receipt.producer_epoch == record.generation {
+            continue;
+        }
+        let Some(action) = crate::opencode_workspace::parse_check_request(&json!({
+            "action": receipt.action,
+            "operation_id": receipt.operation_id,
+        }))
+        .map(|request| request.action) else {
+            continue;
+        };
+        let Some(model) = record.private_codex_model.as_deref() else {
+            continue;
+        };
+        let Some(effort) = record.private_codex_effort.as_deref() else {
+            continue;
+        };
+        let args = json!({
+            "operation_id": receipt.operation_id,
+            "task": action.task(),
+            "model": model,
+            "effort": effort,
+        });
+        let origin = crate::codex_app_server::TaskStartOrigin::opencode_workspace_check(
+            record.task_id,
+            receipt.workspace_id,
+            action.name(),
+            receipt.producer_epoch,
+        );
+        let Ok(Some(start)) =
+            crate::codex_app_server::task_start_receipt_if_retained(&args, session, &origin)
+        else {
+            continue;
+        };
+        if start.get("task_id") != Some(&json!(receipt.codex_task_id)) {
+            continue;
+        }
+        let Ok(view) = crate::orchestration::invoke(
+            crate::orchestration::Backend::Codex,
+            crate::orchestration::Operation::TaskGet,
+            &json!({"task_id": receipt.codex_task_id}),
+            session,
+            &actor,
+            None,
+        )
+        .await
+        else {
+            continue;
+        };
+        if !matches!(
+            view.get("status").and_then(Value::as_str),
+            Some("accepted" | "running" | "waiting_approval")
+        ) {
+            continue;
+        }
+        let control_id = Uuid::new_v5(
+            &TASK_ID_NAMESPACE,
+            format!(
+                "private-check-cleanup:{}:{}",
+                record.task_id, receipt.operation_id
+            )
+            .as_bytes(),
+        );
+        let _ = crate::orchestration::invoke(
+            crate::orchestration::Backend::Codex,
+            crate::orchestration::Operation::TaskControl,
+            &json!({"task_id": receipt.codex_task_id,
+                "operation_id": control_id, "action": "interrupt"}),
+            session,
+            &actor,
+            None,
+        )
+        .await;
+    }
+}
+
+async fn watch_private_check_parent(session: config::Session, task_id: Uuid, store: TaskStore) {
+    let mut prior_generation = None;
+    loop {
+        tokio::time::sleep(SESSION_STOP_POLL).await;
+        let Ok(record) = store.read_record(task_id) else {
+            return;
+        };
+        if !SessionInstance::from_session(&session).eq(&record.owner) {
+            return;
+        }
+        if record.status.is_terminal() {
+            cleanup_private_checks(&session, &record, false).await;
+            return;
+        }
+        if prior_generation != Some(record.generation)
+            && record
+                .private_check_receipts
+                .iter()
+                .any(|receipt| receipt.producer_epoch != record.generation)
+        {
+            cleanup_private_checks(&session, &record, true).await;
+        }
+        prior_generation = Some(record.generation);
+        if session_instance_is_closing(&record.owner) {
+            cleanup_private_checks(&session, &record, false).await;
+            return;
+        }
+    }
+}
+
 async fn insert_runtime(
     session: &config::Session,
     task_id: Uuid,
     store: &TaskStore,
     client: ServeClient,
     lease: Arc<TaskRuntimeLease>,
-) -> Result<()> {
+) -> Result<Uuid> {
     let owner = SessionInstance::from_session(session);
     let _permit = ensure_current_active_instance(&owner, session).await?;
     insert_runtime_unchecked(session, task_id, store, client, &owner, lease)
@@ -3644,11 +3978,13 @@ fn insert_runtime_unchecked(
     client: ServeClient,
     owner: &SessionInstance,
     lease: Arc<TaskRuntimeLease>,
-) -> Result<()> {
+) -> Result<Uuid> {
     let owner = owner.clone();
     let store = store.clone();
     let scope = config::canonical_directory(&session.cwd)?;
-    let runtime_instance_id = Uuid::new_v4();
+    let runtime_instance_id = client
+        .private_runtime_instance_id()
+        .unwrap_or_else(Uuid::new_v4);
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
@@ -3687,6 +4023,13 @@ fn insert_runtime_unchecked(
         )
         .await;
     });
+    if client.private_runtime_instance_id().is_some() {
+        tokio::spawn(watch_private_check_parent(
+            session.clone(),
+            task_id,
+            store.clone(),
+        ));
+    }
     tokio::spawn(async move {
         let session_stopped = tokio::select! {
             _ = tokio::time::sleep(CHILD_LIFETIME) => false,
@@ -3708,31 +4051,81 @@ fn insert_runtime_unchecked(
             runtime.client.shutdown().await;
         }
         if session_stopped {
-            let result = async {
-                wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
-                finalize_session_tasks(&owner, &store).await
-            }
-            .await;
-            if let Err(error) = result {
-                eprintln!(
-                    "failed to finalize OpenCode tasks after session {} stopped: {error:#}",
-                    owner.id
-                );
+            loop {
+                let result = async {
+                    wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
+                    finalize_session_tasks(&owner, &store).await
+                }
+                .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error) => {
+                        eprintln!(
+                            "failed to finalize OpenCode tasks after session {} stopped; retrying: {error:#}",
+                            owner.id
+                        );
+                        tokio::time::sleep(SESSION_STOP_POLL).await;
+                    }
+                }
             }
         }
     });
-    Ok(())
+    Ok(runtime_instance_id)
+}
+
+fn remove_runtime_instance(task_id: Uuid, runtime_instance_id: Uuid) {
+    let _guard = store_lock().lock().unwrap();
+    let mut state = runtimes().lock().unwrap();
+    if state
+        .get(&task_id)
+        .is_some_and(|runtime| runtime.instance_id == runtime_instance_id)
+    {
+        state.remove(&task_id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStopObservation {
+    Active,
+    Inactive,
+    Replaced,
+    Unknown,
+}
+
+fn classify_session_observation(
+    same_instance: Result<bool, ()>,
+    active: Result<bool, ()>,
+) -> SessionStopObservation {
+    match same_instance {
+        Ok(false) => SessionStopObservation::Replaced,
+        Ok(true) => match active {
+            Ok(true) => SessionStopObservation::Active,
+            Ok(false) => SessionStopObservation::Inactive,
+            Err(()) => SessionStopObservation::Unknown,
+        },
+        Err(()) => SessionStopObservation::Unknown,
+    }
+}
+
+async fn observe_session_instance(owner: &SessionInstance) -> SessionStopObservation {
+    let same_instance = config::read_session_metadata(&owner.id)
+        .await
+        .map(|session| owner.matches(&session))
+        .map_err(|_| ());
+    let active = if same_instance == Ok(true) {
+        config::session_is_active(&owner.id).await.map_err(|_| ())
+    } else {
+        Err(())
+    };
+    classify_session_observation(same_instance, active)
 }
 
 async fn wait_for_session_stop(owner: SessionInstance) {
     loop {
-        let same_instance_active = match config::read_session_metadata(&owner.id).await {
-            Ok(session) if owner.matches(&session) => {
-                config::session_is_active(&owner.id).await.unwrap_or(false)
-            }
-            Ok(_) | Err(_) => false,
-        };
-        if !same_instance_active {
+        if matches!(
+            observe_session_instance(&owner).await,
+            SessionStopObservation::Inactive | SessionStopObservation::Replaced
+        ) {
             begin_session_instance_shutdown(&owner);
             return;
         }
@@ -3799,6 +4192,19 @@ async fn finalize_session_tasks(owner: &SessionInstance, store: &TaskStore) -> R
 pub(crate) async fn remove_session(session: &config::Session) -> Result<()> {
     let owner = SessionInstance::from_session(session);
     begin_session_instance_shutdown(&owner);
+    if let Ok(store) = TaskStore::default_store()
+        && let Ok((records, _)) = store.list_owned(session)
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            for record in records
+                .iter()
+                .filter(|record| !record.private_check_receipts.is_empty())
+            {
+                cleanup_private_checks(session, record, false).await;
+            }
+        })
+        .await;
+    }
     shutdown_session_runtimes(&owner).await;
     wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
     match TaskStore::default_store() {
@@ -4028,7 +4434,35 @@ fn derive_serve_state(
     // Retain the bounded raw reply before report decoding so a malformed
     // structured report cannot strand a completed task's result.
     let (raw_result, raw_result_truncated) = truncate_text(&text, MAX_RAW_RESULT_BYTES);
-    let (report, report_status, report_error) = extract_report(&text);
+    let (report, report_status, report_error) = if record.native_report_requested {
+        let info = assistant.get("info").unwrap_or(assistant);
+        match info
+            .get("structured_output")
+            .or_else(|| info.get("structured"))
+            .or_else(|| {
+                info.get("result").and_then(|result| {
+                    result
+                        .get("structured_output")
+                        .or_else(|| result.get("structured"))
+                })
+            }) {
+            None => (
+                None,
+                ReportStatus::MissingReport,
+                Some("native structured report is missing".to_owned()),
+            ),
+            Some(value) if report_contract::validate_native_wire(value) => {
+                (Some(value.clone()), ReportStatus::Valid, None)
+            }
+            Some(_) => (
+                None,
+                ReportStatus::InvalidReportSchema,
+                Some("native structured report failed validation".to_owned()),
+            ),
+        }
+    } else {
+        extract_report(&text)
+    };
     DerivedServeState {
         status: TaskStatus::Completed,
         usage,
@@ -4141,40 +4575,7 @@ fn parse_balanced_json(text: &str) -> Option<Value> {
 }
 
 fn report_shape_valid(report: &Value) -> bool {
-    let Some(object) = report.as_object() else {
-        return false;
-    };
-    let status_ok = object
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "blocked" | "needs_decision"
-            )
-        });
-    if !status_ok {
-        return false;
-    }
-    if object
-        .get("summary")
-        .and_then(Value::as_str)
-        .is_none_or(|summary| summary.chars().count() > MAX_SUMMARY_CHARS)
-    {
-        return false;
-    }
-    for key in ["changed_files", "checks", "unresolved"] {
-        match object.get(key) {
-            Some(Value::Array(items))
-                if items.len() <= MAX_REPORT_ARRAY_ITEMS
-                    && items.iter().all(|item| item.is_string()) => {}
-            None => {}
-            _ => return false,
-        }
-    }
-    serde_json::to_vec(report)
-        .map(|bytes| bytes.len() <= MAX_REPORT_BYTES)
-        .unwrap_or(false)
+    report_contract::validate(report, ReportProfile::TaskReport)
 }
 
 async fn reconcile_task(
@@ -4192,8 +4593,10 @@ async fn reconcile_task(
             if record.status.is_terminal() {
                 return Ok(());
             }
-            record.status = TaskStatus::ReconciliationRequired;
-            record.revision = record.revision.saturating_add(1);
+            if record.status != TaskStatus::ReconciliationRequired {
+                record.status = TaskStatus::ReconciliationRequired;
+                record.revision = record.revision.saturating_add(1);
+            }
             let outcome = record.outcome();
             if let Some(receipt) = record
                 .operations
@@ -4252,8 +4655,10 @@ async fn reconcile_task(
                 if record.status.is_terminal() {
                     return Ok(());
                 }
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
+                if record.status != TaskStatus::ReconciliationRequired {
+                    record.status = TaskStatus::ReconciliationRequired;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 update_operation_receipt(record, start_operation_id, OperationPhase::Accepted);
                 Ok(())
             });
@@ -4261,6 +4666,24 @@ async fn reconcile_task(
     }
 
     apply_derived(session, owner, store, record, derived).await
+}
+
+fn fit_raw_result_to_record_limit(record: &mut TaskRecord) -> Result<()> {
+    while let Some(raw) = record.raw_result.as_ref() {
+        let size = serde_json::to_vec_pretty(record)?.len();
+        if size <= MAX_TASK_RECORD_BYTES {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !raw.is_empty(),
+            "terminal task metadata exceeds {MAX_TASK_RECORD_BYTES} bytes even without raw result"
+        );
+        let remaining = raw.len().saturating_sub(size - MAX_TASK_RECORD_BYTES);
+        let (bounded, _) = truncate_text(raw, remaining.min(raw.len() - 1));
+        record.raw_result = Some(bounded);
+        record.raw_result_truncated = true;
+    }
+    Ok(())
 }
 
 async fn apply_derived(
@@ -4274,6 +4697,7 @@ async fn apply_derived(
         if record.status.is_terminal() {
             return Ok(());
         }
+        let previous = record.clone();
         if record.status != derived.status {
             record.status = derived.status;
         }
@@ -4296,7 +4720,17 @@ async fn apply_derived(
         if derived.last_error.is_some() {
             record.last_error = derived.last_error.clone();
         }
-        record.revision = record.revision.saturating_add(1);
+        if record.status != previous.status
+            || record.usage != previous.usage
+            || record.observed_model != previous.observed_model
+            || record.report != previous.report
+            || record.report_status != previous.report_status
+            || record.raw_result != previous.raw_result
+            || record.raw_result_truncated != previous.raw_result_truncated
+            || record.last_error != previous.last_error
+        {
+            record.revision = record.revision.saturating_add(1);
+        }
         let outcome = record.outcome();
         if derived.status.is_terminal()
             && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
@@ -4306,6 +4740,7 @@ async fn apply_derived(
             receipt.phase = OperationPhase::Applied;
             receipt.outcome = outcome;
         }
+        fit_raw_result_to_record_limit(record)?;
         Ok(())
     })
 }
@@ -4425,6 +4860,422 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
     task_start_with_store_and_binary(args, session, &store, Path::new("opencode")).await
 }
 
+fn preflight_blocker(class: &str, path: &Path, capability: &str, hint: &str) -> Value {
+    json!({"class": class, "backend": "opencode", "path": path,
+        "missing_capability": capability, "recovery_hint": hint})
+}
+
+fn bind_managed_commands(
+    session: &config::Session,
+    scope: &Path,
+) -> Result<crate::opencode_workspace::BoundWorkspace> {
+    use crate::opencode_workspace::{ManagedWorkspace, bind, blocker};
+    use crate::repository_store::{ProvisioningPhase, RepositoryStore};
+
+    let receipt = RepositoryStore::new()?.find_by_session_id(&session.id)?;
+    let Some(receipt) = receipt else {
+        let blocked = blocker(
+            "workspace_absent",
+            None,
+            scope,
+            "managed_workspace",
+            "Start a managed session with a ready workspace before an implementation task.",
+        );
+        anyhow::bail!(
+            "OPENCODE_PREFLIGHT_BLOCKER: {}",
+            serde_json::to_string(&blocked)?
+        );
+    };
+    let workspace = ManagedWorkspace {
+        workspace_id: receipt.workspace_id,
+        repository_id: receipt.request.repository.logical_name(),
+        checkout: scope.to_owned(),
+    };
+    let valid_owner = receipt.phase == ProvisioningPhase::WorkspaceReady
+        && receipt
+            .activated_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(session));
+    let resolved = (|| -> Result<PathBuf> {
+        anyhow::ensure!(valid_owner, "managed workspace session identity changed");
+        let roots = crate::named_roots::NamedRoots::from_env()?;
+        let root = roots
+            .canonical_root(&receipt.root_name)
+            .context("managed named root is unavailable")?;
+        let pinned = crate::workspace_provisioning::inspect_ready(root, &receipt)?;
+        anyhow::ensure!(
+            receipt.pinned_base.as_deref() == Some(pinned.as_str()),
+            "managed workspace base changed"
+        );
+        Ok(crate::workspace_provisioning::ready_allocation(&roots, &receipt)?.canonical_path)
+    })();
+    let checkout = match resolved {
+        Ok(path) => path,
+        Err(_) => {
+            let blocked = blocker(
+                "workspace_mismatch",
+                Some(&workspace),
+                scope,
+                "authoritative_managed_checkout",
+                "Reconcile the managed workspace receipt and active session before retrying.",
+            );
+            anyhow::bail!(
+                "OPENCODE_PREFLIGHT_BLOCKER: {}",
+                serde_json::to_string(&blocked)?
+            );
+        }
+    };
+    let workspace = ManagedWorkspace {
+        checkout,
+        ..workspace
+    };
+    let bound = bind(scope, Some(&workspace)).map_err(|blocked| {
+        anyhow::anyhow!(
+            "OPENCODE_PREFLIGHT_BLOCKER: {}",
+            serde_json::to_string(&blocked).expect("capability blocker serializes")
+        )
+    })?;
+    // Project configuration may load arbitrary plugins in the unsandboxed
+    // OpenCode child. This private bridge is available only when no such
+    // configuration is present at startup or on a later bridge call.
+    if [".opencode", "opencode.json", "opencode.jsonc"]
+        .iter()
+        .any(|entry| std::fs::symlink_metadata(scope.join(entry)).is_ok())
+    {
+        let blocked = blocker(
+            "workspace_mismatch",
+            Some(&workspace),
+            scope,
+            "private_opencode_configuration",
+            "Remove project OpenCode plugins/configuration before using the private workspace helper.",
+        );
+        anyhow::bail!(
+            "OPENCODE_PREFLIGHT_BLOCKER: {}",
+            serde_json::to_string(&blocked)?
+        );
+    }
+    Ok(bound)
+}
+
+fn private_codex_opt_in(
+    bound: &crate::opencode_workspace::BoundWorkspace,
+) -> Result<(String, String)> {
+    let model = std::env::var("TEMOTE_OPENCODE_WORKSPACE_CODEX_MODEL").ok();
+    let effort = std::env::var("TEMOTE_OPENCODE_WORKSPACE_CODEX_EFFORT").ok();
+    match (model, effort) {
+        (Some(model), Some(effort))
+            if !model.is_empty()
+                && !effort.is_empty()
+                && model.len() <= 128
+                && effort.len() <= 32
+                && model
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-/".contains(&c))
+                && effort.bytes().all(|c| c.is_ascii_lowercase()) =>
+        {
+            Ok((model, effort))
+        }
+        _ => {
+            let blocked = crate::opencode_workspace::require_scoped_commands(bound);
+            anyhow::bail!(
+                "OPENCODE_PREFLIGHT_BLOCKER: {}",
+                serde_json::to_string(&blocked)?
+            )
+        }
+    }
+}
+
+async fn preflight_managed_commands(
+    session: &config::Session,
+    scope: &Path,
+) -> Result<(Uuid, String, String)> {
+    let bound = bind_managed_commands(session, scope)?;
+    let (model, effort) = private_codex_opt_in(&bound)?;
+    let status = crate::codex_app_server::status(session)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "OPENCODE_PREFLIGHT_BLOCKER: {}",
+                preflight_blocker(
+                    "execution_unavailable",
+                    scope,
+                    "codex_backend",
+                    "Restore the Host Codex backend before retrying."
+                )
+            )
+        })?;
+    let advertised = status
+        .get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|item| {
+                item.get("model").and_then(Value::as_str) == Some(&model)
+                    && item
+                        .get("efforts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| item.as_str() == Some(&effort))
+                        })
+            })
+        });
+    if !advertised {
+        anyhow::bail!(
+            "OPENCODE_PREFLIGHT_BLOCKER: {}",
+            preflight_blocker(
+                "execution_unavailable",
+                scope,
+                "codex_model_effort",
+                "Configure an advertised Codex model and effort on the Host."
+            )
+        );
+    }
+    Ok((bound.workspace_id, model, effort))
+}
+
+pub(crate) fn validate_private_workspace_bridge_sync(
+    authority: &crate::opencode_private_workspace::Authority,
+) -> Result<()> {
+    let scope = config::canonical_directory(&authority.session.cwd)?;
+    let bound = bind_managed_commands(&authority.session, &scope)?;
+    anyhow::ensure!(
+        bound.workspace_id == authority.workspace_id && bound.cwd == scope,
+        "private workspace binding changed"
+    );
+    anyhow::ensure!(
+        private_codex_opt_in(&bound)? == (authority.model.clone(), authority.effort.clone()),
+        "private workspace Host opt-in changed"
+    );
+    let store = TaskStore::default_store()?;
+    let record = store.read_record(authority.parent_task_id)?;
+    ensure_task_owner(&record, &authority.session)?;
+    anyhow::ensure!(
+        private_record_matches(&record, authority, &scope)
+            && runtime_registration_matches(
+                &authority.session,
+                authority.parent_task_id,
+                authority.runtime_instance_id,
+            ),
+        "private workspace parent task is no longer active"
+    );
+    Ok(())
+}
+
+fn private_record_matches(
+    record: &TaskRecord,
+    authority: &crate::opencode_private_workspace::Authority,
+    scope: &Path,
+) -> bool {
+    record.task_id == authority.parent_task_id
+        && record.owner.matches(&authority.session)
+        && record.scope_cwd == scope
+        && record.managed_workspace_id == Some(authority.workspace_id)
+        && record.private_codex_model.as_deref() == Some(&authority.model)
+        && record.private_codex_effort.as_deref() == Some(&authority.effort)
+        && record.generation == authority.producer_epoch
+        && matches!(
+            record.status,
+            TaskStatus::Running | TaskStatus::WaitingApproval
+        )
+}
+
+fn retain_private_check_receipt(
+    record: &mut TaskRecord,
+    authority: &crate::opencode_private_workspace::Authority,
+    operation_id: Uuid,
+    action: &str,
+    expected: Uuid,
+    create: bool,
+) -> Result<Uuid> {
+    anyhow::ensure!(
+        private_record_matches(record, authority, &authority.session.cwd),
+        "private workspace parent changed"
+    );
+    if let Some(receipt) = record
+        .private_check_receipts
+        .iter()
+        .find(|item| item.operation_id == operation_id)
+    {
+        anyhow::ensure!(
+            receipt.action == action
+                && receipt.workspace_id == authority.workspace_id
+                && receipt.producer_epoch == authority.producer_epoch
+                && receipt.codex_task_id == expected,
+            "private check receipt mismatch"
+        );
+        return Ok(receipt.codex_task_id);
+    }
+    anyhow::ensure!(create, "private check receipt absent");
+    anyhow::ensure!(
+        record.private_check_receipts.len() < 64,
+        "private check receipt limit reached"
+    );
+    record.private_check_receipts.push(PrivateCheckReceipt {
+        operation_id,
+        action: action.to_owned(),
+        codex_task_id: expected,
+        workspace_id: authority.workspace_id,
+        producer_epoch: authority.producer_epoch,
+    });
+    record.revision = record.revision.saturating_add(1);
+    Ok(expected)
+}
+
+pub(crate) async fn validate_private_workspace_bridge(
+    authority: &crate::opencode_private_workspace::Authority,
+) -> Result<()> {
+    let owner = SessionInstance::from_session(&authority.session);
+    let _permit = ensure_current_active_instance(&owner, &authority.session).await?;
+    validate_private_workspace_bridge_sync(authority)
+}
+
+pub(crate) fn private_check_receipt(
+    authority: &crate::opencode_private_workspace::Authority,
+    operation_id: Uuid,
+    action: &str,
+    create: bool,
+) -> Result<Uuid> {
+    validate_private_workspace_bridge_sync(authority)?;
+    let store = TaskStore::default_store()?;
+    let expected =
+        crate::codex_app_server::task_id_for_operation(&authority.session, operation_id)?;
+    let mut task_id = None;
+    store.update(&authority.session, authority.parent_task_id, |record| {
+        anyhow::ensure!(
+            runtime_registration_matches(
+                &authority.session,
+                authority.parent_task_id,
+                authority.runtime_instance_id
+            ),
+            "private workspace runtime changed"
+        );
+        task_id = Some(retain_private_check_receipt(
+            record,
+            authority,
+            operation_id,
+            action,
+            expected,
+            create,
+        )?);
+        Ok(())
+    })?;
+    task_id.context("private check receipt was not retained")
+}
+
+async fn preflight_start(scope: &Path, binary: &Path) -> Result<Option<Value>> {
+    #[cfg(test)]
+    let fake_installed = SPAWN_HOOK
+        .get()
+        .is_some_and(|hook| hook.lock().unwrap().is_some());
+    #[cfg(not(test))]
+    let fake_installed = false;
+    if !fake_installed {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(binary)
+                .arg("--version")
+                .output(),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(ref output)) if output.status.success()) {
+            let blocker = preflight_blocker(
+                "execution_unavailable",
+                scope,
+                "serve_binary",
+                "Configure an executable OpenCode serve binary on the host and retry the same operation ID.",
+            );
+            anyhow::bail!("OPENCODE_PREFLIGHT_BLOCKER: {blocker}");
+        }
+    }
+    let checkout = scope
+        .ancestors()
+        .any(|path| path.join(".git").exists() || path.join(".jj").exists());
+    let probe = scope.join(format!(".temote-opencode-preflight-{}", Uuid::new_v4()));
+    let writable = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if writable {
+        let _ = std::fs::remove_file(&probe);
+    }
+    if !writable {
+        let blocker = preflight_blocker(
+            "checkout_read_only",
+            scope,
+            "workspace_write",
+            "Select a writable session scope before implementation work.",
+        );
+        anyhow::bail!("OPENCODE_PREFLIGHT_BLOCKER: {blocker}");
+    }
+    if !checkout {
+        let mut advisory = preflight_blocker(
+            "checkout_missing",
+            scope,
+            "working_checkout",
+            "Bind the task to a managed checkout when repository work is required.",
+        );
+        advisory["severity"] = json!("advisory");
+        return Ok(Some(advisory));
+    }
+    Ok(None)
+}
+
+async fn probe_private_registration(
+    session: &config::Session,
+    store: &TaskStore,
+    task_id: Uuid,
+    workspace_id: Uuid,
+    model: &str,
+    effort: &str,
+    binary: &Path,
+) -> Result<()> {
+    // Pre-acceptance probes run before a TaskRecord creates this store.
+    // Create and validate each private ancestor without accepting a task.
+    store.ensure_directory()?;
+    ensure_private_directory(&store.runtime_state_root())?;
+    let state_dir = store.runtime_state_directory(task_id);
+    ensure_private_directory(&state_dir)?;
+    let data_dir = state_dir.join("probe-data");
+    ensure_private_directory(&data_dir)?;
+    let config_dir = state_dir.join("probe-config");
+    ensure_private_directory(&config_dir)?;
+    let authority = crate::opencode_private_workspace::Authority {
+        session: session.clone(),
+        parent_task_id: task_id,
+        workspace_id,
+        model: model.to_owned(),
+        effort: effort.to_owned(),
+        producer_epoch: 1,
+        runtime_instance_id: Uuid::new_v4(),
+    };
+    let bridge = crate::opencode_private_workspace::start(authority)?;
+    let mut config: Value = serde_json::from_str(&serve_permission_config(&state_dir, &[])?)?;
+    crate::opencode_private_workspace::configure(&mut config, &bridge);
+    let config = serde_json::to_string(&config)?;
+    let result = spawn_serve_once(
+        binary,
+        &session.cwd,
+        &data_dir,
+        reserve_loopback_port()?,
+        &Uuid::new_v4().simple().to_string(),
+        &config,
+        ServeContract::V2,
+        Some(bridge),
+        Some(&config_dir),
+    )
+    .await;
+    let connected = match result {
+        Ok(client) => {
+            let connected = client.wait_private_workspace_registered().await;
+            client.shutdown().await;
+            connected
+        }
+        Err(_) => false,
+    };
+    anyhow::ensure!(connected, "private workspace MCP registration probe failed");
+    Ok(())
+}
+
 async fn task_start_with_store_and_binary(
     args: &Value,
     session: &config::Session,
@@ -4437,6 +5288,7 @@ async fn task_start_with_store_and_binary(
     let model = optional_string(args, "model")?;
     let agent = optional_string(args, "agent")?;
     let variant = optional_string(args, "variant")?;
+    let workspace_requirement = optional_string(args, "workspace_requirement")?;
     validate_task_input(task, "task")?;
     if let Some(model) = model {
         validate_argument(model, "model")?;
@@ -4451,22 +5303,77 @@ async fn task_start_with_store_and_binary(
     if let Some(variant) = variant {
         validate_argument(variant, "variant")?;
     }
+    anyhow::ensure!(
+        workspace_requirement.is_none_or(|value| value == "managed_commands"),
+        "workspace_requirement must be managed_commands"
+    );
 
+    let scope_cwd = config::canonical_directory(&session.cwd).map_err(|_| {
+        let blocker = preflight_blocker(
+            "scope_unresolvable",
+            &session.cwd,
+            "canonical_scope",
+            "Restore the session directory or start a new scoped session.",
+        );
+        anyhow::anyhow!("OPENCODE_PREFLIGHT_BLOCKER: {blocker}")
+    })?;
     let task_id = task_id_for_operation(session, operation_id)?;
-    let request_fingerprint = fingerprint(&json!({
+    let mut fingerprint_request = json!({
         "kind": "start",
         "task_id": task_id,
         "task": task,
         "model": model,
         "agent": agent,
         "variant": variant,
-    }))?;
+    });
+    if let Some(requirement) = workspace_requirement {
+        fingerprint_request["workspace_requirement"] = json!(requirement);
+    }
+    let request_fingerprint = fingerprint(&fingerprint_request)?;
+    if store.path(task_id).exists() {
+        let existing = store.read_record(task_id)?;
+        ensure_task_owner(&existing, session)?;
+        return replay_operation(&existing, operation_id, request_fingerprint);
+    }
+    let managed = if workspace_requirement == Some("managed_commands") {
+        Some(preflight_managed_commands(session, &scope_cwd).await?)
+    } else {
+        None
+    };
+    let blocker = preflight_start(&scope_cwd, binary).await?;
+    if let Some((workspace_id, model, effort)) = &managed {
+        probe_private_registration(
+            session,
+            store,
+            task_id,
+            *workspace_id,
+            model,
+            effort,
+            binary,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "OPENCODE_PREFLIGHT_BLOCKER: {}",
+                preflight_blocker(
+                    "execution_unavailable",
+                    &scope_cwd,
+                    "private_workspace_mcp",
+                    "Restore OpenCode v2 private MCP registration before retrying."
+                )
+            )
+        })?;
+    }
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
         task_id,
         owner: SessionInstance::from_session(session),
-        scope_cwd: config::canonical_directory(&session.cwd)?,
+        scope_cwd,
+        managed_workspace_id: managed.as_ref().map(|(id, _, _)| *id),
+        private_codex_model: managed.as_ref().map(|(_, model, _)| model.clone()),
+        private_codex_effort: managed.as_ref().map(|(_, _, effort)| effort.clone()),
+        private_check_receipts: Vec::new(),
         model: model.map(str::to_owned),
         agent: agent.map(str::to_owned),
         variant: variant.map(str::to_owned),
@@ -4477,6 +5384,8 @@ async fn task_start_with_store_and_binary(
         usage: None,
         observed_model: None,
         report: None,
+        native_report_requested: false,
+        blocker,
         last_error: None,
         report_status: None,
         raw_result: None,
@@ -4540,6 +5449,7 @@ async fn task_start_with_store_and_binary(
         }
     };
 
+    let mut registered_runtime = None;
     let start_result = async {
         let created = client
             .session_create(&json!({
@@ -4564,6 +5474,7 @@ async fn task_start_with_store_and_binary(
                 "opencode task session was already bound"
             );
             record.opencode_session_id = Some(opencode_session_id.clone());
+            record.native_report_requested = matches!(&client, ServeClient::SdkV2(_));
             record.revision = record.revision.saturating_add(1);
             Ok(())
         })?;
@@ -4579,8 +5490,8 @@ async fn task_start_with_store_and_binary(
             "\n",
             task
         )}]);
-        client.prompt_async(&opencode_session_id, &body).await?;
-
+        // Private tools may be called before prompt_async returns. Persist the
+        // parent execution authority before registering the bridge runtime.
         let apply_permit = ensure_current_active_instance(&owner, session).await?;
         record = store.update_if_instance_live(session, task_id, &owner, |record| {
             if record.status.is_terminal() {
@@ -4594,7 +5505,27 @@ async fn task_start_with_store_and_binary(
             }
             record.generation = 1;
             record.revision = record.revision.saturating_add(1);
-            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+            Ok(())
+        })?;
+        drop(apply_permit);
+        registered_runtime = Some(
+            insert_runtime(
+                session,
+                task_id,
+                store,
+                client.clone(),
+                Arc::clone(&runtime_lease),
+            )
+            .await?,
+        );
+        client.prompt_async(&opencode_session_id, &body).await?;
+
+        let apply_permit = ensure_current_active_instance(&owner, session).await?;
+        record = store.update_if_instance_live(session, task_id, &owner, |record| {
+            if !record.status.is_terminal() {
+                record.revision = record.revision.saturating_add(1);
+                update_operation_receipt(record, operation_id, OperationPhase::Applied);
+            }
             Ok(())
         })?;
         drop(apply_permit);
@@ -4603,6 +5534,9 @@ async fn task_start_with_store_and_binary(
     .await;
 
     if let Err(error) = start_result {
+        if let Some(runtime_instance_id) = registered_runtime {
+            remove_runtime_instance(task_id, runtime_instance_id);
+        }
         client.shutdown().await;
         let shutting_down = session_instance_is_closing(&owner);
         let record = store.update(session, task_id, |record| {
@@ -4626,10 +5560,10 @@ async fn task_start_with_store_and_binary(
             }
             Ok(())
         })?;
+        Box::pin(cleanup_private_checks(session, &record, false)).await;
         return Ok(task_view(&record, None));
     }
 
-    insert_runtime(session, task_id, store, client.clone(), runtime_lease).await?;
     Ok(task_view(&record, None))
 }
 
@@ -4680,6 +5614,21 @@ async fn task_get_with_store_and_binary(
     let task_id = required_uuid(args, "task_id")?;
     let after_revision = optional_u64(args, "after_revision")?;
     let owner = SessionInstance::from_session(session);
+    if session_instance_is_closing(&owner) {
+        if let Ok(current) = config::read_session_metadata(&owner.id).await {
+            anyhow::ensure!(
+                owner.matches(&current),
+                "OpenCode session instance is no longer current"
+            );
+        }
+        let record = {
+            let _guard = store.lock()?;
+            store.load_locked(session, task_id)?
+        };
+        let mut view = task_view(&record, None);
+        view["recovery_state"] = json!("owner_closing");
+        return Ok(view);
+    }
     let _load_permit = ensure_current_active_instance(&owner, session).await?;
     let (record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
 
@@ -4711,13 +5660,13 @@ async fn task_get_with_store_and_binary(
             }
             Err(_) => {
                 let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                    if !record.status.is_terminal() {
+                    if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                         record.status = TaskStatus::Unknown;
                         record.revision = record.revision.saturating_add(1);
                     }
                     Ok(())
                 })?;
-                return Ok(task_view(&record, None));
+                return Ok(task_view_at_revision(&record, after_revision));
             }
         };
 
@@ -4727,13 +5676,18 @@ async fn task_get_with_store_and_binary(
         Err(error) => {
             let record = store.update_if_instance_live(session, task_id, &owner, |record| {
                 if !record.status.is_terminal() {
-                    record.status = TaskStatus::Unknown;
-                    record.last_error = Some(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
-                    record.revision = record.revision.saturating_add(1);
+                    let last_error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
+                    if record.status != TaskStatus::Unknown
+                        || record.last_error.as_ref() != Some(&last_error)
+                    {
+                        record.status = TaskStatus::Unknown;
+                        record.last_error = Some(last_error);
+                        record.revision = record.revision.saturating_add(1);
+                    }
                 }
                 Ok(())
             })?;
-            return Ok(task_view(&record, None));
+            return Ok(task_view_at_revision(&record, after_revision));
         }
     };
 
@@ -5530,6 +6484,7 @@ struct FakeServe {
     abort_calls: Vec<String>,
     create_fail: Option<String>,
     prompt_fail: Option<String>,
+    prompt_hook: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
     version: String,
     providers: Value,
 }
@@ -5581,6 +6536,9 @@ impl FakeServe {
 
     fn prompt_async(&mut self, session_id: &str, body: &Value) -> Result<()> {
         self.require_live()?;
+        if let Some(hook) = &self.prompt_hook {
+            hook()?;
+        }
         if let Some(error) = &self.prompt_fail {
             anyhow::bail!("{error}");
         }
@@ -5734,6 +6692,16 @@ impl FakeServe {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_stops_only_on_confirmed_inactivity_or_replacement() {
+        use SessionStopObservation::*;
+        assert_eq!(classify_session_observation(Ok(true), Ok(true)), Active);
+        assert_eq!(classify_session_observation(Ok(true), Ok(false)), Inactive);
+        assert_eq!(classify_session_observation(Ok(false), Err(())), Replaced);
+        assert_eq!(classify_session_observation(Err(()), Err(())), Unknown);
+        assert_eq!(classify_session_observation(Ok(true), Err(())), Unknown);
+    }
+
     use super::*;
     use crate::approvals;
 
@@ -5973,6 +6941,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn first_prompt_callback_sees_parent_authority_and_failure_cleans_runtime() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+
+        for submission_fails in [false, true] {
+            let operation_id = Uuid::new_v4();
+            let task_id = task_id_for_operation(&session, operation_id).unwrap();
+            let (_, fake) = fake_client();
+            let callback_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_session = session.clone();
+            let callback_store = store.clone();
+            let seen = Arc::clone(&callback_seen);
+            fake.lock().unwrap().prompt_hook = Some(Arc::new(move || {
+                let record = callback_store.read_record(task_id)?;
+                let runtime = runtime_for(&callback_session, task_id)
+                    .context("first prompt callback has no parent runtime")?;
+                anyhow::ensure!(
+                    record.status == TaskStatus::Running && record.generation == 1,
+                    "first prompt callback has no persisted parent execution authority"
+                );
+                anyhow::ensure!(
+                    runtime_registration_matches(&callback_session, task_id, runtime.instance_id),
+                    "first prompt callback has no matching parent runtime"
+                );
+                anyhow::ensure!(
+                    record.operations[0].phase == OperationPhase::Accepted,
+                    "prompt acceptance was recorded before submission"
+                );
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }));
+            if submission_fails {
+                fake.lock().unwrap().prompt_fail = Some("submission failed".to_owned());
+            }
+            install_fake(fake.clone());
+            let view = task_start_with_store_and_binary(
+                &start_args(operation_id, "invoke private tool immediately"),
+                &session,
+                &store,
+                Path::new("opencode"),
+            )
+            .await
+            .unwrap();
+            clear_fake();
+            assert!(callback_seen.load(std::sync::atomic::Ordering::SeqCst));
+            let record = store.read_record(task_id).unwrap();
+            if submission_fails {
+                assert_eq!(view["status"], "reconciliation_required");
+                assert!(runtime_for(&session, task_id).is_none());
+                assert!(fake.lock().unwrap().dead);
+                assert_eq!(record.operations[0].phase, OperationPhase::Accepted);
+            } else {
+                assert_eq!(view["status"], "running");
+                assert!(runtime_for(&session, task_id).is_some());
+                assert_eq!(record.operations[0].phase, OperationPhase::Applied);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn start_replays_same_operation_id_without_respawning() {
         let root = tempdir();
         let (_handle, session) = active_test_session(&root, &test_id(), false).await;
@@ -6056,6 +7086,25 @@ mod tests {
             let fake = fake.lock().unwrap();
             fake.sessions.keys().next().unwrap().clone()
         };
+        let running = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let revision = running["revision"].as_u64().unwrap();
+        let unchanged = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": revision}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["status"], "not_modified");
+        assert_eq!(unchanged["revision"], revision);
         let report = json!({
             "status": "completed",
             "summary": "done",
@@ -6086,6 +7135,7 @@ mod tests {
         clear_fake();
 
         assert_eq!(out["status"], "completed");
+        assert!(out["revision"].as_u64().unwrap() > revision);
         assert_eq!(out["report"]["summary"], "done");
         assert_eq!(out["report_status"], "valid");
         assert_eq!(out["raw_result_bytes"], report.to_string().len() as u64);
@@ -6299,6 +7349,46 @@ mod tests {
         assert_eq!(derived.report.unwrap()["summary"], "done");
         assert!(derived.raw_result_truncated);
         assert!(derived.raw_result.unwrap().len() <= MAX_RAW_RESULT_BYTES);
+    }
+
+    #[test]
+    fn native_structured_result_never_falls_back_to_final_message() {
+        let root = tempdir();
+        let session = session(&root, "native-report");
+        let mut record = record_for(&session, Uuid::new_v4(), TaskStatus::Running, Some("ses_1"));
+        record.native_report_requested = true;
+        let message = |structured: Value| {
+            json!({
+            "info": {"role": "assistant", "time": {"created": 1, "completed": 2}, "structured_output": structured},
+                "parts": [{"type": "text", "text": "{\"status\":\"completed\",\"summary\":\"fallback\"}"}]
+            })
+        };
+        for (structured, expected) in [
+            (
+                json!({"status":"completed","summary":"native"}),
+                ReportStatus::Valid,
+            ),
+            (
+                json!({"status":"invalid","summary":"bad"}),
+                ReportStatus::InvalidReportSchema,
+            ),
+        ] {
+            let derived = derive_serve_state(
+                &record,
+                "ses_1",
+                &BTreeSet::new(),
+                &json!({}),
+                &[message(structured)],
+                &[],
+                &[],
+            );
+            assert_eq!(derived.report_status, Some(expected));
+            if expected == ReportStatus::Valid {
+                assert_eq!(derived.report.unwrap()["summary"], "native");
+            } else {
+                assert!(derived.report.is_none());
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7277,6 +8367,8 @@ mod tests {
             &serve_password,
             &config_content,
             ServeContract::V2,
+            None,
+            None,
         )
         .await;
         let client = match client {
@@ -7377,6 +8469,8 @@ mod tests {
             &serve_password,
             &config_content,
             ServeContract::Auto,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -7544,6 +8638,7 @@ mod tests {
             directory: "/tmp".to_owned(),
             child: tokio::sync::Mutex::new(child),
             tail: Arc::new(Mutex::new(String::new())),
+            _private_bridge: None,
         }));
 
         let health = client.health().await.unwrap();
@@ -7673,6 +8768,10 @@ mod tests {
             task_id,
             owner: SessionInstance::from_session(owner_session),
             scope_cwd: owner_session.cwd.clone(),
+            managed_workspace_id: None,
+            private_codex_model: None,
+            private_codex_effort: None,
+            private_check_receipts: Vec::new(),
             model: Some("anthropic/claude-sonnet-4".to_owned()),
             agent: None,
             variant: None,
@@ -7683,6 +8782,8 @@ mod tests {
             usage: None,
             observed_model: None,
             report: None,
+            native_report_requested: false,
+            blocker: None,
             last_error: None,
             report_status: None,
             raw_result: None,
@@ -7695,6 +8796,279 @@ mod tests {
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
+    }
+
+    #[test]
+    fn private_check_receipt_replay_and_generation_are_parent_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "private-check-receipt");
+        let parent_task_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let child_task_id = Uuid::new_v4();
+        let mut record = record_for(&session, parent_task_id, TaskStatus::Running, Some("oc"));
+        record.managed_workspace_id = Some(workspace_id);
+        record.private_codex_model = Some("gpt-5.6-luna".to_owned());
+        record.private_codex_effort = Some("high".to_owned());
+        let authority = crate::opencode_private_workspace::Authority {
+            session: session.clone(),
+            parent_task_id,
+            workspace_id,
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "high".to_owned(),
+            producer_epoch: record.generation,
+            runtime_instance_id: Uuid::new_v4(),
+        };
+        assert!(private_record_matches(&record, &authority, &session.cwd));
+        assert!(
+            retain_private_check_receipt(
+                &mut record,
+                &authority,
+                operation_id,
+                "test",
+                child_task_id,
+                false
+            )
+            .is_err()
+        );
+        let revision = record.revision;
+        assert_eq!(
+            retain_private_check_receipt(
+                &mut record,
+                &authority,
+                operation_id,
+                "test",
+                child_task_id,
+                true
+            )
+            .unwrap(),
+            child_task_id
+        );
+        assert_eq!(record.private_check_receipts.len(), 1);
+        assert!(record.revision > revision);
+        assert_eq!(
+            retain_private_check_receipt(
+                &mut record,
+                &authority,
+                operation_id,
+                "test",
+                child_task_id,
+                true
+            )
+            .unwrap(),
+            child_task_id
+        );
+        assert_eq!(record.private_check_receipts.len(), 1);
+        assert!(
+            retain_private_check_receipt(
+                &mut record,
+                &authority,
+                operation_id,
+                "build",
+                child_task_id,
+                true
+            )
+            .is_err()
+        );
+        let mut other_parent = authority.clone();
+        other_parent.parent_task_id = Uuid::new_v4();
+        assert!(!private_record_matches(
+            &record,
+            &other_parent,
+            &session.cwd
+        ));
+        record.generation += 1;
+        assert!(!private_record_matches(&record, &authority, &session.cwd));
+        assert!(
+            retain_private_check_receipt(
+                &mut record,
+                &authority,
+                Uuid::new_v4(),
+                "lint",
+                Uuid::new_v4(),
+                true
+            )
+            .is_err()
+        );
+        record.generation -= 1;
+        record.status = TaskStatus::ReconciliationRequired;
+        assert!(!private_record_matches(&record, &authority, &session.cwd));
+        record.status = TaskStatus::Interrupted;
+        assert!(!private_record_matches(&record, &authority, &session.cwd));
+    }
+
+    #[test]
+    fn private_check_uses_codex_ask_approval_class() {
+        use crate::approvals::{LocalApproval, local_approval};
+        assert_eq!(
+            local_approval(
+                config::PermissionMode::Ask,
+                crate::approvals::ApprovalClass::CodexAppServer,
+            ),
+            LocalApproval::Request,
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_derived_state_preserves_revision_until_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "derived-revision");
+        let instance = SessionInstance::from_session(&owner);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(instance.clone(), LifecycleEntry::new());
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = record_for(&owner, task_id, TaskStatus::Running, Some("session-1"));
+        store.save(&record).unwrap();
+        let derived = DerivedServeState {
+            status: TaskStatus::Running,
+            usage: None,
+            observed_model: None,
+            report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
+            last_error: None,
+        };
+        let first = apply_derived(&owner, &instance, &store, record, derived)
+            .await
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        let same = DerivedServeState {
+            status: TaskStatus::Running,
+            usage: None,
+            observed_model: None,
+            report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
+            last_error: None,
+        };
+        let first = apply_derived(&owner, &instance, &store, first, same)
+            .await
+            .unwrap();
+        assert_eq!(first.revision, 1);
+        let changed = DerivedServeState {
+            status: TaskStatus::WaitingApproval,
+            usage: None,
+            observed_model: None,
+            report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
+            last_error: None,
+        };
+        let second = apply_derived(&owner, &instance, &store, first, changed)
+            .await
+            .unwrap();
+        assert_eq!(second.revision, 2);
+        begin_session_instance_shutdown(&instance);
+        finish_session_shutdown(&instance).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_owner_can_read_retained_task_without_restarting_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "closing-task-read");
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                Some("session-1"),
+            ))
+            .unwrap();
+        let instance = SessionInstance::from_session(&owner);
+        begin_session_instance_shutdown(&instance);
+        let view = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            Path::new("missing-opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["status"], "running");
+        assert_eq!(view["recovery_state"], "owner_closing");
+        let mut replacement = owner.clone();
+        replacement.started_at += 1;
+        assert!(store.load_locked(&replacement, task_id).is_err());
+        finish_session_shutdown(&instance).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_task_store_finalization_keeps_same_owner_cleanup_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "retry-finalization");
+        let instance = SessionInstance::from_session(&owner);
+        let bad_path = root.path().join("bad-store");
+        std::fs::write(&bad_path, b"not a directory").unwrap();
+        begin_session_instance_shutdown(&instance);
+        assert!(
+            finalize_session_tasks(&instance, &TaskStore::new(bad_path))
+                .await
+                .is_err()
+        );
+        assert!(session_instance_is_closing(&instance));
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(&owner, task_id, TaskStatus::Running, None))
+            .unwrap();
+        finalize_session_tasks(&instance, &store).await.unwrap();
+        assert_eq!(
+            store.read_record(task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        assert!(!session_instance_is_closing(&instance));
+    }
+
+    #[test]
+    fn terminal_raw_result_fits_near_limit_record_without_losing_replay_history() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "bounded-terminal-result");
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Completed, Some("session-1"));
+        record.report_status = Some(ReportStatus::Valid);
+        record.report = Some(json!({"status": "completed", "summary": "x".repeat(7000)}));
+        while serde_json::to_vec_pretty(&record).unwrap().len() < 54_000 {
+            record.operation_tombstones.push(OperationTombstone {
+                operation_id: Uuid::new_v4(),
+                request_fingerprint: Uuid::new_v4(),
+            });
+        }
+        let replay_id = record.operation_tombstones[0].operation_id;
+        store.save(&record).unwrap();
+        record.raw_result = Some("水".repeat(MAX_RAW_RESULT_BYTES / 3));
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() > MAX_TASK_RECORD_BYTES);
+        fit_raw_result_to_record_limit(&mut record).unwrap();
+        assert!(record.raw_result_truncated);
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() <= MAX_TASK_RECORD_BYTES);
+        store.save(&record).unwrap();
+        let reread = store.read_record(task_id).unwrap();
+        assert_eq!(reread.status, TaskStatus::Completed);
+        assert_eq!(reread.report_status, Some(ReportStatus::Valid));
+        assert!(reread.raw_result.is_some());
+        assert!(reread.raw_result_truncated);
+        let replay_fingerprint = reread.operation_tombstones[0].request_fingerprint;
+        assert!(
+            replay_operation(&reread, replay_id, replay_fingerprint)
+                .unwrap_err()
+                .to_string()
+                .contains("OPERATION_REPLAY_COMPACTED")
+        );
+        assert!(
+            reread
+                .operation_tombstones
+                .iter()
+                .any(|item| item.operation_id == replay_id)
+        );
     }
 
     // ---------- session-owned task listing ----------
@@ -7877,6 +9251,35 @@ mod tests {
         assert!(restored.pending_interaction_summary.is_none());
     }
 
+    #[tokio::test]
+    #[ignore = "host gate: installed OpenCode v2 and loopback process startup"]
+    async fn installed_v2_registers_private_workspace_bridge_host_acceptance() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), &test_id());
+        let store = TaskStore::new(state.path().join("tasks"));
+        let binary = PathBuf::from(
+            std::env::var("TEMOTE_TEST_OPENCODE_BINARY")
+                .expect("set TEMOTE_TEST_OPENCODE_BINARY to the installed v2 executable"),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            probe_private_registration(
+                &owner,
+                &store,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "fixture-model",
+                "medium",
+                &binary,
+            ),
+        )
+        .await
+        .expect("registration probe timed out")
+        .expect("private tool did not register");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_observer_updates_task_list_without_task_get_or_detail_storage() {
         let _serial = serial().await;
@@ -8043,8 +9446,11 @@ mod tests {
         let stored = store.read_record(task_id).unwrap();
         assert_eq!(stored.updated_at, original_updated_at);
         assert_eq!(stored.status, TaskStatus::Running);
+        // Pending interactions use their own cursor and do not invalidate
+        // verification attached to the task's semantic revision.
         assert_eq!(stored.revision, record.revision);
         let mut expected = record.clone();
+        expected.revision = stored.revision;
         expected.pending_interaction_summary = stored.pending_interaction_summary.clone();
         assert_eq!(stored, expected);
         let bytes = std::fs::read(store.path(task_id)).unwrap();
@@ -8308,10 +9714,9 @@ mod tests {
         assert_eq!(after.opencode_session_id, record.opencode_session_id);
         assert_eq!(after.operations, record.operations);
         assert!(store.path(expired_task_id).exists());
-        assert_eq!(
-            after.pending_interaction_summary.unwrap().state,
-            SummaryState::None
-        );
+        let summary = after.pending_interaction_summary.unwrap();
+        assert_eq!(summary.state, SummaryState::None);
+        assert!(summary.summary_revision > 0);
         assert_eq!(
             task_list_with_store(&json!({}), &owner, &store).unwrap()["total"],
             2

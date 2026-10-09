@@ -44,10 +44,10 @@ jobs:
           node-version: 22
 
       - name: Install gateway dependencies
-        run: npm ci --prefix gateway
+        run: npm ci --prefix fabric
 
       - name: Install Chromium and system dependencies
-        working-directory: gateway
+        working-directory: fabric
         run: npx playwright install --with-deps chromium
 
       - name: Set up Linux sandbox runtime
@@ -113,14 +113,14 @@ jobs:
           cargo test --all-targets --all-features
           cargo build --release --locked
           cargo build --release --locked --no-default-features
-          npm test --prefix gateway
+          npm test --prefix fabric
 
       - name: Verify public contract parity
         shell: bash
         run: |
           set -euo pipefail
-          TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
-          npm test --prefix gateway
+          TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote --locked gateway_generated
+          npm test --prefix fabric
 
       - name: Create release-only commit
         shell: bash

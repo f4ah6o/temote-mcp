@@ -2,6 +2,16 @@
 
 [English](usage.md)
 
+
+ローカル `temote task ... --local` と新しい MCP の task／evidence 呼び出しは、同じ supervisor の実行所有者へ送ります。relay capability を持たない旧 supervisor だけが互換用の直接 MCP 処理を使います。交渉失敗や応答不明時に別の実行所有者へ切り替えず、元の operation ID で照合します。
+## 現在の task ワークフロー
+
+標準の実行ファイル名は `temote` です。既存の `temote-mcp` コマンドと保存状態も引き続き使えます。設定は `TEMOTE_` / `TEMOTE_FABRIC_` を従来の別名より優先します。[名称の移行](naming-migration.md)を参照してください。
+
+4 backend の `*_task_get` は `wait_ms` を受け付けます。省略または 0 は即時読み取り、最大 30000 の符号なし整数は revision の変更や対応が必要な状態を待ちます。待機で task を開始・制御しません。変更なしの期限到達は `not_modified`、まだ観測できない場合は revision を作らず `wait_timeout` を返します。再接続時も task ID と operation receipt を保持してください。
+
+所有者向けの `temote task ... --local` は MCP と同じ orchestration と session instance の検証を使います。[backend の対応](backend-capabilities.ja.md)、[Change と delivery](change-delivery.md)、[prompt observation](prompt-observation.md)、[friction](friction.md)を参照してください。Fabric の任意の client extension と webhook Events は [extensions](fabric-extensions.md) / [Events](events.ja.md) に説明しています。
+
 ## session
 
 local work では session を直接作成します。lifecycle supervisor が未起動なら、local CLI が現在の Temote binary 自身を supervisor として起動し、control socket が ready になるまで待ちます。新規 session は sandbox を維持した approval-free の `agent` mode が既定です。
@@ -17,11 +27,13 @@ local approval input が必要な場合は `temote-mcp session console` を使�
 
 supervisor の bounded local activity stream は `temote-mcp activity [SESSION_ID] [--tail N] [--no-follow]` で確認できます。既定では follow し、filter 後の最新100件を replay します。durable audit log ではなく best-effort な診断機能です。privacy、欠落、retention、切断時の動作は [managed session と named root](managed-sessions.ja.md#local-activity-viewer) を参照してください。
 
-installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。dry-run の `blocked_sessions` には復元不能な session と理由が一覧され、`temote-mcp upgrade --force` はそれらを停止して続行します(復元されません)が、互換性 gate は回避しません。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
+installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。dry-run の `blocked_sessions` には復元不能な session と理由が一覧され、`temote-mcp upgrade --force` はそれらを停止して続行します(復元されません)が、互換性 gate は回避しません。通常の upgrade が blocked の場合は件数 summary を維持し、検証済み session ID と安全化した理由を bounded に表示します。restart context の key として表示されるのは `LANG`、`LC_ALL`、`PATH` のみです。dry-run は制限された read-only supervisor request を使い、session reaper、lifecycle metadata の reconcile、終了済み session の cleanup、restart 予約を実行しません。installed binary の同一性を保つため private な一時 executable snapshot と capability check subprocess は実行します。この一時 file は check 終了時に削除され、supervisor の通常の background maintenance は従来どおり独立して動きます。read-only diagnostic request に未対応の supervisor は dry-run を fail closed にし、legacy Ping/Upgrade request へ fallback しません。authenticated direct HTTP の `upgrade_preflight` も同じ経路です。upgrade apply の maintenance preflight は互換性を保ちます。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
+
+CLI の `session list` / `session info` と gateway readiness diagnostic は制限された read-only request を使います。古い実行中 supervisor では置き換えまたは restart まで unavailable と報告される場合があり、legacy maintenance request へ fallback しません。MCP `session_list` は既存の `serve` と `fabric connect` で古い supervisor 経由の session discovery を維持するため operational list request を使います。この互換経路には CLI diagnostic と同じ厳密な no-maintenance 保証はありません。
 
 `session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` に加え、durable metadata は残っているが canonical な working directory または permitted workspace root が解決できなくなった session を `degraded` として確認できます。degraded entry は保存済みの ID、path、lifecycle timestamp を保持したまま返し、listing 全体を失敗させません。消失した path を stopped / crashed runtime と読み替えることはなく、`session info` も同じ bounded な degraded view を返します。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。working directory が対応する標準 Git worktree 配下にある場合は、configured な `src` named root から導出した非 secret の `workspace` identity(`canonical_checkout` / `managed_worktree` / `legacy_worktree` の `workspace_type` と、判明していれば `repository_root`、`workspace_root`、`repository`、`branch`、managed task 名)も返します。identity は read-only で、workspace が解決できなくなると表示されません。bare repository または `.git` 以外の common directory を使う標準 linked worktree では、lifecycle admission とこの bounded view は検証済み canonical common directory を repository identity として使います。managed-worktree authority と Git mutation access の strict な primary-checkout 要件は緩和しません。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。restart は old full session instance を fence し、replacement の開始前に登録済み Codex runtime を shutdown します。replacement の開始に失敗しても old child runtime は残しません。
 
-session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返しますが、workspace が解決できなくなった historical metadata は bounded history から除外します（metadata は保持し、`session info` は引き続き degraded view を返します）。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。read-only listing と MCP fallback は cleanup を行いません。
+session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返しますが、workspace が解決できなくなった historical metadata は bounded history から除外します（metadata は保持し、`session info` は引き続き degraded view を返します）。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。strict な CLI listing と filesystem fallback は cleanup を要求しません。互換用 MCP list は operational supervisor path を使い、通常の background maintenance は独立して継続します。
 
 `temote-mcp session forget <id>` は、terminal で non-live な1 session の Temote-owned durable state（metadata、lifecycle state、stale と確認済みの socket entry）を削除します。`stop` は後から `session list` / `session info` で参照できるよう metadata を保持し、`forget` は意図的に削除します。runtime socket probe が live を返した場合は無条件で拒否し、supervisor の lifecycle transition と直列化され、symlink や非 regular file の metadata target を拒否し、workspace、cwd、worktree には触れません。1 session の forget は他 session の retention policy を変更しません。
 
@@ -75,6 +87,9 @@ migration は legacy state file を安全に検証し、signal 前に live PID �
 通常 session では canonical な起動 directory が最初の permitted root です。local named-root selection で対象 project directory を決め、remote `session_start` は administrator が設定した named root 配下しか解決できません。通常 session は permitted root の外へ出る path、symlink target、command `cwd` を拒否します。
 
 named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定します。`TEMOTE_MCP_ROOTS='src=~/src'` のような単一 mapping、または `TEMOTE_MCP_ROOTS='{"src":"~/src","opt":"~/opt"}'` のような JSON object を設定してから Temote MCP を再起動してください。未設定の場合 `session_start` は無効のままで、named-root resolution の error に設定方法が表示されます。実行中 session の root は後述の host-approved `directories` grant で restart なしに追加することもできます。
+
+新規の通常 session はローカル開始も named root を必要とし、root 外では runtime 作成前に失敗します。`TEMOTE_ROOTS` が優先名で、`TEMOTE_MCP_ROOTS` も互換名として使えます。旧 session の再起動・upgrade は検証済みの既存 cwd を維持し、現在の root mapping を暗黙に割り当てません。
+
 
 従来の inline `/permission ...` terminal command UI は detached runtime の owner ではなくなったため、第一段階の supervisor control surface には載せていません。権限を広げる変更ではなく、runtime は persisted permitted root のまま fail closed します。
 
@@ -187,6 +202,8 @@ inactive または full session instance の変更を確認した場合は即停
 この有限の再検査で unknown を active と扱うことはなく、新しい task の受付と routing は引き続き liveness 情報が得られない場合に拒否します。
 
 ### Experimental OpenCode task
+
+実装作業では `opencode_task_start` に `workspace_requirement: "managed_commands"` を指定できます。Temote は受理前に active な managed session、provisioning receipt、canonical checkout を検証します。OpenCode の native shell は引き続き拒否されます。private command delegation adapter がまだないため、正しい workspace でもこの selector は構造化された `execution_unavailable` blocker を返します。通常の OpenCode task の動作は従来どおりです。詳細は [scoped workspace assessment](opencode-scoped-workspace.md) を参照してください。
 
 opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`opencode_task_control` は、task ごとの `opencode serve` child を loopback 上に起動し、`unofficial-opencode-sdk` HTTP client 経由で操作します。各 serve child は 127.0.0.1 の動的 port、child 環境変数経由のみで渡す instance ごとの random Basic-auth password、task ごとの隔離 data directory、`OPENCODE_CONFIG_CONTENT` で注入される上限付き serve permission 設定で動きます。host の OpenCode global 設定（provider/model 定義を含む）を読み、従来の `auth.json` と OpenCode V2 の SQLite 保存資格情報を task 専用 state に取り込みます。host の session や履歴は取り込みません。先に host の CLI で `opencode auth login` を行ってください。資格情報は spawn 時点の copy であり、child による token 更新は host のアカウントへ戻りません。未対応の V2 credential schema は安全側に失敗します。task record、ownership、lease、receipt、retention、scoped evidence は上記 Codex app-server task と同じ契約です。task は完全な session instance と canonical working directory に所有され、別 session、別 process generation、別 scope から resume できません。
 

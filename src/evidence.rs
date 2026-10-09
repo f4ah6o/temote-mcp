@@ -36,6 +36,7 @@ pub(crate) struct EvidenceChunk {
 struct Record {
     session_id: String,
     scope: PathBuf,
+    instance: Option<crate::local_tasks::SessionInstance>,
     content: String,
     created_at: Instant,
 }
@@ -56,9 +57,26 @@ pub(crate) fn canonical_scope(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve evidence scope {}", path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn store(
     session_id: &str,
     scope: &Path,
+    content: String,
+) -> Result<Option<EvidenceRef>> {
+    store_inner(session_id, scope, None, content)
+}
+
+pub(crate) fn store_for_session(
+    session: &crate::config::Session,
+    content: String,
+) -> Result<Option<EvidenceRef>> {
+    store_inner(&session.id, &session.cwd, Some(session.into()), content)
+}
+
+fn store_inner(
+    session_id: &str,
+    scope: &Path,
+    instance: Option<crate::local_tasks::SessionInstance>,
     content: String,
 ) -> Result<Option<EvidenceRef>> {
     if content.is_empty() {
@@ -98,6 +116,7 @@ pub(crate) fn store(
         Record {
             session_id: session_id.to_owned(),
             scope,
+            instance,
             content,
             created_at: Instant::now(),
         },
@@ -110,9 +129,44 @@ pub(crate) fn store(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn read(
     session_id: &str,
     scope: &Path,
+    evidence_id: Uuid,
+    offset_bytes: usize,
+    max_bytes: usize,
+) -> Result<EvidenceChunk> {
+    read_inner(
+        session_id,
+        scope,
+        None,
+        evidence_id,
+        offset_bytes,
+        max_bytes,
+    )
+}
+
+pub(crate) fn read_for_session(
+    session: &crate::config::Session,
+    evidence_id: Uuid,
+    offset_bytes: usize,
+    max_bytes: usize,
+) -> Result<EvidenceChunk> {
+    read_inner(
+        &session.id,
+        &session.cwd,
+        Some(&crate::local_tasks::SessionInstance::from(session)),
+        evidence_id,
+        offset_bytes,
+        max_bytes,
+    )
+}
+
+fn read_inner(
+    session_id: &str,
+    scope: &Path,
+    instance: Option<&crate::local_tasks::SessionInstance>,
     evidence_id: Uuid,
     offset_bytes: usize,
     max_bytes: usize,
@@ -133,6 +187,12 @@ pub(crate) fn read(
         "evidence ownership mismatch"
     );
     anyhow::ensure!(record.scope == scope, "evidence scope mismatch");
+    if let Some(instance) = instance {
+        anyhow::ensure!(
+            record.instance.as_ref() == Some(instance),
+            "evidence session instance mismatch"
+        );
+    }
     anyhow::ensure!(
         offset_bytes <= record.content.len(),
         "evidence offset exceeds content length"
@@ -145,7 +205,15 @@ pub(crate) fn read(
     let desired_end = offset_bytes
         .saturating_add(max_bytes)
         .min(record.content.len());
-    let end = next_char_boundary(&record.content, desired_end);
+    let mut end = next_char_boundary(&record.content, desired_end);
+    // Tiny pages may include one whole UTF-8 character to make progress, but
+    // even a boundary crossing must never exceed the absolute 64 KiB cap.
+    if end.saturating_sub(offset_bytes) > MAX_READ_BYTES {
+        end = desired_end;
+        while !record.content.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
     let content = record.content[offset_bytes..end].to_owned();
     let truncated = end < record.content.len();
     Ok(EvidenceChunk {
@@ -208,6 +276,53 @@ fn remove_record(state: &mut State, id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_instance_evidence_rejects_replacement_and_permission_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = crate::mcp_tasks::tests::session();
+        session.cwd = std::fs::canonicalize(root.path()).unwrap();
+        session.permitted_directories = vec![session.cwd.clone()];
+        let reference = store_for_session(&session, "owned".to_owned())
+            .unwrap()
+            .unwrap();
+        let id = Uuid::parse_str(&reference.evidence_id).unwrap();
+        assert_eq!(read_for_session(&session, id, 0, 1).unwrap().content, "o");
+        for change in 0..5 {
+            let mut replacement = session.clone();
+            match change {
+                0 => replacement.process_id += 1,
+                1 => replacement.started_at += 1,
+                2 => replacement.permission_mode = crate::config::PermissionMode::Ask,
+                3 => replacement
+                    .permitted_directories
+                    .push(PathBuf::from("/tmp/extra")),
+                _ => replacement.grants.listen_ports.push(4211),
+            }
+            assert!(read_for_session(&replacement, id, 0, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn utf8_evidence_never_expands_beyond_absolute_chunk_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let text = format!("{}🦀tail", "a".repeat(MAX_READ_BYTES - 1));
+        let reference = store("absolute-cap", root.path(), text.clone())
+            .unwrap()
+            .unwrap();
+        let id = Uuid::parse_str(&reference.evidence_id).unwrap();
+        let first = read("absolute-cap", root.path(), id, 0, MAX_READ_BYTES).unwrap();
+        assert_eq!(first.returned_bytes, MAX_READ_BYTES - 1);
+        let second = read(
+            "absolute-cap",
+            root.path(),
+            id,
+            first.next_offset_bytes.unwrap(),
+            MAX_READ_BYTES,
+        )
+        .unwrap();
+        assert_eq!(format!("{}{}", first.content, second.content), text);
+    }
 
     #[test]
     fn evidence_is_session_and_scope_bound_and_utf8_chunked() {

@@ -491,7 +491,7 @@ async fn dispatch_direct_upgrade(
                         emitter,
                     )
                 });
-            let preflight_result = crate::upgrade_coordinator::preflight()
+            let preflight_result = crate::upgrade_coordinator::preflight_for_apply()
                 .await
                 .map_err(|_| anyhow::anyhow!("upgrade preflight failed"));
             let (executable, preflight) = match preflight_result {
@@ -1791,7 +1791,7 @@ mod tests {
             yolo["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("only path and session_id")
+                .contains("only path, source, operation_id, and session_id")
         );
         supervisor.shutdown().await.unwrap();
 

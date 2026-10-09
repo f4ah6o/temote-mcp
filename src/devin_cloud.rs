@@ -30,7 +30,10 @@ use crate::orchestration::outcome::{self, DeliveryRecord, VerificationRecord};
 use crate::pending_interaction::{
     self, InteractionType, PendingInteractionSummary, ProducerKind, Summary, SummaryState,
 };
-use crate::{config, evidence};
+use crate::{
+    config, evidence,
+    report_contract::{self, ReportProfile},
+};
 
 const MIN_TASK_SCHEMA_VERSION: u64 = 1;
 const TASK_SCHEMA_VERSION: u64 = 3;
@@ -43,9 +46,7 @@ const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_REPOS: usize = 16;
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
-const MAX_REPORT_BYTES: usize = 8 * 1024;
-const MAX_REPORT_ARRAY_ITEMS: usize = 64;
-const MAX_SUMMARY_CHARS: usize = 1200;
+use crate::report_contract::MAX_TASK_REPORT_BYTES as MAX_REPORT_BYTES;
 const MAX_PULL_REQUESTS: usize = 16;
 const MAX_MESSAGE_TEXT_BYTES: usize = MAX_REPORT_BYTES * 4;
 const MAX_EVIDENCE_MESSAGES: usize = 8;
@@ -86,22 +87,6 @@ Task:
 "#;
 
 const RESUME_INSTRUCTIONS: &str = "Continue the task. When finished, publish the required JSON report object as structured output and as your final message, and nothing else.";
-
-fn report_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": ["completed", "failed", "blocked", "needs_decision"]},
-            "summary": {"type": "string", "maxLength": MAX_SUMMARY_CHARS},
-            "base_commit": {"type": "string"},
-            "changed_files": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_REPORT_ARRAY_ITEMS},
-            "checks": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_REPORT_ARRAY_ITEMS},
-            "unresolved": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_REPORT_ARRAY_ITEMS},
-        },
-        "required": ["status", "summary"],
-        "additionalProperties": false,
-    })
-}
 
 // ---------- configuration ----------
 
@@ -1255,6 +1240,14 @@ impl TaskStore {
                 lease.producer_epoch,
             )?,
         };
+        if record
+            .pending_interaction_summary
+            .as_ref()
+            .map(|previous| previous.summary_revision)
+            != Some(summary.summary_revision)
+        {
+            record.revision = record.revision.saturating_add(1);
+        }
         record.pending_interaction_summary = Some(summary);
         self.save_metadata_locked(&record)?;
         Ok(true)
@@ -2291,6 +2284,8 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "acus_consumed_milli": record.acus_consumed_milli,
         "pull_requests": record.pull_requests,
         "report": record.report,
+        "report_source": record.report.as_ref().map(|_| "native_structured_output"),
+        "report_capability": "structured_output_required",
         "last_error": record.last_error,
         "reconciliation_required": record.status == TaskStatus::ReconciliationRequired,
         "evidence": evidence_ref,
@@ -2363,40 +2358,7 @@ fn parse_balanced_json(text: &str) -> Option<Value> {
 }
 
 fn report_shape_valid(report: &Value) -> bool {
-    let Some(object) = report.as_object() else {
-        return false;
-    };
-    let status_ok = object
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "blocked" | "needs_decision"
-            )
-        });
-    if !status_ok {
-        return false;
-    }
-    if object
-        .get("summary")
-        .and_then(Value::as_str)
-        .is_none_or(|summary| summary.chars().count() > MAX_SUMMARY_CHARS)
-    {
-        return false;
-    }
-    for key in ["changed_files", "checks", "unresolved"] {
-        match object.get(key) {
-            Some(Value::Array(items))
-                if items.len() <= MAX_REPORT_ARRAY_ITEMS
-                    && items.iter().all(|item| item.is_string()) => {}
-            None => {}
-            _ => return false,
-        }
-    }
-    serde_json::to_vec(report)
-        .map(|bytes| bytes.len() <= MAX_REPORT_BYTES)
-        .unwrap_or(false)
+    report_contract::validate(report, ReportProfile::TaskReport)
 }
 
 // ---------- remote state mapping ----------
@@ -2608,6 +2570,17 @@ fn devin_messages(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn semantic_task_state_changed(previous: &TaskRecord, record: &TaskRecord) -> bool {
+    record.status != previous.status
+        || record.remote_status != previous.remote_status
+        || record.remote_status_detail != previous.remote_status_detail
+        || record.session_url != previous.session_url
+        || record.acus_consumed_milli != previous.acus_consumed_milli
+        || record.pull_requests != previous.pull_requests
+        || record.report != previous.report
+        || record.last_error != previous.last_error
+}
+
 async fn reconcile(
     session: &config::Session,
     owner: &SessionInstance,
@@ -2623,8 +2596,10 @@ async fn reconcile(
             if record.status.is_terminal() {
                 return Ok(());
             }
-            record.status = TaskStatus::ReconciliationRequired;
-            record.revision = record.revision.saturating_add(1);
+            if record.status != TaskStatus::ReconciliationRequired {
+                record.status = TaskStatus::ReconciliationRequired;
+                record.revision = record.revision.saturating_add(1);
+            }
             let start_operation = record
                 .operations
                 .iter()
@@ -2649,9 +2624,14 @@ async fn reconcile(
                 if record.status.is_terminal() {
                     return Ok(());
                 }
-                record.status = TaskStatus::Unknown;
-                record.last_error = Some(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
-                record.revision = record.revision.saturating_add(1);
+                let last_error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
+                if record.status != TaskStatus::Unknown
+                    || record.last_error.as_ref() != Some(&last_error)
+                {
+                    record.status = TaskStatus::Unknown;
+                    record.last_error = Some(last_error);
+                    record.revision = record.revision.saturating_add(1);
+                }
                 Ok(())
             })?;
             return Ok((record, None));
@@ -2692,6 +2672,7 @@ async fn reconcile(
         if record.status.is_terminal() {
             return Ok(());
         }
+        let previous = record.clone();
         record.status = derived.status;
         record.remote_status = Some(remote.status.clone());
         record.remote_status_detail = remote.status_detail.clone();
@@ -2708,7 +2689,9 @@ async fn reconcile(
             record.report = derived.report.clone();
         }
         record.last_error = derived.last_error.clone();
-        record.revision = record.revision.saturating_add(1);
+        if semantic_task_state_changed(&previous, record) {
+            record.revision = record.revision.saturating_add(1);
+        }
         if derived.status.is_terminal() {
             let outcome = record.outcome();
             for receipt in record
@@ -2741,9 +2724,8 @@ async fn reconcile(
                 .take(MAX_EVIDENCE_MESSAGES)
                 .collect::<Vec<_>>(),
         });
-        evidence_ref = evidence::store(
-            &session.id,
-            &session.cwd,
+        evidence_ref = evidence::store_for_session(
+            session,
             serde_json::to_string(&payload).unwrap_or_default(),
         )
         .ok()
@@ -3137,7 +3119,7 @@ async fn task_start_with_store(
         "prompt": format!("{REPORT_INSTRUCTIONS}{task}"),
         "title": record.title.clone().unwrap_or_else(|| format!("temote-mcp task {task_id}")),
         "tags": [SESSION_TAG],
-        "structured_output_schema": report_schema(),
+        "structured_output_schema": report_contract::report_json_schema(),
         "structured_output_required": true,
         "resumable": true,
     });
@@ -4087,13 +4069,14 @@ mod tests {
         let revision = out["revision"].as_u64().unwrap();
 
         let out = task_get_with_store(
-            &json!({"task_id": task_id, "after_revision": revision + 1}),
+            &json!({"task_id": task_id, "after_revision": revision}),
             &session,
             &store,
         )
         .await
         .unwrap();
         assert_eq!(out["status"], "not_modified");
+        assert_eq!(out["revision"], revision);
 
         fake.lock()
             .unwrap()
@@ -4493,6 +4476,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_revision_ignores_observation_time_and_detects_public_change() {
+        let root = tempdir();
+        let owner = session(&root, "semantic-revision");
+        let record = record_for(&owner, Uuid::new_v4(), TaskStatus::Running);
+        let mut observed = record.clone();
+        observed.updated_at += 1;
+        assert!(!semantic_task_state_changed(&record, &observed));
+        observed.remote_status = Some("running".to_owned());
+        assert!(semantic_task_state_changed(&record, &observed));
+        observed = record.clone();
+        observed.status = TaskStatus::Completed;
+        assert!(semantic_task_state_changed(&record, &observed));
+    }
+
     fn cloud_observer_record(
         session: &config::Session,
         task_id: Uuid,
@@ -4724,8 +4722,10 @@ mod tests {
         let after_publish = store.read_record(task_id).unwrap();
         assert_eq!(
             task_view(&after_publish, None)["verification"]["status"],
-            "passed"
+            "not_run"
         );
+        let mut expected_metadata = task_metadata.clone();
+        expected_metadata.1 += 1;
         assert_eq!(
             after_publish.start_fingerprint_version,
             record.start_fingerprint_version
@@ -4742,7 +4742,7 @@ mod tests {
                 after_publish.verification.clone(),
                 after_publish.delivery.clone(),
             ),
-            task_metadata
+            expected_metadata
         );
         assert_eq!(
             after_publish
@@ -5396,11 +5396,9 @@ mod tests {
         assert_eq!(none_revision, pending_revision + 1);
 
         let current = store.read_record(task_id).unwrap();
-        assert_eq!(
-            (current.status, current.revision, current.updated_at),
-            original_task_metadata,
-            "periodic metadata observation must not reconcile or revise the task"
-        );
+        assert_eq!(current.status, original_task_metadata.0);
+        assert_eq!(current.revision, original_task_metadata.1 + 3);
+        assert_eq!(current.updated_at, original_task_metadata.2);
         let calls = fake.lock().unwrap().calls.clone();
         assert!(calls.len() >= 3);
         assert!(calls.iter().all(|(method, path)| {

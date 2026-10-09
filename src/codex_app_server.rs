@@ -32,6 +32,39 @@ use crate::pending_interaction::{
 use crate::{approvals, config, evidence};
 
 const APP_SERVER_CLIENT_NAME: &str = "temote-mcp";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CodexContinuation {
+    #[default]
+    New,
+    PreviousTask {
+        task_id: Uuid,
+    },
+}
+
+pub(crate) fn codex_continuation(args: &Value) -> Result<CodexContinuation> {
+    match args.get("continuation") {
+        None => Ok(CodexContinuation::New),
+        Some(value) => {
+            let object = value
+                .as_object()
+                .context("continuation must be an object")?;
+            let exact = match object.get("type").and_then(Value::as_str) {
+                Some("new") => object.len() == 1,
+                Some("previous_task") => object.len() == 2 && object.contains_key("task_id"),
+                _ => false,
+            };
+            anyhow::ensure!(
+                exact,
+                "{}",
+                "continuation must be {type:new} or {type:previous_task,task_id:UUID}"
+            );
+            serde_json::from_value(value.clone())
+                .context("continuation must be {type:new} or {type:previous_task,task_id:UUID}")
+        }
+    }
+}
 const APP_SERVER_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_APP_SERVER_USER_AGENT_BYTES: usize = 512;
 const TASK_SCHEMA_VERSION: u64 = 1;
@@ -47,7 +80,6 @@ const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_STOP_POLL: Duration = Duration::from_secs(1);
-const SESSION_STOP_UNKNOWN_LIMIT: u8 = 3;
 const SESSION_CODEX_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_USAGE_FIELDS: &[&str] = &[
     "input_tokens",
@@ -320,7 +352,6 @@ enum SessionMonitorObservation {
 enum SessionMonitorStopReason {
     Inactive,
     OwnerChanged,
-    PersistentUnknown(SessionMonitorUnknownKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,12 +379,9 @@ impl SessionStopMonitor {
                 SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged)
             }
             SessionMonitorObservation::Unknown(kind) => {
+                let _ = kind;
                 self.consecutive_unknown = self.consecutive_unknown.saturating_add(1);
-                if self.consecutive_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
-                    SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(kind))
-                } else {
-                    SessionMonitorAction::Continue
-                }
+                SessionMonitorAction::Continue
             }
         }
     }
@@ -437,9 +465,23 @@ struct TaskRecord {
     revision: u64,
     generation: u64,
     thread_id: Option<String>,
+    #[serde(default)]
+    continued_from_task_id: Option<Uuid>,
+    #[serde(default)]
+    continued_by_task_id: Option<Uuid>,
+    #[serde(default)]
+    continued_by_request_fingerprint: Option<Uuid>,
     turn_id: Option<String>,
     #[serde(default)]
+    previous_turn_id: Option<String>,
+    #[serde(default)]
     usage: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    report: Option<Value>,
+    #[serde(default)]
+    report_source: Option<String>,
+    #[serde(default)]
+    report_status: Option<String>,
     #[serde(default)]
     pending_interaction: Option<PendingInteractionSummary>,
     created_at: u64,
@@ -484,7 +526,12 @@ struct TaskStore {
 
 enum StartAcceptance {
     Existing(TaskRecord),
-    Accepted(TaskRecord, TaskRuntimeLease),
+    Accepted(
+        TaskRecord,
+        TaskRuntimeLease,
+        Option<RuntimeHandle>,
+        Option<String>,
+    ),
 }
 
 #[derive(Debug)]
@@ -538,6 +585,12 @@ impl Drop for TaskRuntimeLease {
 fn store_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn set_pending_summary(record: &mut TaskRecord, summary: Summary) {
+    // The summary has its own cursor. Runtime-owner observations must not
+    // invalidate verification tied to the task's semantic revision.
+    record.pending_interaction = Some(summary);
 }
 
 impl TaskStore {
@@ -776,9 +829,12 @@ impl TaskStore {
             .context("Codex session instance lifecycle state is unavailable")?;
         anyhow::ensure!(!entry.closing, "Codex session instance is closing");
         let mut record = self.load_locked(session, task_id)?;
+        let previous = record.clone();
         f(&mut record)?;
-        record.updated_at = config::unix_time();
-        self.save_locked(&record)?;
+        if record != previous {
+            record.updated_at = config::unix_time();
+            self.save_locked(&record)?;
+        }
         Ok(record)
     }
 
@@ -841,11 +897,12 @@ impl TaskStore {
         if pending_count == 0
             && (!pending_state_ready || record.status == TaskStatus::WaitingApproval)
         {
-            record.pending_interaction = Some(Summary::unavailable(
+            let summary = Summary::unavailable(
                 record.pending_interaction.as_ref(),
                 ProducerKind::RuntimeOwner,
                 record.generation,
-            )?);
+            )?;
+            set_pending_summary(&mut record, summary);
             if !runtime_registration_matches(session, task_id, runtime_instance_id) {
                 return Ok(false);
             }
@@ -866,7 +923,7 @@ impl TaskStore {
         } else {
             vec![InteractionType::Approval]
         };
-        record.pending_interaction = Some(Summary::observe(
+        let summary = Summary::observe(
             record.pending_interaction.as_ref(),
             state,
             Some(count),
@@ -875,7 +932,8 @@ impl TaskStore {
             ProducerKind::RuntimeOwner,
             record.generation,
             observed_at,
-        )?);
+        )?;
+        set_pending_summary(&mut record, summary);
         if !runtime_registration_matches(session, task_id, runtime_instance_id) {
             return Ok(false);
         }
@@ -908,6 +966,44 @@ impl TaskStore {
         self.accept_start_locked(session, record)
     }
 
+    /// A crash can leave A's claim persisted before B's record is written.
+    /// Search under the store lock so a retry cannot redirect B's operation ID
+    /// to another source while that durable claim exists.
+    fn claim_for_successor_locked(&self, successor_id: Uuid) -> Result<Option<(Uuid, Uuid)>> {
+        let mut claim = None;
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&self.directory)
+            .context("cannot inspect Codex continuation claims")?
+        {
+            count += 1;
+            anyhow::ensure!(
+                count <= MAX_TASK_DIRECTORY_ENTRIES,
+                "Codex task store contains more than {MAX_TASK_DIRECTORY_ENTRIES} entries"
+            );
+            let name = entry?.file_name();
+            let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            let Ok(task_id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            let record = self.read_record(task_id).with_context(|| {
+                format!("cannot inspect Codex continuation claim in task {task_id}")
+            })?;
+            if record.continued_by_task_id == Some(successor_id) {
+                let fingerprint = record
+                    .continued_by_request_fingerprint
+                    .context("Codex continuation claim is incomplete")?;
+                anyhow::ensure!(
+                    claim.is_none(),
+                    "CODEX_CONTINUATION_CONFLICT: multiple sources claim the same successor"
+                );
+                claim = Some((task_id, fingerprint));
+            }
+        }
+        Ok(claim)
+    }
+
     fn accept_start_locked(
         &self,
         session: &config::Session,
@@ -932,6 +1028,23 @@ impl TaskStore {
                             && existing.thread_id.is_none()
                     });
                 if retryable {
+                    let resume_thread = if let Some(source_id) = existing.continued_from_task_id {
+                        let source = self.load_locked(session, source_id).context("CODEX_CONTINUATION_SOURCE_UNAVAILABLE: source must be a retained Codex task in this exact session and scope")?;
+                        anyhow::ensure!(
+                            source.continued_by_task_id == Some(existing.task_id),
+                            "CODEX_CONTINUATION_CLAIM_LOST: source belongs to another successor"
+                        );
+                        anyhow::ensure!(
+                            source.continued_by_request_fingerprint
+                                == Some(candidate_receipt.request_fingerprint),
+                            "CODEX_CONTINUATION_CLAIM_LOST: source claim does not match successor request"
+                        );
+                        Some(source.thread_id.context(
+                            "CODEX_CONTINUATION_UNAVAILABLE: source has no retained thread",
+                        )?)
+                    } else {
+                        None
+                    };
                     let lease = self
                         .try_acquire_runtime_lease_locked(existing.task_id)?
                         .context("CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process")?;
@@ -944,18 +1057,97 @@ impl TaskStore {
                     );
                     existing.updated_at = config::unix_time();
                     self.save_locked(&existing)?;
-                    Ok(StartAcceptance::Accepted(existing, lease))
+                    Ok(StartAcceptance::Accepted(
+                        existing,
+                        lease,
+                        None,
+                        resume_thread,
+                    ))
                 } else {
                     Ok(StartAcceptance::Existing(existing))
                 }
             }
             Err(error) if is_not_found(&error) => {
+                if let Some((claimed_source, fingerprint)) =
+                    self.claim_for_successor_locked(record.task_id)?
+                {
+                    anyhow::ensure!(
+                        record.continued_from_task_id == Some(claimed_source)
+                            && candidate_receipt.request_fingerprint == fingerprint,
+                        "OPERATION_CONFLICT: operation_id was already claimed for a different continuation request"
+                    );
+                }
+                let (mut source, resume_thread, new_claim) = if let Some(source_id) =
+                    record.continued_from_task_id
+                {
+                    anyhow::ensure!(
+                        source_id != record.task_id,
+                        "CODEX_CONTINUATION_INVALID: task cannot continue itself"
+                    );
+                    let mut source = self.load_locked(session, source_id).context("CODEX_CONTINUATION_SOURCE_UNAVAILABLE: source must be a retained Codex task in this exact session and scope")?;
+                    anyhow::ensure!(
+                        source.status.is_terminal()
+                            && !source
+                                .operations
+                                .iter()
+                                .any(|receipt| receipt.phase == OperationPhase::Accepted),
+                        "CODEX_CONTINUATION_NOT_QUIESCENT: source task has an active turn or control"
+                    );
+                    let new_claim = source.continued_by_task_id.is_none();
+                    match source.continued_by_task_id {
+                        None => {}
+                        Some(successor) if successor == record.task_id => {
+                            anyhow::ensure!(
+                                source.continued_by_request_fingerprint
+                                    == Some(candidate_receipt.request_fingerprint),
+                                "OPERATION_CONFLICT: operation_id was already accepted with a different continuation request"
+                            );
+                        }
+                        Some(_) => anyhow::bail!(
+                            "CODEX_CONTINUATION_CLAIMED: source conversation already has a successor"
+                        ),
+                    }
+                    let thread = source
+                        .thread_id
+                        .clone()
+                        .filter(|id| !id.is_empty())
+                        .context("CODEX_CONTINUATION_UNAVAILABLE: source has no retained thread")?;
+                    {
+                        let state = runtimes().lock().unwrap();
+                        if let Some(runtime) = state.get(&source_id) {
+                            anyhow::ensure!(
+                                runtime.owner == source.owner && runtime.scope == source.scope_cwd,
+                                "CODEX_CONTINUATION_RUNTIME_MISMATCH: source runtime does not match record"
+                            );
+                        } else {
+                            anyhow::ensure!(
+                                !self.runtime_lease_held_locked(source_id)?,
+                                "CODEX_CONTINUATION_RUNTIME_OWNED: source runtime belongs to another process"
+                            );
+                        }
+                    }
+                    source.continued_by_task_id = Some(record.task_id);
+                    source.continued_by_request_fingerprint =
+                        Some(candidate_receipt.request_fingerprint);
+                    source.updated_at = config::unix_time();
+                    (Some(source), Some(thread), new_claim)
+                } else {
+                    (None, None, false)
+                };
                 let lease = self
                     .try_acquire_runtime_lease_locked(record.task_id)?
                     .context(
                         "CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process",
                     )?;
+                if let Some(source_record) = source.as_ref().filter(|_| new_claim) {
+                    self.save_locked(source_record)?;
+                }
                 if let Err(error) = self.save_locked(&record) {
+                    if let Some(mut source_record) = source.take().filter(|_| new_claim) {
+                        source_record.continued_by_task_id = None;
+                        source_record.continued_by_request_fingerprint = None;
+                        self.save_locked(&source_record)?;
+                    }
                     drop(lease);
                     match std::fs::remove_file(self.runtime_lock_path(record.task_id)) {
                         Ok(()) => {}
@@ -969,7 +1161,15 @@ impl TaskStore {
                     }
                     return Err(error);
                 }
-                Ok(StartAcceptance::Accepted(record, lease))
+                let retired_runtime = record
+                    .continued_from_task_id
+                    .and_then(|source_id| runtimes().lock().unwrap().remove(&source_id));
+                Ok(StartAcceptance::Accepted(
+                    record,
+                    lease,
+                    retired_runtime,
+                    resume_thread,
+                ))
             }
             Err(error) => Err(error),
         }
@@ -1016,6 +1216,10 @@ impl TaskStore {
         action: &str,
     ) -> Result<ControlAcceptance> {
         let mut record = self.load_locked(session, task_id)?;
+        anyhow::ensure!(
+            record.continued_by_task_id.is_none(),
+            "CODEX_CONTINUATION_CLAIMED: source conversation belongs to its successor"
+        );
         if let Some(receipt) = record
             .operations
             .iter()
@@ -1049,6 +1253,11 @@ impl TaskStore {
             );
         }
 
+        let completed_steer = action == "steer"
+            && matches!(
+                record.status,
+                TaskStatus::Completed | TaskStatus::Interrupted
+            );
         if action == "resume" {
             anyhow::ensure!(
                 matches!(
@@ -1057,7 +1266,7 @@ impl TaskStore {
                 ),
                 "Codex task does not require resume reconciliation"
             );
-        } else {
+        } else if !completed_steer {
             anyhow::ensure!(
                 matches!(
                     record.status,
@@ -1084,6 +1293,15 @@ impl TaskStore {
                 "CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process",
             )?)
         };
+
+        if completed_steer {
+            record.previous_turn_id = record.turn_id.take();
+            record.status = TaskStatus::ReconciliationRequired;
+            record.generation = record.generation.saturating_add(1);
+            record.report = None;
+            record.report_source = None;
+            record.report_status = None;
+        }
 
         record.revision = record.revision.saturating_add(1);
         let accepted_outcome = record.outcome();
@@ -1488,6 +1706,15 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
         canonical == record.scope_cwd,
         "Codex task scope is not canonical"
     );
+    anyhow::ensure!(
+        record.continued_by_task_id.is_some() == record.continued_by_request_fingerprint.is_some(),
+        "Codex continuation claim is incomplete"
+    );
+    anyhow::ensure!(
+        record.continued_from_task_id != Some(record.task_id)
+            && record.continued_by_task_id != Some(record.task_id),
+        "Codex task cannot continue itself"
+    );
     if let Some(verification) = &record.verification {
         verification.validate()?;
     }
@@ -1553,7 +1780,7 @@ fn append_scope_identity(bytes: &mut Vec<u8>, scope: &Path) {
     bytes.extend_from_slice(scope.to_string_lossy().as_bytes());
 }
 
-fn task_id_for_operation(session: &config::Session, operation_id: Uuid) -> Result<Uuid> {
+pub(crate) fn task_id_for_operation(session: &config::Session, operation_id: Uuid) -> Result<Uuid> {
     let scope = config::canonical_directory(&session.cwd)?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(session.id.as_bytes());
@@ -1580,6 +1807,12 @@ fn fingerprint(value: &Value) -> Result<Uuid> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TaskStartOrigin {
     Generic,
+    OpenCodeWorkspaceCheck {
+        parent_task_id: Uuid,
+        workspace_id: Uuid,
+        action: String,
+        producer_epoch: u64,
+    },
     RepositoryCloneBare {
         root: String,
         source: String,
@@ -1588,6 +1821,19 @@ pub(crate) enum TaskStartOrigin {
 }
 
 impl TaskStartOrigin {
+    pub(crate) fn opencode_workspace_check(
+        parent_task_id: Uuid,
+        workspace_id: Uuid,
+        action: &str,
+        producer_epoch: u64,
+    ) -> Self {
+        Self::OpenCodeWorkspaceCheck {
+            parent_task_id,
+            workspace_id,
+            action: action.to_owned(),
+            producer_epoch,
+        }
+    }
     pub(crate) fn repository_clone_bare(root: &str, source: &str, destination: &str) -> Self {
         Self::RepositoryCloneBare {
             root: root.to_owned(),
@@ -1614,6 +1860,25 @@ fn task_start_fingerprint(
             "model": model,
             "effort": effort,
         })),
+        TaskStartOrigin::OpenCodeWorkspaceCheck {
+            parent_task_id,
+            workspace_id,
+            action,
+            producer_epoch,
+        } => fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": task,
+            "model": model,
+            "effort": effort,
+            "origin": {
+                "kind": "opencode_workspace_check",
+                "parent_task_id": parent_task_id,
+                "workspace_id": workspace_id,
+                "action": action,
+                "producer_epoch": producer_epoch,
+            }
+        })),
         TaskStartOrigin::RepositoryCloneBare {
             root,
             source,
@@ -1634,6 +1899,30 @@ fn task_start_fingerprint(
     }
 }
 
+fn continuation_fingerprint(
+    task_id: Uuid,
+    task: &str,
+    model: &str,
+    effort: &str,
+    origin: &TaskStartOrigin,
+    continuation: CodexContinuation,
+) -> Result<Uuid> {
+    match continuation {
+        CodexContinuation::New => task_start_fingerprint(task_id, task, model, effort, origin),
+        CodexContinuation::PreviousTask { task_id: source } => {
+            anyhow::ensure!(
+                matches!(origin, TaskStartOrigin::Generic),
+                "continuation is only supported for codex_task_start"
+            );
+            fingerprint(&json!({
+                "kind": "start", "task_id": task_id, "task": task,
+                "model": model, "effort": effort,
+                "continuation": {"type": "previous_task", "task_id": source},
+            }))
+        }
+    }
+}
+
 fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) -> Value {
     json!({
         "task_id": record.task_id,
@@ -1646,8 +1935,14 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "model": record.model,
         "effort": record.effort,
         "thread_id": record.thread_id,
+        "continued_from_task_id": record.continued_from_task_id,
+        "continued_by_task_id": record.continued_by_task_id,
         "turn_id": record.turn_id,
+        "previous_turn_id": record.previous_turn_id,
         "usage": record.usage,
+        "report": record.report,
+        "report_source": record.report_source,
+        "report_status": record.report_status,
         "reconciliation_required": record.status == TaskStatus::ReconciliationRequired,
         "evidence": evidence_ref,
         "retention_seconds": TASK_RETENTION_SECONDS,
@@ -1672,6 +1967,22 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
     view
 }
 
+fn task_view_after_reconciliation(
+    record: &TaskRecord,
+    after_revision: Option<u64>,
+    evidence_ref: Option<&evidence::EvidenceRef>,
+) -> Value {
+    if after_revision == Some(record.revision) {
+        json!({
+            "task_id": record.task_id,
+            "status": "not_modified",
+            "revision": record.revision,
+        })
+    } else {
+        task_view(record, evidence_ref)
+    }
+}
+
 fn store_evidence_for_instance(
     owner: &SessionInstance,
     session: &config::Session,
@@ -1685,13 +1996,9 @@ fn store_evidence_for_instance(
     {
         return None;
     }
-    evidence::store(
-        &session.id,
-        &session.cwd,
-        serde_json::to_string(response).ok()?,
-    )
-    .ok()
-    .flatten()
+    evidence::store_for_session(session, serde_json::to_string(response).ok()?)
+        .ok()
+        .flatten()
 }
 
 fn apply_thread_start_response(
@@ -1968,12 +2275,19 @@ impl RpcClient {
     }
 
     async fn shutdown(&self) {
+        let _ = self.shutdown_checked().await;
+    }
+
+    async fn shutdown_checked(&self) -> Result<()> {
         self.connected.store(false, Ordering::Release);
         let _ = self.tx.send(ClientCommand::Shutdown).await;
         let actor = self.actor.lock().unwrap().take();
         if let Some(actor) = actor {
-            let _ = actor.await;
+            actor
+                .await
+                .context("Codex app-server shutdown did not complete cleanly")?;
         }
+        Ok(())
     }
 }
 
@@ -2312,16 +2626,22 @@ fn insert_runtime_unchecked(
             runtime.client.shutdown().await;
         }
         if session_stopped {
-            let result = async {
-                wait_for_session_inflight_drain(&owner, SESSION_CODEX_DRAIN_TIMEOUT).await?;
-                finalize_session_tasks(&owner, &store).await
-            }
-            .await;
-            if let Err(error) = result {
-                eprintln!(
-                    "failed to finalize Codex tasks after session {} stopped: {error:#}",
-                    owner.id
-                );
+            loop {
+                let result = async {
+                    wait_for_session_inflight_drain(&owner, SESSION_CODEX_DRAIN_TIMEOUT).await?;
+                    finalize_session_tasks(&owner, &store).await
+                }
+                .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error) => {
+                        eprintln!(
+                            "failed to finalize Codex tasks after session {} stopped; retrying: {error:#}",
+                            owner.id
+                        );
+                        tokio::time::sleep(SESSION_STOP_POLL).await;
+                    }
+                }
             }
         }
     });
@@ -2351,23 +2671,13 @@ async fn wait_for_session_stop(owner: SessionInstance) {
                 {
                     eprintln!(
                         "Codex session monitor observation is unknown; retrying accepted runtime \
-                         (session {}, class {}, limit {})",
+                         (session {}, class {})",
                         owner.id,
-                        kind.as_str(),
-                        SESSION_STOP_UNKNOWN_LIMIT
+                        kind.as_str()
                     );
                 }
             }
-            SessionMonitorAction::Stop(reason) => {
-                if let SessionMonitorStopReason::PersistentUnknown(kind) = reason {
-                    eprintln!(
-                        "Codex session monitor remained unknown; stopping accepted runtime \
-                         fail-closed (session {}, class {}, observations {})",
-                        owner.id,
-                        kind.as_str(),
-                        monitor.consecutive_unknown
-                    );
-                }
+            SessionMonitorAction::Stop(_) => {
                 begin_session_instance_shutdown(&owner);
                 return;
             }
@@ -2468,7 +2778,40 @@ async fn spawn_initialized_client(
     session: &config::Session,
     task_id: Option<Uuid>,
 ) -> Result<(RpcClient, Value)> {
-    spawn_initialized_client_with_binary(session, task_id, Path::new("codex")).await
+    let binary = configured_codex_binary()?;
+    spawn_initialized_client_with_binary(session, task_id, &binary).await
+}
+
+/// Resolve an explicit host-owned executable before accepting work. The
+/// compatibility name is supported by `environment::var_os`; task input never
+/// selects an executable.
+fn configured_codex_binary() -> Result<PathBuf> {
+    let Some(configured) = temote_mcp::environment::var_os("TEMOTE_MCP_CODEX_BINARY") else {
+        return Ok(PathBuf::from("codex"));
+    };
+    let path = PathBuf::from(configured);
+    validate_configured_codex_binary(&path)
+}
+
+fn validate_configured_codex_binary(path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "configured Codex binary must be absolute"
+    );
+    let resolved = path
+        .canonicalize()
+        .context("configured Codex binary is unavailable")?;
+    let metadata = std::fs::metadata(&resolved)?;
+    anyhow::ensure!(metadata.is_file(), "configured Codex binary is not a file");
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o111 != 0,
+        "configured Codex binary is not executable"
+    );
+    // Validate the resolved target, but execute the configured invocation path.
+    // Multicall executables select their applet from argv[0] (e.g. a `codex`
+    // symlink to a host-owned launcher); canonicalizing it changes the applet.
+    Ok(path.to_path_buf())
 }
 
 async fn spawn_initialized_client_with_binary(
@@ -2904,6 +3247,34 @@ fn handle_notification(
     let Some(task_id) = task_id else {
         return;
     };
+    #[cfg(unix)]
+    if let Some(candidate) = crate::codex_prompt_observer::parse_item_started(method, params) {
+        let session = session.clone();
+        tokio::spawn(async move {
+            // Codex may emit item/started before the turn/start RPC response
+            // has established the retained turn binding. Observe only after
+            // that exact binding exists, with bounded best-effort retries.
+            for attempt in 0..100 {
+                if session_instance_is_closing(&SessionInstance::from_session(&session)) {
+                    break;
+                }
+                let binding = (|| -> Result<Option<crate::codex_prompt_observer::Binding>> {
+                    let store = TaskStore::default_store()?;
+                    let _guard = store.lock()?;
+                    let record = store.load_locked(&session, task_id)?;
+                    Ok(prompt_notification_binding(&session, &record, &candidate))
+                })();
+                if let Ok(Some(binding)) = binding {
+                    let _ = crate::codex_prompt_observer::observe(candidate, binding).await;
+                    break;
+                }
+                if attempt < 99 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+        return;
+    }
     let Some(params) = params else {
         return;
     };
@@ -2935,11 +3306,19 @@ fn handle_notification(
             record.thread_id.as_deref() == Some(thread_id),
             "Codex notification does not match task thread"
         );
+        // A predecessor notification cannot move a newer turn backwards.
+        if record.previous_turn_id.as_deref() == turn_id.as_deref() {
+            return Ok(());
+        }
+        if record.turn_id.is_some() && turn_id.as_deref() != record.turn_id.as_deref() {
+            return Ok(());
+        }
         let mut changed = false;
         if let Some(turn_id) = turn_id.as_deref()
             && record.turn_id.as_deref() != Some(turn_id)
         {
             record.turn_id = Some(turn_id.to_owned());
+            record.previous_turn_id = None;
             record.generation = record.generation.max(1);
             changed = true;
         }
@@ -2959,6 +3338,28 @@ fn handle_notification(
         }
         Ok(())
     });
+}
+
+#[cfg(unix)]
+fn prompt_notification_binding(
+    session: &config::Session,
+    record: &TaskRecord,
+    candidate: &crate::codex_prompt_observer::Candidate,
+) -> Option<crate::codex_prompt_observer::Binding> {
+    if !record.owner.matches(session)
+        || record.scope_cwd != session.cwd
+        || record.task_id.is_nil()
+        || record.generation == 0
+        || record.thread_id.as_deref() != Some(candidate.thread_id.as_str())
+        || record.turn_id.as_deref() != Some(candidate.turn_id.as_str())
+    {
+        return None;
+    }
+    Some(crate::codex_prompt_observer::Binding {
+        session: session.clone(),
+        task_id: record.task_id.to_string(),
+        execution_id: outcome::execution_id(record.task_id, record.generation).to_string(),
+    })
 }
 
 fn notification_thread_id(params: &Value) -> Option<&str> {
@@ -3407,6 +3808,30 @@ fn advertised_effort_name(entry: &Value) -> Option<&str> {
         .or_else(|| entry.as_str())
 }
 
+fn advertised_model(entry: &Value) -> Option<Value> {
+    let model = entry.get("model")?.as_str()?;
+    let efforts = entry
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| advertised_effort_name(item).map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut advertised = json!({"model": model, "efforts": efforts});
+    for (native, public) in [("hidden", "hidden"), ("isDefault", "is_default")] {
+        if let Some(value) = entry.get(native).and_then(Value::as_bool) {
+            advertised[public] = json!(value);
+        }
+    }
+    if let Some(effort) = entry.get("defaultReasoningEffort").and_then(Value::as_str) {
+        advertised["default_effort"] = json!(effort);
+    }
+    Some(advertised)
+}
+
 fn validate_model_request(models: &Value, model: &str, effort: &str) -> Result<()> {
     let data = models
         .get("data")
@@ -3452,23 +3877,7 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
         .get("data")
         .and_then(Value::as_array)
         .context("Codex model/list response is missing data")?;
-    let advertised = data
-        .iter()
-        .filter_map(|entry| {
-            let model = entry.get("model")?.as_str()?;
-            let efforts = entry
-                .get("supportedReasoningEfforts")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| advertised_effort_name(item).map(str::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Some(json!({"model": model, "efforts": efforts}))
-        })
-        .collect::<Vec<_>>();
+    let advertised = data.iter().filter_map(advertised_model).collect::<Vec<_>>();
     let app_server_version = app_server_version_from_initialize_response(&initialized);
     Ok(json!({
         "compatible": true,
@@ -3481,11 +3890,12 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
+    let binary = configured_codex_binary()?;
     task_start_with_store_and_binary_inner(
         args,
         session,
         &store,
-        Path::new("codex"),
+        &binary,
         true,
         &TaskStartOrigin::Generic,
         || Ok(()),
@@ -3505,6 +3915,36 @@ pub(crate) fn task_start_replay_if_retained(
     task_start_replay_if_retained_with_store(args, session, origin, &store)
 }
 
+/// Read an exact retained start receipt even when the pre-thread start is
+/// retryable. Private status uses this to inspect an already admitted check;
+/// it never dispatches a new task.
+pub(crate) fn task_start_receipt_if_retained(
+    args: &Value,
+    session: &config::Session,
+    origin: &TaskStartOrigin,
+) -> Result<Option<Value>> {
+    let store = TaskStore::default_store()?;
+    let operation_id = required_uuid(args, "operation_id")?;
+    let task = required_string(args, "task")?;
+    let model = required_string(args, "model")?;
+    let effort = required_string(args, "effort")?;
+    validate_task_input(task, "task")?;
+    validate_argument(model, "model")?;
+    validate_argument(effort, "effort")?;
+    let continuation = codex_continuation(args)?;
+    let task_id = task_id_for_operation(session, operation_id)?;
+    let request_fingerprint =
+        continuation_fingerprint(task_id, task, model, effort, origin, continuation)?;
+    match store.read_record(task_id) {
+        Ok(record) => {
+            ensure_task_owner(&record, session)?;
+            replay_operation(&record, operation_id, request_fingerprint).map(Some)
+        }
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn task_start_replay_if_retained_with_store(
     args: &Value,
     session: &config::Session,
@@ -3518,8 +3958,10 @@ fn task_start_replay_if_retained_with_store(
     validate_task_input(task, "task")?;
     validate_argument(model, "model")?;
     validate_argument(effort, "effort")?;
+    let continuation = codex_continuation(args)?;
     let task_id = task_id_for_operation(session, operation_id)?;
-    let request_fingerprint = task_start_fingerprint(task_id, task, model, effort, origin)?;
+    let request_fingerprint =
+        continuation_fingerprint(task_id, task, model, effort, origin, continuation)?;
     match store.read_record(task_id) {
         Ok(record) => {
             ensure_task_owner(&record, session)?;
@@ -3575,8 +4017,15 @@ pub(crate) fn seed_completed_task_for_test(
         revision: 2,
         generation: 1,
         thread_id: Some("test-completed-thread".to_owned()),
+        continued_from_task_id: None,
+        continued_by_task_id: None,
+        continued_by_request_fingerprint: None,
         turn_id: Some("test-completed-turn".to_owned()),
+        previous_turn_id: None,
         usage: None,
+        report: None,
+        report_source: None,
+        report_status: None,
         pending_interaction: None,
         created_at: now,
         updated_at: now,
@@ -3608,16 +4057,9 @@ where
     F: FnOnce() -> Result<()>,
 {
     let store = TaskStore::default_store()?;
-    task_start_with_store_and_binary_inner(
-        args,
-        session,
-        &store,
-        Path::new("codex"),
-        true,
-        origin,
-        admission,
-    )
-    .await
+    let binary = configured_codex_binary()?;
+    task_start_with_store_and_binary_inner(args, session, &store, &binary, true, origin, admission)
+        .await
 }
 
 #[cfg(test)]
@@ -3696,7 +4138,9 @@ where
     validate_argument(effort, "effort")?;
 
     let task_id = task_id_for_operation(session, operation_id)?;
-    let request_fingerprint = task_start_fingerprint(task_id, task, model, effort, origin)?;
+    let continuation = codex_continuation(args)?;
+    let request_fingerprint =
+        continuation_fingerprint(task_id, task, model, effort, origin, continuation)?;
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
@@ -3709,8 +4153,18 @@ where
         revision: 1,
         generation: 0,
         thread_id: None,
+        continued_from_task_id: match continuation {
+            CodexContinuation::New => None,
+            CodexContinuation::PreviousTask { task_id } => Some(task_id),
+        },
+        continued_by_task_id: None,
+        continued_by_request_fingerprint: None,
         turn_id: None,
+        previous_turn_id: None,
         usage: None,
+        report: None,
+        report_source: None,
+        report_status: None,
         pending_interaction: None,
         created_at: now,
         updated_at: now,
@@ -3737,12 +4191,30 @@ where
         store.accept_start(session, record)?
     };
     drop(acceptance_permit);
-    let (mut record, runtime_lease) = match acceptance {
+    let (mut record, runtime_lease, retired_runtime, resume_thread) = match acceptance {
         StartAcceptance::Existing(existing) => {
             return replay_operation(&existing, operation_id, request_fingerprint);
         }
-        StartAcceptance::Accepted(record, lease) => (record, lease),
+        StartAcceptance::Accepted(record, lease, runtime, thread) => {
+            (record, lease, runtime, thread)
+        }
     };
+    if let Some(runtime) = retired_runtime {
+        let source_lease = Arc::clone(&runtime._lease);
+        let shutdown = runtime.client.shutdown_checked().await;
+        drop(runtime);
+        drop(source_lease);
+        if let Err(error) = shutdown {
+            store.update(session, task_id, |record| {
+                record.status = TaskStatus::Failed;
+                record.revision = record.revision.saturating_add(1);
+                update_operation_receipt(record, operation_id, OperationPhase::Applied);
+                Ok(())
+            })?;
+            return Err(error)
+                .context("CODEX_CONTINUATION_HANDOFF_FAILED: source runtime could not be retired");
+        }
+    }
     if let Err(error) = admission() {
         drop(runtime_lease);
         store.update(session, task_id, |record| {
@@ -3853,21 +4325,41 @@ where
 
     let start_result = async {
         let cwd = record.scope_cwd.to_string_lossy().into_owned();
+        let (thread_method, thread_params) = if let Some(source_thread) = &resume_thread {
+            (
+                "thread/resume",
+                json!({
+                    "threadId": source_thread,
+                    "cwd": cwd,
+                    "model": model,
+                    "approvalPolicy": CODEX_APPROVAL_POLICY,
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write",
+                    "runtimeWorkspaceRoots": [record.scope_cwd],
+                    "excludeTurns": true,
+                }),
+            )
+        } else {
+            (
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "model": model,
+                    "approvalPolicy": CODEX_APPROVAL_POLICY,
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write",
+                    "runtimeWorkspaceRoots": [record.scope_cwd],
+                    "ephemeral": false,
+                    "threadSource": "temote-mcp",
+                }),
+            )
+        };
         let thread = request_codex(
             &client,
             &owner,
             session,
-            "thread/start",
-            json!({
-                "cwd": cwd,
-                "model": model,
-                "approvalPolicy": CODEX_APPROVAL_POLICY,
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
-                "runtimeWorkspaceRoots": [record.scope_cwd],
-                "ephemeral": false,
-                "threadSource": "temote-mcp",
-            }),
+            thread_method,
+            thread_params,
             fence,
         )
         .await?;
@@ -3875,8 +4367,14 @@ where
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
-            .context("thread/start response is missing thread.id")?
+            .with_context(|| format!("{thread_method} response is missing thread.id"))?
             .to_owned();
+        anyhow::ensure!(
+            resume_thread
+                .as_ref()
+                .is_none_or(|source| source == &thread_id),
+            "CODEX_CONTINUATION_THREAD_MISMATCH: resumed a different conversation"
+        );
         let thread_update_permit = if fence {
             Some(ensure_current_active_instance(&owner, session).await?)
         } else {
@@ -3899,6 +4397,7 @@ where
                 "input": [{"type": "text", "text": task}],
                 "model": model,
                 "effort": effort,
+                "outputSchema": crate::report_contract::codex_report_json_schema(),
                 "cwd": cwd,
                 "approvalPolicy": CODEX_APPROVAL_POLICY,
                 "sandboxPolicy": {
@@ -3939,7 +4438,7 @@ where
     }
     .await;
 
-    if let Err(_error) = start_result {
+    if let Err(error) = start_result {
         client.shutdown().await;
         let shutting_down = fence && session_instance_is_closing(&owner);
         let record = store.update(session, task_id, |record| {
@@ -3962,6 +4461,9 @@ where
             }
             Ok(())
         })?;
+        if resume_thread.is_some() {
+            return Err(error).context("CODEX_CONTINUATION_UNAVAILABLE: source conversation could not be resumed or advanced; reconcile the retained successor task");
+        }
         return Ok(task_view(&record, None));
     }
 
@@ -4024,7 +4526,8 @@ fn replay_operation(record: &TaskRecord, operation_id: Uuid, fingerprint: Uuid) 
 
 pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
-    task_get_with_store_and_binary(args, session, &store, Path::new("codex")).await
+    let binary = configured_codex_binary()?;
+    task_get_with_store_and_binary(args, session, &store, &binary).await
 }
 
 async fn task_get_with_store_and_binary(
@@ -4036,9 +4539,29 @@ async fn task_get_with_store_and_binary(
     let task_id = required_uuid(args, "task_id")?;
     let after_revision = optional_u64(args, "after_revision")?;
     let owner = SessionInstance::from_session(session);
+    if session_instance_is_closing(&owner) {
+        if let Ok(current) = config::read_session_metadata(&owner.id).await {
+            anyhow::ensure!(
+                owner.matches(&current),
+                "Codex session instance is no longer current"
+            );
+        }
+        let record = {
+            let _guard = store.lock()?;
+            store.load_locked(session, task_id)?
+        };
+        let mut view = task_view(&record, None);
+        view["recovery_state"] = json!("owner_closing");
+        return Ok(view);
+    }
     let load_permit = ensure_current_active_instance(&owner, session).await?;
     let (mut record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
     drop(load_permit);
+    if record.continued_by_task_id.is_some() {
+        // The old task stays readable, but its thread is now owned by the
+        // successor. In particular, do not reconstruct a source runtime.
+        return Ok(task_view_at_revision(&record, after_revision));
+    }
     let acquired_lease = match runtime_access {
         RuntimeAccess::Local => None,
         RuntimeAccess::Acquired(lease) => Some(lease),
@@ -4058,8 +4581,10 @@ async fn task_get_with_store_and_binary(
                 if record.status.is_terminal() {
                     return Ok(());
                 }
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
+                if record.status != TaskStatus::ReconciliationRequired {
+                    record.status = TaskStatus::ReconciliationRequired;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 if let Some(operation_id) = start_operation_id {
                     update_operation_receipt(record, operation_id, OperationPhase::Accepted);
                 }
@@ -4067,7 +4592,11 @@ async fn task_get_with_store_and_binary(
             })?;
             drop(apply_permit);
         }
-        return Ok(task_view(&record, None));
+        return Ok(task_view_after_reconciliation(
+            &record,
+            after_revision,
+            None,
+        ));
     }
 
     let client =
@@ -4079,14 +4608,18 @@ async fn task_get_with_store_and_binary(
             Err(_) => {
                 let apply_permit = ensure_current_active_instance(&owner, session).await?;
                 record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                    if !record.status.is_terminal() {
+                    if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                         record.status = TaskStatus::Unknown;
                         record.revision = record.revision.saturating_add(1);
                     }
                     Ok(())
                 })?;
                 drop(apply_permit);
-                return Ok(task_view(&record, None));
+                return Ok(task_view_after_reconciliation(
+                    &record,
+                    after_revision,
+                    None,
+                ));
             }
         };
     let thread_id = record.thread_id.clone().unwrap();
@@ -4103,44 +4636,84 @@ async fn task_get_with_store_and_binary(
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
             let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
+                if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
             })?;
             drop(apply_permit);
-            return Ok(task_view(&record, None));
+            return Ok(task_view_after_reconciliation(
+                &record,
+                after_revision,
+                None,
+            ));
         }
     };
-    let evidence_permit = ensure_current_active_instance(&owner, session).await?;
-    let evidence_ref = store_evidence_for_instance(&owner, session, &response);
-    drop(evidence_permit);
-    let derived = match derive_thread_state(&response, record.turn_id.as_deref()) {
+    let derived = match derive_thread_state_after(
+        &response,
+        record.turn_id.as_deref(),
+        record.previous_turn_id.as_deref(),
+    ) {
         Ok(derived) => derived,
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
             record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
+                if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
             })?;
             drop(apply_permit);
+            if after_revision == Some(record.revision) {
+                return Ok(task_view_after_reconciliation(
+                    &record,
+                    after_revision,
+                    None,
+                ));
+            }
+            let evidence_permit = ensure_current_active_instance(&owner, session).await?;
+            let evidence_ref = store_evidence_for_instance(&owner, session, &response);
+            drop(evidence_permit);
             return Ok(task_view(&record, evidence_ref.as_ref()));
         }
     };
     let reconciled_status = reconciled_task_status(record.status, derived.status);
     let changed = record.status != reconciled_status
         || record.turn_id != derived.turn_id
+        || (derived.report_status.is_some()
+            && (record.report != derived.report
+                || record.report_status != derived.report_status
+                || record.report_source.as_deref() != Some("native_structured_output")))
         || (derived.usage.is_some() && record.usage != derived.usage);
     if changed || (record.generation == 0 && derived.turn_id.is_some()) {
         let apply_permit = ensure_current_active_instance(&owner, session).await?;
         record = store.update_if_instance_live(session, task_id, &owner, |record| {
             if record.status.is_terminal() {
+                let previous = record.clone();
+                if let Some(usage) = &derived.usage {
+                    record.usage = Some(usage.clone());
+                }
+                if derived.report_status.is_some()
+                    && (record.report != derived.report
+                        || record.report_status != derived.report_status
+                        || record.report_source.as_deref() != Some("native_structured_output"))
+                {
+                    record.report = derived.report.clone();
+                    record.report_status = derived.report_status.clone();
+                    record.report_source = Some("native_structured_output".to_owned());
+                }
+                if record.usage != previous.usage
+                    || record.report != previous.report
+                    || record.report_status != previous.report_status
+                    || record.report_source != previous.report_source
+                {
+                    record.revision = record.revision.saturating_add(1);
+                }
                 return Ok(());
             }
+            let previous = record.clone();
             record.status = reconciled_task_status(record.status, derived.status);
             if derived.turn_id.is_some() {
                 record.turn_id = derived.turn_id.clone();
@@ -4151,7 +4724,21 @@ async fn task_get_with_store_and_binary(
             if derived.usage.is_some() {
                 record.usage = derived.usage.clone();
             }
-            record.revision = record.revision.saturating_add(1);
+            if derived.report_status.is_some() {
+                record.report = derived.report.clone();
+                record.report_status = derived.report_status.clone();
+                record.report_source = Some("native_structured_output".to_owned());
+            }
+            if record.status != previous.status
+                || record.turn_id != previous.turn_id
+                || record.generation != previous.generation
+                || record.usage != previous.usage
+                || record.report != previous.report
+                || record.report_status != previous.report_status
+                || record.report_source != previous.report_source
+            {
+                record.revision = record.revision.saturating_add(1);
+            }
             let outcome = record.outcome();
             if derived.turn_id.is_some()
                 && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
@@ -4166,12 +4753,15 @@ async fn task_get_with_store_and_binary(
         drop(apply_permit);
     }
     if after_revision == Some(record.revision) {
-        return Ok(json!({
-            "task_id": task_id,
-            "status": "not_modified",
-            "revision": record.revision,
-        }));
+        return Ok(task_view_after_reconciliation(
+            &record,
+            after_revision,
+            None,
+        ));
     }
+    let evidence_permit = ensure_current_active_instance(&owner, session).await?;
+    let evidence_ref = store_evidence_for_instance(&owner, session, &response);
+    drop(evidence_permit);
     Ok(task_view(&record, evidence_ref.as_ref()))
 }
 
@@ -4187,11 +4777,21 @@ struct DerivedThreadState {
     status: TaskStatus,
     turn_id: Option<String>,
     usage: Option<BTreeMap<String, u64>>,
+    report: Option<Value>,
+    report_status: Option<String>,
 }
 
 fn derive_thread_state(
     response: &Value,
     expected_turn_id: Option<&str>,
+) -> Result<DerivedThreadState> {
+    derive_thread_state_after(response, expected_turn_id, None)
+}
+
+fn derive_thread_state_after(
+    response: &Value,
+    expected_turn_id: Option<&str>,
+    predecessor_turn_id: Option<&str>,
 ) -> Result<DerivedThreadState> {
     let thread = response
         .get("thread")
@@ -4207,7 +4807,16 @@ fn derive_thread_state(
                 .iter()
                 .find(|turn| turn.get("id").and_then(Value::as_str) == Some(id))
         })
-        .or_else(|| turns.last());
+        .or_else(|| {
+            if let Some(predecessor) = predecessor_turn_id {
+                turns
+                    .iter()
+                    .position(|turn| turn.get("id").and_then(Value::as_str) == Some(predecessor))
+                    .and_then(|index| turns.get(index + 1))
+            } else {
+                turns.last()
+            }
+        });
     let usage = thread
         .get("tokenUsage")
         .or_else(|| thread.get("usage"))
@@ -4221,6 +4830,7 @@ fn derive_thread_state(
             .unwrap_or("unknown");
         return Ok(DerivedThreadState {
             status: match thread_status {
+                "idle" if predecessor_turn_id.is_some() => TaskStatus::ReconciliationRequired,
                 "idle" => TaskStatus::Unknown,
                 "active" => TaskStatus::Running,
                 "systemError" => TaskStatus::Failed,
@@ -4228,6 +4838,8 @@ fn derive_thread_state(
             },
             turn_id: None,
             usage,
+            report: None,
+            report_status: None,
         });
     };
     let turn_id = turn.get("id").and_then(Value::as_str).map(str::to_owned);
@@ -4236,10 +4848,41 @@ fn derive_thread_state(
         .and_then(Value::as_str)
         .and_then(task_status_from_str)
         .unwrap_or(TaskStatus::Unknown);
+    let (report, report_status) = if status == TaskStatus::Completed {
+        let text = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .rev()
+                    .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+            });
+        let result = match text {
+            None => (None, "missing_report"),
+            Some(text) if text.len() > crate::report_contract::MAX_TASK_REPORT_BYTES => {
+                (None, "oversized_report")
+            }
+            Some(text) => match serde_json::from_str::<Value>(text) {
+                Ok(value) if crate::report_contract::validate_codex_native(&value) => {
+                    (Some(value), "valid")
+                }
+                Ok(_) => (None, "invalid_report_schema"),
+                Err(_) => (None, "invalid_json"),
+            },
+        };
+        (result.0, Some(result.1.to_owned()))
+    } else {
+        (None, None)
+    };
     Ok(DerivedThreadState {
         status,
         turn_id,
         usage,
+        report,
+        report_status,
     })
 }
 
@@ -4283,6 +4926,14 @@ async fn ensure_runtime_with_binary(
             None => return Ok(EnsuredRuntime::OwnedElsewhere),
         },
     };
+    {
+        let _guard = store.lock()?;
+        let current = store.load_locked(session, record.task_id)?;
+        anyhow::ensure!(
+            current.continued_by_task_id.is_none(),
+            "CODEX_CONTINUATION_CLAIMED: source conversation belongs to its successor"
+        );
+    }
     let _operation_permit = ensure_current_active_instance(&owner, session).await?;
     let (client, _) = spawn_initialized_client_with_binary_mode(
         session,
@@ -4384,7 +5035,8 @@ fn task_list_limit(args: &Value) -> Result<usize> {
 
 pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
-    task_control_with_store_and_binary(args, session, &store, Path::new("codex")).await
+    let binary = configured_codex_binary()?;
+    task_control_with_store_and_binary(args, session, &store, &binary).await
 }
 
 async fn task_control_with_store_and_binary(
@@ -4433,6 +5085,8 @@ async fn task_control_with_store_and_binary(
         .clone()
         .context("Codex task requires reconciliation before control")?;
     let turn_id = record.turn_id.clone();
+    let starts_new_turn =
+        action == "steer" && record.previous_turn_id.is_some() && turn_id.is_none();
 
     let client =
         match ensure_runtime_with_binary(session, &record, store, binary, acquired_lease).await {
@@ -4453,18 +5107,31 @@ async fn task_control_with_store_and_binary(
     let pending_summary_was_ready = client.pending_summary_ready_for(&record);
     let result = match action {
         "steer" => {
-            request_for_instance(
-                &client,
-                &owner,
-                session,
-                "turn/steer",
-                json!({
+            if starts_new_turn {
+                request_for_instance(&client, &owner, session, "turn/start", json!({
                     "threadId": thread_id,
-                    "expectedTurnId": turn_id.as_deref().unwrap_or_default(),
                     "input": [{"type": "text", "text": input.unwrap()}],
-                }),
-            )
-            .await
+                    "model": record.model,
+                    "effort": record.effort,
+                    "cwd": record.scope_cwd,
+                    "approvalPolicy": CODEX_APPROVAL_POLICY,
+                    "outputSchema": crate::report_contract::codex_report_json_schema(),
+                    "sandboxPolicy": {"type":"workspaceWrite", "writableRoots":[record.scope_cwd], "networkAccess":false}
+                })).await
+            } else {
+                request_for_instance(
+                    &client,
+                    &owner,
+                    session,
+                    "turn/steer",
+                    json!({
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id.as_deref().unwrap_or_default(),
+                        "input": [{"type": "text", "text": input.unwrap()}],
+                    }),
+                )
+                .await
+            }
         }
         "interrupt" => {
             request_for_instance(
@@ -4528,6 +5195,21 @@ async fn task_control_with_store_and_binary(
             if resumed.usage.is_some() {
                 record.usage = resumed.usage.clone();
             }
+        } else if starts_new_turn {
+            let new_turn_id = result
+                .as_ref()
+                .ok()
+                .and_then(|response| response.get("turn"))
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+                .context("turn/start response is missing turn.id")?;
+            anyhow::ensure!(
+                Some(new_turn_id) != record.previous_turn_id.as_deref(),
+                "turn/start reused predecessor turn"
+            );
+            record.turn_id = Some(new_turn_id.to_owned());
+            record.previous_turn_id = None;
+            record.status = TaskStatus::Running;
         } else if !record.status.is_terminal() {
             record.generation = record.generation.saturating_add(1);
             record.status = if action == "interrupt" {
@@ -4578,6 +5260,34 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_multicall_codex_keeps_invocation_path() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("launcher");
+        std::fs::write(&target, b"#!/bin/sh\n[ \"${0##*/}\" = codex ]\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let invocation = root.path().join("codex");
+        std::os::unix::fs::symlink(&target, &invocation).unwrap();
+        let validated = validate_configured_codex_binary(&invocation).unwrap();
+        assert_eq!(validated, invocation);
+        assert!(
+            std::process::Command::new(validated)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            !std::process::Command::new(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_ne!(std::fs::canonicalize(&invocation).unwrap(), invocation);
+        assert!(validate_configured_codex_binary(Path::new("codex")).is_err());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_configured_codex_binary(&invocation).is_err());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::io;
@@ -4726,7 +5436,7 @@ mod tests {
         );
         assert_eq!(monitor.consecutive_unknown, 0);
 
-        for expected in 1..SESSION_STOP_UNKNOWN_LIMIT {
+        for expected in 1..=10 {
             assert_eq!(
                 monitor.observe(SessionMonitorObservation::Unknown(
                     SessionMonitorUnknownKind::MetadataRead
@@ -4735,14 +5445,6 @@ mod tests {
             );
             assert_eq!(monitor.consecutive_unknown, expected);
         }
-        assert_eq!(
-            monitor.observe(SessionMonitorObservation::Unknown(
-                SessionMonitorUnknownKind::MetadataRead
-            )),
-            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
-                SessionMonitorUnknownKind::MetadataRead
-            ))
-        );
 
         assert_eq!(
             SessionStopMonitor::default().observe(SessionMonitorObservation::Inactive),
@@ -4787,13 +5489,7 @@ mod tests {
                             SessionMonitorUnknownKind::ActivityProbe
                         };
                         reference_unknown = reference_unknown.saturating_add(1);
-                        let expected = if reference_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
-                            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
-                                kind,
-                            ))
-                        } else {
-                            SessionMonitorAction::Continue
-                        };
+                        let expected = SessionMonitorAction::Continue;
                         (SessionMonitorObservation::Unknown(kind), expected)
                     }
                 };
@@ -4822,6 +5518,9 @@ for raw in sys.stdin:
         continue
     i = req.get('id')
     method = req.get('method')
+    if mode == 'continuation':
+        with open(os.path.join(os.path.dirname(sys.argv[0]), 'methods.log'), 'a') as log:
+            log.write(method + '\n')
     if method == 'initialize':
         result = {'userAgent':'temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}
     elif method == 'model/list':
@@ -4861,7 +5560,8 @@ for raw in sys.stdin:
             continue
         result = {'thread':{'id':thread_id}}
     elif method == 'thread/read':
-        result = {'thread':{'id':thread_id,'status':{'type':'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':'completed','items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
+        turn_status = 'inProgress' if mode == 'running-read' else 'completed'
+        result = {'thread':{'id':thread_id,'status':{'type':'active' if mode == 'running-read' else 'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':turn_status,'items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
     elif method == 'turn/steer':
         result = {'turnId':turn_id}
     elif method == 'turn/interrupt':
@@ -5120,8 +5820,15 @@ for raw in sys.stdin:
             revision,
             generation: u64::from(thread_id.is_some()),
             thread_id: thread_id.map(str::to_owned),
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: turn_id.map(str::to_owned),
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -5130,6 +5837,46 @@ for raw in sys.stdin:
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_item_binding_requires_exact_task_turn_and_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "prompt-binding", false);
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            1,
+            Some("thread-1"),
+            Some("turn-1"),
+        );
+        let params = json!({"threadId":"thread-1", "turnId":"turn-1", "startedAtMs":42,
+            "item":{"type":"userMessage", "id":"item-1",
+                "content":[{"type":"text", "text":"instruction"}]}});
+        let mut candidate =
+            crate::codex_prompt_observer::parse_item_started("item/started", Some(&params))
+                .unwrap();
+        let binding = prompt_notification_binding(&owner, &record, &candidate).unwrap();
+        assert_eq!(binding.task_id, task_id.to_string());
+        assert_eq!(
+            binding.execution_id,
+            outcome::execution_id(task_id, record.generation).to_string()
+        );
+        assert_ne!(binding.execution_id, candidate.turn_id);
+        candidate.turn_id = "other-turn".into();
+        assert!(prompt_notification_binding(&owner, &record, &candidate).is_none());
+        candidate.turn_id = "turn-1".into();
+        candidate.thread_id = "other-thread".into();
+        assert!(prompt_notification_binding(&owner, &record, &candidate).is_none());
+        candidate.thread_id = "thread-1".into();
+        record.scope_cwd = root.path().join("other");
+        assert!(prompt_notification_binding(&owner, &record, &candidate).is_none());
+        record.scope_cwd = owner.cwd.clone();
+        record.owner.started_at += 1;
+        assert!(prompt_notification_binding(&owner, &record, &candidate).is_none());
     }
 
     fn start_receipt(
@@ -5256,8 +6003,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 0,
             thread_id: None,
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: None,
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -5372,7 +6126,8 @@ for raw in sys.stdin:
                 TaskStartOrigin::Generic => {
                     task_start_with_store_and_binary(&args, &owner, &store, &missing_binary).await
                 }
-                TaskStartOrigin::RepositoryCloneBare { .. } => {
+                TaskStartOrigin::RepositoryCloneBare { .. }
+                | TaskStartOrigin::OpenCodeWorkspaceCheck { .. } => {
                     task_start_with_store_binary_and_admission(
                         &args,
                         &owner,
@@ -5394,7 +6149,8 @@ for raw in sys.stdin:
                 TaskStartOrigin::Generic => {
                     task_start_with_store_and_binary(&args, &owner, &store, &missing_binary).await
                 }
-                TaskStartOrigin::RepositoryCloneBare { .. } => {
+                TaskStartOrigin::RepositoryCloneBare { .. }
+                | TaskStartOrigin::OpenCodeWorkspaceCheck { .. } => {
                     task_start_with_store_binary_and_admission(
                         &args,
                         &owner,
@@ -5417,6 +6173,27 @@ for raw in sys.stdin:
             );
             assert_eq!(admissions.get(), 0, "{label}");
             assert_eq!(store.load(&owner, task_id).unwrap(), before, "{label}");
+        }
+    }
+
+    #[test]
+    fn private_workspace_origin_fences_parent_workspace_action_and_epoch() {
+        let task_id = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let workspace = Uuid::new_v4();
+        let base = TaskStartOrigin::opencode_workspace_check(parent, workspace, "test", 1);
+        let fingerprint_for = |origin: &TaskStartOrigin| {
+            task_start_fingerprint(task_id, "fixed task", "gpt-5.6-luna", "high", origin).unwrap()
+        };
+        let expected = fingerprint_for(&base);
+        assert_ne!(expected, fingerprint_for(&TaskStartOrigin::Generic));
+        for changed in [
+            TaskStartOrigin::opencode_workspace_check(Uuid::new_v4(), workspace, "test", 1),
+            TaskStartOrigin::opencode_workspace_check(parent, Uuid::new_v4(), "test", 1),
+            TaskStartOrigin::opencode_workspace_check(parent, workspace, "build", 1),
+            TaskStartOrigin::opencode_workspace_check(parent, workspace, "test", 2),
+        ] {
+            assert_ne!(expected, fingerprint_for(&changed));
         }
     }
 
@@ -5743,8 +6520,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 1,
             thread_id: Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa".to_owned()),
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb".to_owned()),
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -5801,8 +6585,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 0,
             thread_id: None,
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: None,
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -6935,8 +7726,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 0,
             thread_id: None,
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: None,
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -7364,8 +8162,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 1,
             thread_id: Some("thread-1".to_owned()),
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: Some("turn-1".to_owned()),
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -7434,8 +8239,15 @@ for raw in sys.stdin:
             revision: 1,
             generation: 1,
             thread_id: Some("thread-1".to_owned()),
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: Some("turn-1".to_owned()),
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: now,
             updated_at: now,
@@ -7522,8 +8334,15 @@ for raw in sys.stdin:
             revision: 3,
             generation: 1,
             thread_id: Some("thread-1".to_owned()),
+            continued_from_task_id: None,
+            continued_by_task_id: None,
+            continued_by_request_fingerprint: None,
             turn_id: Some("turn-1".to_owned()),
+            previous_turn_id: None,
             usage: None,
+            report: None,
+            report_source: None,
+            report_status: None,
             pending_interaction: None,
             created_at: config::unix_time(),
             updated_at: config::unix_time(),
@@ -7546,6 +8365,51 @@ for raw in sys.stdin:
         };
         assert!(error.to_string().contains("not active"));
         assert!(store.load(&owner, task_id).unwrap().operations.is_empty());
+    }
+
+    #[test]
+    fn terminal_steer_retains_task_and_durably_claims_fresh_turn_generation() {
+        for status in [TaskStatus::Completed, TaskStatus::Interrupted] {
+            let root = tempfile::tempdir().unwrap();
+            let store = TaskStore::new(root.path().join("tasks"));
+            let owner = session(root.path(), "terminal-steer", true);
+            let task_id = Uuid::new_v4();
+            let mut record =
+                task_record(&owner, task_id, status, 3, Some("thread-1"), Some("turn-1"));
+            record.generation = 2;
+            store.save(&record).unwrap();
+            let operation_id = Uuid::new_v4();
+            let request_fingerprint =
+                fingerprint(&json!({"action":"steer","input":"next"})).unwrap();
+            let accepted = store
+                .accept_control(&owner, task_id, operation_id, request_fingerprint, "steer")
+                .unwrap();
+            assert!(matches!(accepted, ControlAcceptance::Accepted(..)));
+            let retained = store.load(&owner, task_id).unwrap();
+            assert_eq!(retained.task_id, task_id);
+            assert_eq!(retained.status, TaskStatus::ReconciliationRequired);
+            assert_eq!(retained.generation, 3);
+            assert_eq!(retained.previous_turn_id.as_deref(), Some("turn-1"));
+            assert!(retained.turn_id.is_none());
+            assert_eq!(retained.operations[0].operation_id, operation_id);
+            assert!(matches!(
+                store
+                    .accept_control(&owner, task_id, operation_id, request_fingerprint, "steer")
+                    .unwrap(),
+                ControlAcceptance::Replay(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn successor_reconciliation_does_not_select_a_turn_before_predecessor() {
+        let response = json!({"thread":{"status":{"type":"idle"},"turns":[
+            {"id":"older","status":"completed"},
+            {"id":"predecessor","status":"completed"}
+        ]}});
+        let state = derive_thread_state_after(&response, None, Some("predecessor")).unwrap();
+        assert_eq!(state.status, TaskStatus::ReconciliationRequired);
+        assert!(state.turn_id.is_none());
     }
 
     #[test]
@@ -7896,6 +8760,120 @@ for raw in sys.stdin:
                 .len(),
             persisted.operation_tombstones.len()
         );
+    }
+
+    #[tokio::test]
+    async fn closing_owner_can_read_retained_task_without_restarting_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "closing-task-read", true);
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                7,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+        let instance = SessionInstance::from_session(&owner);
+        begin_session_instance_shutdown(&instance);
+        let view = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            Path::new("missing-codex"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["status"], "running");
+        assert_eq!(view["recovery_state"], "owner_closing");
+        assert_eq!(view["revision"], 7);
+        let mut replacement = owner.clone();
+        replacement.started_at += 1;
+        assert!(store.load(&replacement, task_id).is_err());
+        finish_session_shutdown(&instance).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_task_store_finalization_keeps_same_owner_cleanup_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "retry-finalization", true);
+        let instance = SessionInstance::from_session(&owner);
+        let bad_path = root.path().join("bad-store");
+        std::fs::write(&bad_path, b"not a directory").unwrap();
+        begin_session_instance_shutdown(&instance);
+        assert!(
+            finalize_session_tasks(&instance, &TaskStore::new(bad_path))
+                .await
+                .is_err()
+        );
+        assert!(session_instance_is_closing(&instance));
+        let store = TaskStore::new(root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                1,
+                None,
+                None,
+            ))
+            .unwrap();
+        finalize_session_tasks(&instance, &store).await.unwrap();
+        assert_eq!(
+            store.load(&owner, task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        assert!(!session_instance_is_closing(&instance));
+    }
+
+    #[tokio::test]
+    async fn task_get_keeps_revision_for_unchanged_running_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (handle, owner) = active_test_session(root.path(), "stable-running-get", true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+            Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"),
+        );
+        record.updated_at = config::unix_time().saturating_sub(10);
+        store.save(&record).unwrap();
+        let binary = fake_app_server(root.path(), "running-read");
+        let first =
+            task_get_with_store_and_binary(&json!({"task_id": task_id}), &owner, &store, &binary)
+                .await
+                .unwrap();
+        assert_eq!(first["status"], "running");
+        let revision = first["revision"].as_u64().unwrap();
+        // The first probe may learn native usage. Subsequent identical probes
+        // must preserve both its semantic cursor and retention timestamp.
+        let observed_updated_at = store.load(&owner, task_id).unwrap().updated_at;
+        let unchanged = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": revision}),
+            &owner,
+            &store,
+            &binary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["status"], "not_modified");
+        assert_eq!(unchanged["revision"], revision);
+        assert_eq!(
+            store.load(&owner, task_id).unwrap().updated_at,
+            observed_updated_at
+        );
+        remove_session(&owner).await.unwrap();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -8254,6 +9232,23 @@ for raw in sys.stdin:
             Some("high")
         );
         assert_eq!(advertised_effort_name(&json!("medium")), Some("medium"));
+    }
+
+    #[test]
+    fn model_inventory_preserves_native_selection_metadata_without_inventing_legacy_defaults() {
+        let legacy = json!({"model":"legacy", "supportedReasoningEfforts":["medium"]});
+        assert_eq!(
+            advertised_model(&legacy).unwrap(),
+            json!({"model":"legacy", "efforts":["medium"]})
+        );
+        let mut current = legacy;
+        current["hidden"] = json!(false);
+        current["isDefault"] = json!(true);
+        current["defaultReasoningEffort"] = json!("medium");
+        assert_eq!(
+            advertised_model(&current).unwrap(),
+            json!({"model":"legacy", "efforts":["medium"], "hidden":false, "is_default":true, "default_effort":"medium"})
+        );
     }
 
     fn initialize_response(user_agent: &str) -> Value {
@@ -9123,9 +10118,14 @@ for raw in sys.stdin:
         let object = value.as_object_mut().unwrap();
         assert!(object.remove("verification").is_some());
         assert!(object.remove("delivery").is_some());
+        assert!(object.remove("continued_from_task_id").is_some());
+        assert!(object.remove("continued_by_task_id").is_some());
+        assert!(object.remove("continued_by_request_fingerprint").is_some());
         let legacy: TaskRecord = serde_json::from_value(value).unwrap();
         assert!(legacy.verification.is_none());
         assert!(legacy.delivery.is_none());
+        assert!(legacy.continued_from_task_id.is_none());
+        assert!(legacy.continued_by_task_id.is_none());
 
         let view = task_view(&legacy, None);
         assert_eq!(view["verification"]["status"], "not_run");
@@ -9171,5 +10171,376 @@ for raw in sys.stdin:
             checked_at: 1_700_000_000,
         });
         assert!(validate_record(&record).is_err());
+    }
+
+    #[tokio::test]
+    async fn continued_start_resumes_once_and_preserves_independent_task_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "continuation-fixture", true);
+        let store = TaskStore::new(state.path().join("tasks"));
+        let binary = fake_app_server(state.path(), "continuation");
+        let source_operation = Uuid::new_v4();
+        let source_args = json!({"operation_id":source_operation,"task":"first","model":"gpt-5.6-luna","effort":"high"});
+        let source_view = task_start_with_store_and_binary(&source_args, &owner, &store, &binary)
+            .await
+            .unwrap();
+        let source_id = Uuid::parse_str(source_view["task_id"].as_str().unwrap()).unwrap();
+        store
+            .update(&owner, source_id, |source| {
+                source.status = TaskStatus::Completed;
+                source.revision += 1;
+                Ok(())
+            })
+            .unwrap();
+        let successor_operation = Uuid::new_v4();
+        let args = json!({"operation_id":successor_operation,"task":"follow up","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        let successor = task_start_with_store_and_binary(&args, &owner, &store, &binary)
+            .await
+            .unwrap();
+        let successor_id = Uuid::parse_str(successor["task_id"].as_str().unwrap()).unwrap();
+        assert_ne!(source_id, successor_id);
+        assert_eq!(successor["continued_from_task_id"], json!(source_id));
+        assert_eq!(successor["verification"]["status"], "not_run");
+        assert_eq!(successor["delivery"]["status"], "not_started");
+        let retained_source = store.load(&owner, source_id).unwrap();
+        assert_eq!(retained_source.status, TaskStatus::Completed);
+        assert_eq!(
+            retained_source.thread_id,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa".to_owned())
+        );
+        assert_eq!(
+            retained_source.turn_id,
+            Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb".to_owned())
+        );
+        assert_eq!(retained_source.continued_by_task_id, Some(successor_id));
+        assert!(runtime_for(&owner, source_id).is_none());
+        let methods = std::fs::read_to_string(state.path().join("methods.log")).unwrap();
+        assert_eq!(methods.matches("thread/start\n").count(), 1);
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert_eq!(methods.matches("turn/start\n").count(), 2);
+        let replay = task_start_with_store_and_binary(&args, &owner, &store, &binary)
+            .await
+            .unwrap();
+        assert_eq!(replay["task_id"], successor["task_id"]);
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("methods.log")).unwrap(),
+            methods
+        );
+        assert!(
+            store
+                .accept_control(&owner, source_id, Uuid::new_v4(), Uuid::new_v4(), "steer")
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_CLAIMED")
+        );
+        assert!(
+            store
+                .accept_control(&owner, source_id, Uuid::new_v4(), Uuid::new_v4(), "resume")
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_CLAIMED")
+        );
+        shutdown_session_runtimes(&SessionInstance::from_session(&owner)).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_source_claim_allows_only_exact_successor_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "continuation-crash", true);
+        let store = TaskStore::new(state.path().join("tasks"));
+        let binary = fake_app_server(state.path(), "continuation");
+        let source_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let successor_id = task_id_for_operation(&owner, operation_id).unwrap();
+        let args = json!({"operation_id":operation_id,"task":"follow up","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        let fingerprint = continuation_fingerprint(
+            successor_id,
+            "follow up",
+            "gpt-5.6-luna",
+            "high",
+            &TaskStartOrigin::Generic,
+            CodexContinuation::PreviousTask { task_id: source_id },
+        )
+        .unwrap();
+        let mut source = task_record(
+            &owner,
+            source_id,
+            TaskStatus::Completed,
+            2,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+            Some("old-turn"),
+        );
+        source.continued_by_task_id = Some(successor_id);
+        source.continued_by_request_fingerprint = Some(fingerprint);
+        store.save(&source).unwrap();
+        assert!(
+            !store.path(successor_id).exists(),
+            "fault point: source claim persisted before successor record"
+        );
+        let changed = json!({"operation_id":operation_id,"task":"different","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        assert!(
+            task_start_with_store_and_binary(&changed, &owner, &store, &binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("OPERATION_CONFLICT")
+        );
+        let other_source_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                other_source_id,
+                TaskStatus::Completed,
+                2,
+                Some("another-thread"),
+                Some("another-turn"),
+            ))
+            .unwrap();
+        let redirected = json!({"operation_id":operation_id,"task":"follow up","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":other_source_id}});
+        assert!(
+            task_start_with_store_and_binary(&redirected, &owner, &store, &binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("OPERATION_CONFLICT")
+        );
+        let fresh_thread = json!({"operation_id":operation_id,"task":"follow up","model":"gpt-5.6-luna","effort":"high"});
+        assert!(
+            task_start_with_store_and_binary(&fresh_thread, &owner, &store, &binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("OPERATION_CONFLICT")
+        );
+        let view = task_start_with_store_and_binary(&args, &owner, &store, &binary)
+            .await
+            .unwrap();
+        assert_eq!(view["task_id"], json!(successor_id));
+        assert_eq!(
+            store.load(&owner, source_id).unwrap().continued_by_task_id,
+            Some(successor_id)
+        );
+        let other = json!({"operation_id":Uuid::new_v4(),"task":"racer","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        assert!(
+            task_start_with_store_and_binary(&other, &owner, &store, &binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_CLAIMED")
+        );
+        let methods = std::fs::read_to_string(state.path().join("methods.log")).unwrap();
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert_eq!(methods.matches("thread/start\n").count(), 0);
+        shutdown_session_runtimes(&SessionInstance::from_session(&owner)).await;
+    }
+
+    #[tokio::test]
+    async fn racing_successors_claim_one_conversation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "continuation-race", true);
+        let store = TaskStore::new(state.path().join("tasks"));
+        let binary = fake_app_server(state.path(), "continuation");
+        let source_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                source_id,
+                TaskStatus::Completed,
+                2,
+                Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+                Some("old-turn"),
+            ))
+            .unwrap();
+        let args_b = json!({"operation_id":Uuid::new_v4(),"task":"B","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        let args_c = json!({"operation_id":Uuid::new_v4(),"task":"C","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        let (b, c) = tokio::join!(
+            task_start_with_store_and_binary(&args_b, &owner, &store, &binary),
+            task_start_with_store_and_binary(&args_c, &owner, &store, &binary)
+        );
+        assert_eq!(usize::from(b.is_ok()) + usize::from(c.is_ok()), 1);
+        let winner = b.as_ref().ok().or_else(|| c.as_ref().ok()).unwrap();
+        assert_eq!(
+            store.load(&owner, source_id).unwrap().continued_by_task_id,
+            Some(Uuid::parse_str(winner["task_id"].as_str().unwrap()).unwrap())
+        );
+        let methods = std::fs::read_to_string(state.path().join("methods.log")).unwrap();
+        assert_eq!(methods.matches("thread/resume\n").count(), 1);
+        assert_eq!(methods.matches("turn/start\n").count(), 1);
+        shutdown_session_runtimes(&SessionInstance::from_session(&owner)).await;
+    }
+
+    #[tokio::test]
+    async fn claimed_source_get_is_read_only_without_runtime_reconstruction() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (approval_sender, _approval_receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(
+            workspace.path(),
+            Some("claimed-source-get"),
+            true,
+            approval_sender,
+        )
+        .await
+        .unwrap();
+        let owner = config::read_session_metadata("claimed-source-get")
+            .await
+            .unwrap();
+        let store = TaskStore::new(state.path().join("tasks"));
+        let source_id = Uuid::new_v4();
+        let mut source = task_record(
+            &owner,
+            source_id,
+            TaskStatus::Completed,
+            2,
+            Some("retained-thread"),
+            Some("retained-turn"),
+        );
+        source.continued_by_task_id = Some(Uuid::new_v4());
+        source.continued_by_request_fingerprint = Some(Uuid::new_v4());
+        store.save(&source).unwrap();
+        let view = task_get_with_store_and_binary(
+            &json!({"task_id":source_id}),
+            &owner,
+            &store,
+            &state.path().join("missing-codex"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["thread_id"], "retained-thread");
+        assert!(runtime_for(&owner, source_id).is_none());
+        remove_session(&owner).await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuation_rejects_unavailable_scope_and_nonquiescent_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), "continuation-boundary", true);
+        let store = TaskStore::new(state.path().join("tasks"));
+        let missing_binary = state.path().join("must-not-start");
+        let source_id = Uuid::new_v4();
+        let args = json!({"operation_id":Uuid::new_v4(),"task":"follow up","model":"gpt-5.6-luna","effort":"high","continuation":{"type":"previous_task","task_id":source_id}});
+        assert!(
+            task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_SOURCE_UNAVAILABLE")
+        );
+        let mut source = task_record(
+            &owner,
+            source_id,
+            TaskStatus::Running,
+            1,
+            Some("thread"),
+            Some("turn"),
+        );
+        store.save(&source).unwrap();
+        assert!(
+            task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_NOT_QUIESCENT")
+        );
+        source.status = TaskStatus::Completed;
+        source.thread_id = None;
+        store.save(&source).unwrap();
+        assert!(
+            task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_UNAVAILABLE")
+        );
+        source.thread_id = Some("thread".to_owned());
+        source.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "steer".to_owned(),
+            phase: OperationPhase::Accepted,
+            outcome: source.outcome(),
+        });
+        store.save(&source).unwrap();
+        assert!(
+            task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_NOT_QUIESCENT")
+        );
+        source.operations.clear();
+        store.save(&source).unwrap();
+        let other_session = session(workspace.path(), "other-instance", true);
+        assert!(
+            task_start_with_store_and_binary(&args, &other_session, &store, &missing_binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("CODEX_CONTINUATION_SOURCE_UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn generated_crash_claim_acceptance_matches_single_successor_model() -> noprop::TestResult {
+        crate::test_support::run(0x4343_315f_434c_4149, 128, |ctx| {
+            let workspace = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let owner = session(workspace.path(), "claim-property", true);
+            let store = TaskStore::new(state.path().join("tasks"));
+            let source_id = Uuid::new_v4();
+            let winner_id = Uuid::new_v4();
+            let winner_fingerprint = Uuid::new_v4();
+            let case = noprop::sample_u8(ctx) % 3;
+            let in_flight = noprop::sample_u8(ctx).is_multiple_of(2);
+            let mut source = task_record(
+                &owner,
+                source_id,
+                TaskStatus::Completed,
+                2,
+                Some("thread"),
+                Some("turn"),
+            );
+            source.continued_by_task_id = Some(winner_id);
+            source.continued_by_request_fingerprint = Some(winner_fingerprint);
+            if in_flight {
+                source.operations.push(OperationReceipt {
+                    operation_id: Uuid::new_v4(),
+                    request_fingerprint: Uuid::new_v4(),
+                    action: "control".to_owned(),
+                    phase: OperationPhase::Accepted,
+                    outcome: source.outcome(),
+                });
+            }
+            store.save(&source).unwrap();
+            let candidate_id = if case == 2 { Uuid::new_v4() } else { winner_id };
+            let candidate_fingerprint = if case == 1 {
+                Uuid::new_v4()
+            } else {
+                winner_fingerprint
+            };
+            let mut candidate =
+                task_record(&owner, candidate_id, TaskStatus::Accepted, 1, None, None);
+            candidate.continued_from_task_id = Some(source_id);
+            candidate.operations.push(OperationReceipt {
+                operation_id: Uuid::new_v4(),
+                request_fingerprint: candidate_fingerprint,
+                action: "start".to_owned(),
+                phase: OperationPhase::Accepted,
+                outcome: candidate.outcome(),
+            });
+            let accepted = store.accept_start(&owner, candidate).is_ok();
+            assert_eq!(accepted, !in_flight && case == 0);
+            assert_eq!(
+                store.load(&owner, source_id).unwrap().continued_by_task_id,
+                Some(winner_id)
+            );
+            Ok(())
+        })
     }
 }

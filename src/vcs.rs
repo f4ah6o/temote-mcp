@@ -196,6 +196,24 @@ struct SnapshotReceipt {
     before: Option<JujutsuState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<SnapshotResult>,
+    #[serde(default)]
+    observation_pending: bool,
+    #[serde(default)]
+    observation_base_revision: Option<u64>,
+    #[serde(default)]
+    delegated: bool,
+}
+
+/// The bounded, typed result of a server-owned delegated jj snapshot task.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DelegatedSnapshotReport {
+    pub operation_id: Uuid,
+    pub task_id: String,
+    pub workspace_id: String,
+    pub execution_id: Option<String>,
+    pub before: JujutsuState,
+    pub after: JujutsuState,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -303,14 +321,149 @@ impl CommandRunner for SystemCommandRunner {
 }
 
 pub(crate) trait VcsObservationSink: Send + Sync {
-    fn record(&self, observation: &VcsSnapshotObserved);
+    fn checkpoint(&self) -> VcsResult<Option<u64>> {
+        Ok(None)
+    }
+    fn record(
+        &self,
+        observation: &VcsSnapshotObserved,
+        base_revision: Option<u64>,
+    ) -> VcsResult<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NoopObservationSink;
 
 impl VcsObservationSink for NoopObservationSink {
-    fn record(&self, _observation: &VcsSnapshotObserved) {}
+    fn record(
+        &self,
+        _observation: &VcsSnapshotObserved,
+        _base_revision: Option<u64>,
+    ) -> VcsResult<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct JournalVcsObservationSink {
+    session: crate::config::Session,
+    store: crate::observation::ObservationStore,
+}
+
+impl JournalVcsObservationSink {
+    pub(crate) fn new(session: crate::config::Session) -> VcsResult<Self> {
+        let store = crate::observation::ObservationStore::default_store().map_err(|e| {
+            VcsError::new(
+                VcsErrorCode::Io,
+                format!("open VCS observation journal: {e}"),
+            )
+        })?;
+        Ok(Self { session, store })
+    }
+}
+
+impl VcsObservationSink for JournalVcsObservationSink {
+    fn checkpoint(&self) -> VcsResult<Option<u64>> {
+        let status = self.store.status(&self.session.id).map_err(|e| {
+            VcsError::new(
+                VcsErrorCode::Io,
+                format!("read VCS observation checkpoint: {e}"),
+            )
+        })?;
+        Ok(Some(status.base_revision))
+    }
+
+    fn record(&self, event: &VcsSnapshotObserved, base_revision: Option<u64>) -> VcsResult<()> {
+        use crate::observation::{
+            ActorRef, OBSERVATION_SCHEMA_VERSION, Observation, ObservationContent, ObservationKind,
+            Provenance, SessionInstanceRef, StateRef, TargetRef,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| VcsError::new(VcsErrorCode::Io, format!("observation clock: {e}")))?
+            .as_secs();
+        let observation = Observation {
+            id: event.operation_id,
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            observed_at: now,
+            accepted_at: None,
+            session_id: self.session.id.clone(),
+            session_instance: SessionInstanceRef {
+                started_at: self.session.started_at,
+                process_id: self.session.process_id,
+            },
+            repository: crate::observation::repository_label(&self.session),
+            repository_key: crate::observation::repository::repository_key_for_workspace(
+                &self.session.cwd,
+            ),
+            workspace_id: Some(event.workspace_id.clone()),
+            task_id: event.task_id.clone(),
+            execution_id: event.execution_id.clone(),
+            operation_id: Some(event.operation_id.to_string()),
+            actor: ActorRef {
+                transport: "vcs".into(),
+                principal: None,
+            },
+            target: TargetRef {
+                backend: "jujutsu".into(),
+            },
+            action: "vcs_snapshot".into(),
+            kind: ObservationKind::ExecutionState,
+            content: ObservationContent::View {
+                view: serde_json::json!({
+                    "logical_change_id": event.logical_change_id,
+                    "before_revision": event.before_revision,
+                    "after_revision": event.after_revision,
+                    "vcs_operation_id": event.vcs_operation_id,
+                    "conflicted": event.conflicted,
+                    "empty": event.empty,
+                }),
+            },
+            state_ref: Some(StateRef {
+                task_id: event.task_id.clone(),
+                ..StateRef::default()
+            }),
+            evidence_refs: Vec::new(),
+            provenance: Provenance {
+                tool: "vcs_snapshot".into(),
+                source: "vcs_receipt".into(),
+                control_action: None,
+            },
+            revision: 0,
+            dedupe_key: format!("vcs-snapshot:{}", event.operation_id),
+        };
+        if let Some(existing) = self
+            .store
+            .get(&self.session.id, event.operation_id)
+            .map_err(|e| VcsError::new(VcsErrorCode::Io, format!("read VCS observation: {e}")))?
+        {
+            if existing.dedupe_key == observation.dedupe_key
+                && existing.session_instance.started_at == observation.session_instance.started_at
+                && existing.session_instance.process_id == observation.session_instance.process_id
+                && existing.task_id == event.task_id
+                && existing.execution_id == event.execution_id
+                && existing.workspace_id == observation.workspace_id
+                && serde_json::to_value(&existing.content).ok()
+                    == serde_json::to_value(&observation.content).ok()
+            {
+                return Ok(());
+            }
+            return Err(VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "VCS observation identity conflict",
+            ));
+        }
+        let current_base = self.checkpoint()?.unwrap_or(0);
+        if base_revision.is_none_or(|base| current_base > base) {
+            return Err(VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "VCS journal retention crossed pending receipt; append uniqueness is unknown",
+            ));
+        }
+        self.store
+            .append(observation)
+            .map_err(|e| VcsError::new(VcsErrorCode::Io, format!("append VCS observation: {e}")))?;
+        Ok(())
+    }
 }
 
 pub(crate) struct VcsManager<R = SystemCommandRunner, S = NoopObservationSink> {
@@ -332,7 +485,27 @@ impl VcsManager<SystemCommandRunner, NoopObservationSink> {
     }
 }
 
+impl VcsManager<SystemCommandRunner, JournalVcsObservationSink> {
+    pub(crate) fn open_for_session(
+        repository_root: &Path,
+        managed_root: &Path,
+        session: &crate::config::Session,
+    ) -> VcsResult<Self> {
+        let sink = JournalVcsObservationSink::new(session.clone())?;
+        Self::with_observation_sink(repository_root, managed_root, SystemCommandRunner, sink)
+    }
+}
+
 impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
+    pub(crate) fn with_observation_sink(
+        repository_root: &Path,
+        managed_root: &Path,
+        runner: R,
+        sink: S,
+    ) -> VcsResult<Self> {
+        Self::with_components(repository_root, managed_root, runner, sink)
+    }
+
     fn with_components(
         repository_root: &Path,
         managed_root: &Path,
@@ -519,6 +692,301 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         self.inspect_record(&record)
     }
 
+    /// Index an already provisioned, marker-validated managed workspace for
+    /// task-correlated snapshots. This writes only VCS registry metadata; the
+    /// provisioning task remains the sole creator of the workspace.
+    pub(crate) fn register_provisioned_snapshot_workspace(
+        &self,
+        receipt: &crate::repository_store::ProvisioningReceipt,
+        task_id: &str,
+    ) -> VcsResult<()> {
+        if receipt.phase != crate::repository_store::ProvisioningPhase::WorkspaceReady {
+            return Err(VcsError::new(
+                VcsErrorCode::InvalidRequest,
+                "provisioned workspace is not ready",
+            ));
+        }
+        let root = receipt.canonical_root.as_deref().ok_or_else(|| {
+            VcsError::new(VcsErrorCode::InvalidRequest, "provisioned root is missing")
+        })?;
+        let observed_base =
+            crate::workspace_provisioning::inspect_ready(root, receipt).map_err(|error| {
+                VcsError::new(
+                    VcsErrorCode::WorkspaceConflict,
+                    format!("provisioned workspace marker invalid: {error}"),
+                )
+            })?;
+        let workspace_id = receipt.workspace_id.to_string();
+        validate_workspace_id(&workspace_id)?;
+        validate_correlation_id("task_id", task_id)?;
+        let base_revision = receipt.pinned_base.as_deref().ok_or_else(|| {
+            VcsError::new(
+                VcsErrorCode::InvalidRequest,
+                "provisioned workspace has no pinned base",
+            )
+        })?;
+        if observed_base != base_revision {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceConflict,
+                "provisioned pinned base differs from ready marker",
+            ));
+        }
+        validate_exact_revision(base_revision)?;
+        self.require_jj_repository()?;
+        let workspace_path = canonical_existing_directory(
+            &self.managed_root.join(&workspace_id),
+            "provisioned workspace",
+        )?;
+        ensure_descendant(&self.managed_root, &workspace_path, "provisioned workspace")?;
+        if workspace_path != self.repository_root {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceConflict,
+                "provisioned workspace differs from session repository root",
+            ));
+        }
+        let request = WorkspaceEnsureRequest {
+            workspace_id: workspace_id.clone(),
+            task_id: task_id.to_owned(),
+            backend: VcsBackendKind::Jujutsu,
+            base_revision: base_revision.to_owned(),
+        };
+        let fingerprint = workspace_fingerprint(&self.repository_root, &request);
+        let _lock = self.acquire_store_lock()?;
+        let path = self.workspace_record_path(&workspace_id);
+        if path.exists() {
+            let existing: WorkspaceRecord = read_json_record(&path)?;
+            validate_workspace_record(&existing, &self.repository_root, &self.managed_root)?;
+            if existing.request_fingerprint != fingerprint || existing.path != workspace_path {
+                return Err(VcsError::new(
+                    VcsErrorCode::WorkspaceConflict,
+                    "provisioned workspace registry identity conflict",
+                ));
+            }
+            return Ok(());
+        }
+        write_json_atomic(
+            &path,
+            &WorkspaceRecord {
+                schema_version: SCHEMA_VERSION,
+                request_fingerprint: fingerprint,
+                repository_root: self.repository_root.clone(),
+                workspace_id,
+                task_id: Some(task_id.to_owned()),
+                backend: VcsBackendKind::Jujutsu,
+                path: workspace_path,
+                base_revision: base_revision.to_owned(),
+            },
+        )
+    }
+
+    /// Reserve exactly one delegated snapshot. The Accepted receipt is durable
+    /// before the caller starts a helper; an exact retry must read its retained
+    /// task and must never dispatch a second helper.
+    pub(crate) fn reserve_delegated_snapshot(
+        &self,
+        workspace_id: &str,
+        operation_id: Uuid,
+        execution_id: Option<&str>,
+    ) -> VcsResult<bool> {
+        validate_workspace_id(workspace_id)?;
+        if let Some(id) = execution_id {
+            validate_correlation_id("execution_id", id)?;
+        }
+        let _lock = self.acquire_store_lock()?;
+        let path = self.operation_receipt_path(operation_id);
+        let fingerprint = snapshot_fingerprint(workspace_id, execution_id);
+        if path.exists() {
+            let receipt: SnapshotReceipt = read_json_record(&path)?;
+            validate_receipt(&receipt, operation_id)?;
+            if receipt.request_fingerprint != fingerprint
+                || receipt.execution_id.as_deref() != execution_id
+                || !receipt.delegated
+            {
+                return Err(VcsError::new(
+                    VcsErrorCode::OperationConflict,
+                    "delegated snapshot operation correlation changed",
+                ));
+            }
+            return Ok(false);
+        }
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(self.store_root.join(OPERATIONS_DIR))
+            .map_err(|e| VcsError::new(VcsErrorCode::Io, format!("list VCS receipts: {e}")))?
+        {
+            let entry = entry.map_err(|e| {
+                VcsError::new(VcsErrorCode::Io, format!("read VCS receipt entry: {e}"))
+            })?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            scanned += 1;
+            if scanned > 4096 {
+                return Err(VcsError::new(
+                    VcsErrorCode::ReconciliationRequired,
+                    "VCS receipt scan exceeds bound",
+                ));
+            }
+            let other: SnapshotReceipt = read_json_record(&entry.path())?;
+            let belongs = other.request_fingerprint
+                == snapshot_fingerprint(workspace_id, other.execution_id.as_deref())
+                || other.request_fingerprint == legacy_snapshot_fingerprint(workspace_id);
+            if belongs && (other.state == ReceiptState::Accepted || other.observation_pending) {
+                return Err(VcsError::new(
+                    VcsErrorCode::ReconciliationRequired,
+                    "workspace has another pending VCS receipt",
+                ));
+            }
+        }
+        let record: WorkspaceRecord = read_json_record(&self.workspace_record_path(workspace_id))?;
+        validate_workspace_record(&record, &self.repository_root, &self.managed_root)?;
+        if record.workspace_id != workspace_id
+            || record.task_id.is_none()
+            || record.backend != VcsBackendKind::Jujutsu
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceConflict,
+                "delegated snapshot workspace is not task-bound jj",
+            ));
+        }
+        write_json_atomic(
+            &path,
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: fingerprint,
+                state: ReceiptState::Accepted,
+                task_id: record.task_id,
+                execution_id: execution_id.map(str::to_owned),
+                before: None,
+                result: None,
+                observation_pending: false,
+                observation_base_revision: self.observation_sink.checkpoint()?,
+                delegated: true,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Import only a completed native report from the retained helper task.
+    /// This path performs metadata I/O and observation append, never jj I/O.
+    pub(crate) fn import_delegated_snapshot(
+        &self,
+        workspace_id: &str,
+        operation_id: Uuid,
+        execution_id: Option<&str>,
+        report: &DelegatedSnapshotReport,
+    ) -> VcsResult<SnapshotResult> {
+        let _lock = self.acquire_store_lock()?;
+        let path = self.operation_receipt_path(operation_id);
+        let mut receipt: SnapshotReceipt = read_json_record(&path)?;
+        validate_receipt(&receipt, operation_id)?;
+        if receipt.request_fingerprint != snapshot_fingerprint(workspace_id, execution_id)
+            || receipt.execution_id.as_deref() != execution_id
+            || !receipt.delegated
+            || receipt.task_id.as_deref() != Some(report.task_id.as_str())
+            || report.operation_id != operation_id
+            || report.workspace_id != workspace_id
+            || report.execution_id.as_deref() != execution_id
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::OperationConflict,
+                "delegated snapshot report correlation mismatch",
+            ));
+        }
+        let record: WorkspaceRecord = read_json_record(&self.workspace_record_path(workspace_id))?;
+        validate_workspace_record(&record, &self.repository_root, &self.managed_root)?;
+        if record.workspace_id != workspace_id
+            || record.task_id != receipt.task_id
+            || record.backend != VcsBackendKind::Jujutsu
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceConflict,
+                "delegated snapshot registry correlation changed",
+            ));
+        }
+        validate_delegated_state(&report.before)?;
+        validate_delegated_state(&report.after)?;
+        if report.before.logical_change_id != report.after.logical_change_id
+            || report.after.conflicted
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::InvalidBackendOutput,
+                "delegated snapshot changed logical identity or is conflicted",
+            ));
+        }
+        if receipt.state == ReceiptState::Completed {
+            self.flush_observation(&path, &mut receipt)?;
+            let mut result = receipt.result.ok_or_else(|| {
+                VcsError::new(
+                    VcsErrorCode::InvalidBackendOutput,
+                    "completed snapshot result missing",
+                )
+            })?;
+            if result.before != report.before || result.after != report.after {
+                return Err(VcsError::new(
+                    VcsErrorCode::OperationConflict,
+                    "delegated snapshot result changed",
+                ));
+            }
+            result.replayed = true;
+            return Ok(result);
+        }
+        let observation = VcsSnapshotObserved {
+            operation_id,
+            workspace_id: workspace_id.to_owned(),
+            task_id: receipt.task_id.clone(),
+            execution_id: receipt.execution_id.clone(),
+            backend: record.backend,
+            logical_change_id: report.after.logical_change_id.clone(),
+            before_revision: report.before.materialized_revision.clone(),
+            after_revision: report.after.materialized_revision.clone(),
+            vcs_operation_id: report.after.vcs_operation_id.clone(),
+            conflicted: report.after.conflicted,
+            empty: report.after.empty,
+        };
+        let result = SnapshotResult {
+            operation_id,
+            replayed: false,
+            reconciled: false,
+            before: report.before.clone(),
+            after: report.after.clone(),
+            observation,
+        };
+        receipt.state = ReceiptState::Completed;
+        receipt.result = Some(result.clone());
+        receipt.observation_pending = true;
+        write_json_atomic(&path, &receipt)?;
+        self.flush_observation(&path, &mut receipt)?;
+        Ok(result)
+    }
+
+    /// Replay a completed delegated receipt and flush its observation outbox.
+    pub(crate) fn delegated_snapshot_result(
+        &self,
+        workspace_id: &str,
+        operation_id: Uuid,
+        execution_id: Option<&str>,
+    ) -> VcsResult<Option<SnapshotResult>> {
+        let _lock = self.acquire_store_lock()?;
+        let path = self.operation_receipt_path(operation_id);
+        let mut receipt: SnapshotReceipt = read_json_record(&path)?;
+        validate_receipt(&receipt, operation_id)?;
+        if receipt.request_fingerprint != snapshot_fingerprint(workspace_id, execution_id)
+            || receipt.execution_id.as_deref() != execution_id
+            || !receipt.delegated
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::OperationConflict,
+                "delegated snapshot receipt correlation mismatch",
+            ));
+        }
+        self.flush_observation(&path, &mut receipt)?;
+        Ok(receipt.result.map(|mut result| {
+            result.replayed = true;
+            result
+        }))
+    }
+
     pub(crate) fn snapshot(
         &self,
         workspace_id: &str,
@@ -534,7 +1002,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         let _lock = self.acquire_store_lock()?;
 
         if receipt_path.exists() {
-            let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
+            let mut receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
             validate_receipt(&receipt, operation_id)?;
             let expected_fingerprint =
                 if receipt.task_id.is_none() && receipt.execution_id.is_none() {
@@ -554,6 +1022,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
                     "operation_id was already accepted for a different VCS snapshot request",
                 ));
             }
+            self.flush_observation(&receipt_path, &mut receipt)?;
             return match (receipt.state, receipt.result) {
                 (ReceiptState::Completed, Some(mut result)) => {
                     result.replayed = true;
@@ -590,6 +1059,9 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             execution_id: execution_id.map(str::to_owned),
             before: Some(before.clone()),
             result: None,
+            observation_pending: false,
+            observation_base_revision: self.observation_sink.checkpoint()?,
+            delegated: false,
         };
         write_json_atomic(&receipt_path, &accepted)?;
 
@@ -621,7 +1093,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             after,
             observation: observation.clone(),
         };
-        let completed = SnapshotReceipt {
+        let mut completed = SnapshotReceipt {
             schema_version: SCHEMA_VERSION,
             operation_id,
             request_fingerprint,
@@ -630,9 +1102,12 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             execution_id: execution_id.map(str::to_owned),
             before: None,
             result: Some(result.clone()),
+            observation_pending: true,
+            observation_base_revision: accepted.observation_base_revision,
+            delegated: false,
         };
         write_json_atomic(&receipt_path, &completed)?;
-        self.observation_sink.record(&observation);
+        self.flush_observation(&receipt_path, &mut completed)?;
         Ok(result)
     }
 
@@ -652,7 +1127,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             ));
         }
 
-        let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
+        let mut receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
         validate_receipt(&receipt, operation_id)?;
         let request_fingerprint = if receipt.task_id.is_none() && receipt.execution_id.is_none() {
             legacy_snapshot_fingerprint(workspace_id)
@@ -666,6 +1141,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             ));
         }
 
+        self.flush_observation(&receipt_path, &mut receipt)?;
         if let (ReceiptState::Completed, Some(mut result)) = (receipt.state, receipt.result.clone())
         {
             result.replayed = true;
@@ -714,6 +1190,39 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
                 "accepted VCS snapshot has no durable state transition to attribute; refusing to replay jj status because later filesystem edits could be folded into the old operation",
             ));
         }
+        let operations = self.run_checked(
+            "jj",
+            &strings(&[
+                "--at-op=@",
+                "--ignore-working-copy",
+                "--color=never",
+                "--no-pager",
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                "2",
+                "-T",
+                JJ_OPERATION_TEMPLATE,
+            ]),
+            Some(&record.path),
+            "inspect jj operation ancestry for snapshot reconciliation",
+        )?;
+        let recent = operations
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if recent.len() != 2
+            || recent[0] != after.vcs_operation_id
+            || recent[1] != before.vcs_operation_id
+        {
+            return Err(VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "accepted VCS snapshot crossed ambiguous jj operations; exact result cannot be attributed",
+            ));
+        }
 
         let observation = VcsSnapshotObserved {
             operation_id,
@@ -736,7 +1245,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             after,
             observation: observation.clone(),
         };
-        let completed = SnapshotReceipt {
+        let mut completed = SnapshotReceipt {
             schema_version: SCHEMA_VERSION,
             operation_id,
             request_fingerprint,
@@ -745,10 +1254,67 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             execution_id: receipt.execution_id,
             before: None,
             result: Some(result.clone()),
+            observation_pending: true,
+            observation_base_revision: receipt.observation_base_revision,
+            delegated: false,
         };
         write_json_atomic(&receipt_path, &completed)?;
-        self.observation_sink.record(&observation);
+        self.flush_observation(&receipt_path, &mut completed)?;
         Ok(result)
+    }
+
+    fn flush_observation(&self, path: &Path, receipt: &mut SnapshotReceipt) -> VcsResult<()> {
+        if !receipt.observation_pending {
+            return Ok(());
+        }
+        let event = &receipt
+            .result
+            .as_ref()
+            .ok_or_else(|| {
+                VcsError::new(
+                    VcsErrorCode::InvalidBackendOutput,
+                    "pending VCS observation has no completed result",
+                )
+            })?
+            .observation;
+        self.observation_sink
+            .record(event, receipt.observation_base_revision)?;
+        receipt.observation_pending = false;
+        write_json_atomic(path, receipt)
+    }
+
+    pub(crate) fn workspace_has_unreconciled_snapshots(
+        &self,
+        workspace_id: &str,
+    ) -> VcsResult<bool> {
+        validate_workspace_id(workspace_id)?;
+        let _lock = self.acquire_store_lock()?;
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(self.store_root.join(OPERATIONS_DIR))
+            .map_err(|e| VcsError::new(VcsErrorCode::Io, format!("list VCS receipts: {e}")))?
+        {
+            let entry = entry.map_err(|e| {
+                VcsError::new(VcsErrorCode::Io, format!("read VCS receipt entry: {e}"))
+            })?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            scanned += 1;
+            if scanned > 4096 {
+                return Err(VcsError::new(
+                    VcsErrorCode::ReconciliationRequired,
+                    "VCS receipt scan exceeds bound",
+                ));
+            }
+            let receipt: SnapshotReceipt = read_json_record(&entry.path())?;
+            let belongs = receipt.request_fingerprint
+                == snapshot_fingerprint(workspace_id, receipt.execution_id.as_deref())
+                || receipt.request_fingerprint == legacy_snapshot_fingerprint(workspace_id);
+            if belongs && (receipt.state == ReceiptState::Accepted || receipt.observation_pending) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn require_backend(&self, backend: VcsBackendKind) -> VcsResult<()> {
@@ -1079,6 +1645,20 @@ fn validate_exact_revision(revision: &str) -> VcsResult<()> {
     }
 }
 
+fn validate_delegated_state(state: &JujutsuState) -> VcsResult<()> {
+    validate_exact_revision(&state.materialized_revision)?;
+    let valid = |s: &str| {
+        !s.is_empty() && s.len() <= 128 && s.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    };
+    if !valid(&state.logical_change_id) || !valid(&state.vcs_operation_id) {
+        return Err(VcsError::new(
+            VcsErrorCode::InvalidBackendOutput,
+            "delegated jj identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
 fn workspace_fingerprint(repository_root: &Path, request: &WorkspaceEnsureRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"temote-vcs-workspace-v1\0");
@@ -1316,6 +1896,7 @@ mod tests {
         jj_available: bool,
         revisions: VecDeque<(String, String, bool, bool)>,
         operations: VecDeque<String>,
+        seen_operations: Vec<String>,
         workspace_adds: usize,
         status_calls: usize,
     }
@@ -1330,6 +1911,7 @@ mod tests {
                         ("change-a".into(), "a".repeat(40), false, false),
                     ]),
                     operations: VecDeque::from(["op-a".into(), "op-a".into()]),
+                    seen_operations: Vec::new(),
                     workspace_adds: 0,
                     status_calls: 0,
                 })),
@@ -1395,10 +1977,21 @@ mod tests {
                 )));
             }
             if program == "jj" && args.last().is_some_and(|v| v == JJ_OPERATION_TEMPLATE) {
+                if words.contains(&"--at-op=@") {
+                    let recent = state
+                        .seen_operations
+                        .iter()
+                        .rev()
+                        .take(2)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return Ok(success(&format!("{}\n", recent.join("\n"))));
+                }
                 let operation = state
                     .operations
                     .pop_front()
                     .unwrap_or_else(|| "op-a".into());
+                state.seen_operations.push(operation.clone());
                 return Ok(success(&format!("{operation}\n")));
             }
             if program == "jj" && words.contains(&"status") {
@@ -1413,8 +2006,32 @@ mod tests {
     struct RecordingSink(Arc<Mutex<Vec<VcsSnapshotObserved>>>);
 
     impl VcsObservationSink for RecordingSink {
-        fn record(&self, observation: &VcsSnapshotObserved) {
+        fn record(
+            &self,
+            observation: &VcsSnapshotObserved,
+            _base_revision: Option<u64>,
+        ) -> VcsResult<()> {
             self.0.lock().unwrap().push(observation.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailOnceSink {
+        failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        recorded: RecordingSink,
+    }
+
+    impl VcsObservationSink for FailOnceSink {
+        fn record(
+            &self,
+            observation: &VcsSnapshotObserved,
+            base_revision: Option<u64>,
+        ) -> VcsResult<()> {
+            if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(VcsError::new(VcsErrorCode::Io, "injected journal failure"));
+            }
+            self.recorded.record(observation, base_revision)
         }
     }
 
@@ -1462,6 +2079,161 @@ mod tests {
             stderr: String::new(),
             success: true,
         }
+    }
+
+    #[test]
+    fn delegated_receipt_imports_once_without_running_jj_and_replays_observation() {
+        let fixture = Fixture::new();
+        let runner = MockRunner::new();
+        let sink = RecordingSink::default();
+        let manager = manager(&fixture, runner.clone(), sink.clone());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+        let operation = Uuid::new_v4();
+        let report = DelegatedSnapshotReport {
+            operation_id: operation,
+            task_id: "task-for-task-a".into(),
+            workspace_id: "task-a".into(),
+            execution_id: Some("exec-a".into()),
+            before: JujutsuState {
+                logical_change_id: "changea".into(),
+                materialized_revision: "a".repeat(40),
+                vcs_operation_id: "opa".into(),
+                conflicted: false,
+                empty: false,
+            },
+            after: JujutsuState {
+                logical_change_id: "changea".into(),
+                materialized_revision: "b".repeat(40),
+                vcs_operation_id: "opb".into(),
+                conflicted: false,
+                empty: false,
+            },
+        };
+        let before_calls = runner.state.lock().unwrap().status_calls;
+        assert!(
+            manager
+                .reserve_delegated_snapshot("task-a", operation, Some("exec-a"))
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .reserve_delegated_snapshot("task-a", operation, Some("exec-a"))
+                .unwrap()
+        );
+        assert!(
+            manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+        assert!(
+            manager
+                .delegated_snapshot_result("task-a", operation, Some("exec-a"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .import_delegated_snapshot("task-a", operation, Some("exec-b"), &report)
+                .unwrap_err()
+                .code,
+            VcsErrorCode::OperationConflict
+        );
+        assert_eq!(
+            manager
+                .import_delegated_snapshot("task-a", operation, Some("exec-a"), &report)
+                .unwrap()
+                .after
+                .materialized_revision,
+            "b".repeat(40)
+        );
+        assert!(
+            manager
+                .import_delegated_snapshot("task-a", operation, Some("exec-a"), &report)
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(runner.state.lock().unwrap().status_calls, before_calls);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(
+            !manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn delegated_observation_fault_keeps_workspace_fenced_until_exact_replay() {
+        let fixture = Fixture::new();
+        let runner = MockRunner::new();
+        let sink = FailOnceSink::default();
+        let manager = VcsManager::with_observation_sink(
+            &fixture.repository,
+            &fixture.managed,
+            runner.clone(),
+            sink.clone(),
+        )
+        .unwrap();
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+        let operation = Uuid::new_v4();
+        let before_calls = runner.state.lock().unwrap().status_calls;
+        assert!(
+            manager
+                .reserve_delegated_snapshot("task-a", operation, Some("exec-a"))
+                .unwrap()
+        );
+        let report = DelegatedSnapshotReport {
+            operation_id: operation,
+            task_id: "task-for-task-a".into(),
+            workspace_id: "task-a".into(),
+            execution_id: Some("exec-a".into()),
+            before: JujutsuState {
+                logical_change_id: "changea".into(),
+                materialized_revision: "a".repeat(40),
+                vcs_operation_id: "opa".into(),
+                conflicted: false,
+                empty: false,
+            },
+            after: JujutsuState {
+                logical_change_id: "changea".into(),
+                materialized_revision: "b".repeat(40),
+                vcs_operation_id: "opb".into(),
+                conflicted: false,
+                empty: false,
+            },
+        };
+        assert_eq!(
+            manager
+                .import_delegated_snapshot("task-a", operation, Some("exec-a"), &report)
+                .unwrap_err()
+                .code,
+            VcsErrorCode::Io
+        );
+        assert!(
+            manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+        assert_eq!(
+            manager
+                .reserve_delegated_snapshot("task-a", Uuid::new_v4(), Some("exec-a"))
+                .unwrap_err()
+                .code,
+            VcsErrorCode::ReconciliationRequired
+        );
+        assert!(
+            manager
+                .delegated_snapshot_result("task-a", operation, Some("exec-a"))
+                .unwrap()
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            !manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+        assert_eq!(sink.recorded.0.lock().unwrap().len(), 1);
+        assert_eq!(runner.state.lock().unwrap().status_calls, before_calls);
     }
 
     #[test]
@@ -1589,6 +2361,55 @@ mod tests {
     }
 
     #[test]
+    fn completed_snapshot_replays_pending_observation_without_second_status() {
+        let fixture = Fixture::new();
+        let runner = MockRunner::new();
+        let sink = FailOnceSink::default();
+        let manager = VcsManager::with_observation_sink(
+            &fixture.repository,
+            &fixture.managed,
+            runner.clone(),
+            sink.clone(),
+        )
+        .unwrap();
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+        let operation = Uuid::new_v4();
+        assert_eq!(
+            manager
+                .snapshot("task-a", operation, Some("exec-a"))
+                .unwrap_err()
+                .code,
+            VcsErrorCode::Io
+        );
+        let receipt: SnapshotReceipt =
+            read_json_record(&manager.operation_receipt_path(operation)).unwrap();
+        assert_eq!(receipt.state, ReceiptState::Completed);
+        assert!(receipt.observation_pending);
+        assert!(
+            manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+        assert_eq!(runner.state.lock().unwrap().status_calls, 1);
+        assert!(
+            manager
+                .snapshot("task-a", operation, Some("exec-a"))
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(runner.state.lock().unwrap().status_calls, 1);
+        assert_eq!(sink.recorded.0.lock().unwrap().len(), 1);
+        let receipt: SnapshotReceipt =
+            read_json_record(&manager.operation_receipt_path(operation)).unwrap();
+        assert!(!receipt.observation_pending);
+        assert!(
+            !manager
+                .workspace_has_unreconciled_snapshots("task-a")
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn accepted_receipt_requires_reconciliation_instead_of_replay() {
         let fixture = Fixture::new();
         let runner = MockRunner::new();
@@ -1606,6 +2427,9 @@ mod tests {
                 execution_id: Some("exec-a".into()),
                 before: Some(manager.inspect("task-a").unwrap().jj),
                 result: None,
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
             },
         )
         .unwrap();
@@ -1654,6 +2478,9 @@ mod tests {
                     empty: false,
                 }),
                 result: None,
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
             },
         )
         .unwrap();
@@ -1670,6 +2497,54 @@ mod tests {
         assert!(replay.replayed);
         assert!(replay.reconciled);
         assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_refuses_intervening_jj_operation() {
+        let fixture = Fixture::new();
+        let runner = MockRunner::new().with_revisions(
+            [
+                ("change-a".into(), "a".repeat(40), false, false),
+                ("change-a".into(), "b".repeat(40), false, false),
+                ("change-a".into(), "c".repeat(40), false, false),
+            ],
+            ["op-a".into(), "op-b".into(), "op-c".into()],
+        );
+        let manager = manager(&fixture, runner.clone(), RecordingSink::default());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+        let operation_id = Uuid::new_v4();
+        write_json_atomic(
+            &manager.operation_receipt_path(operation_id),
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
+                state: ReceiptState::Accepted,
+                task_id: Some("task-for-task-a".into()),
+                execution_id: Some("exec-a".into()),
+                before: Some(JujutsuState {
+                    logical_change_id: "change-a".into(),
+                    materialized_revision: "a".repeat(40),
+                    vcs_operation_id: "op-a".into(),
+                    conflicted: false,
+                    empty: false,
+                }),
+                result: None,
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
+            },
+        )
+        .unwrap();
+        manager.inspect("task-a").unwrap(); // unrelated later operation
+        assert_eq!(
+            manager
+                .reconcile_snapshot("task-a", operation_id)
+                .unwrap_err()
+                .code,
+            VcsErrorCode::ReconciliationRequired
+        );
+        assert_eq!(runner.state.lock().unwrap().status_calls, 0);
     }
 
     #[test]
@@ -1701,6 +2576,9 @@ mod tests {
                     empty: false,
                 }),
                 result: None,
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
             },
         )
         .unwrap();
@@ -1736,6 +2614,9 @@ mod tests {
                 execution_id: None,
                 before: None,
                 result: None,
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
             },
         )
         .unwrap();
@@ -1786,6 +2667,9 @@ mod tests {
                 execution_id: None,
                 before: None,
                 result: Some(result),
+                observation_pending: false,
+                observation_base_revision: None,
+                delegated: false,
             },
         )
         .unwrap();

@@ -16,6 +16,14 @@ pub const SENSITIVE_ENV_NAMES: &[&str] = &[
     "TEMOTE_MCP_GATEWAY_HOST_TOKEN",
     "TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID",
     "TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET",
+    "TEMOTE_MCP_EVENTS_SENDER_BEARER",
+    "HOST_TOKENS_JSON",
+    "HOST_TOKEN",
+    "CLIENT_TOKEN",
+    "EVENT_SENDER_BEARER",
+    "EVENT_SENDER_ACCESS_CLIENT_ID",
+    "EVENT_SENDER_ACCESS_CLIENT_SECRET",
+    "FABRIC_INTERACTION_SECRET",
     "KINTONE_USERNAME",
     "KINTONE_PASSWORD",
     "KINTONE_API_TOKEN",
@@ -27,7 +35,9 @@ pub const SENSITIVE_ENV_NAMES: &[&str] = &[
 pub fn scrub_sensitive(command: &mut Command, keep: &[&str]) {
     for name in SENSITIVE_ENV_NAMES {
         if !keep.contains(name) {
-            command.env_remove(name);
+            for alias in temote_mcp::environment::names(std::ffi::OsStr::new(name)) {
+                command.env_remove(alias);
+            }
         }
     }
 }
@@ -58,7 +68,9 @@ mod tests {
             };
             let mut command = Command::new("child");
             for name in SENSITIVE_ENV_NAMES {
-                command.env(name, "sentinel");
+                for alias in temote_mcp::environment::names(OsStr::new(name)) {
+                    command.env(alias, "sentinel");
+                }
             }
             let keep_values = keep.into_iter().collect::<Vec<_>>();
             scrub_sensitive(&mut command, &keep_values);
@@ -68,11 +80,13 @@ mod tests {
                 } else {
                     Some(None)
                 };
-                assert_eq!(
-                    env_value(&command, name),
-                    expected,
-                    "name={name} keep={keep:?}"
-                );
+                for alias in temote_mcp::environment::names(OsStr::new(name)) {
+                    assert_eq!(
+                        env_value(&command, alias.to_str().unwrap()),
+                        expected,
+                        "name={alias:?} keep={keep:?}"
+                    );
+                }
             }
             Ok(())
         })

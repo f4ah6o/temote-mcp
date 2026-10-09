@@ -2,137 +2,54 @@
 
 [日本語](README.ja.md)
 
-Temote MCP lets a local coding agent operate the machine inside explicit, sandboxed, approval-aware sessions: work is delegated through task backends (Codex app-server, `opencode serve`, Devin ACP, the Devin Cloud API, or the structured local-agent broker) and read back as bounded evidence.
+Temote MCP delegates local-machine work to coding agents through explicit, sandboxed sessions. Codex app-server, OpenCode serve, Devin ACP, and Devin Cloud share retained tasks, typed controls, and bounded evidence. Temote Fabric connects multiple Hosts through one authenticated MCP endpoint.
 
 ## Install
 
-Prebuilt binaries are available through `cargo-binstall`:
+Build the current source with Rust:
 
 ```sh
-cargo binstall temote-mcp
-temote-mcp doctor
+cargo install --path . --locked
+temote doctor
 ```
 
-To build from source instead:
+[Prebuilt releases](https://github.com/f4ah6o/temote-mcp/releases) are also available through `cargo-binstall`. Existing releases keep the `temote-mcp` package name until the next CalVer release; after that, install `temote` with `cargo binstall temote` or pin the matching release with `cargo binstall temote@<version>`. This source uses canonical package and command `temote`, with `temote-mcp` retained as an executable compatibility alias. See [migration](docs/naming-migration.md).
+
+## First session
+
+Configure a named root in the supervisor's launch environment, then start inside it:
 
 ```sh
-cargo install temote-mcp --locked
+export TEMOTE_ROOTS='src=~/src'
+cd ~/src/your-project
+temote start work
 ```
 
-When replacing a legacy `just up` deployment, install the new binary first, inspect the migration, apply it, and then start the current supervisor:
+New sessions use `agent` permission mode and require a configured named root. Set roots before the supervisor starts; an existing supervisor keeps its configured roots. Delegated tasks remain restricted to the session's canonical scope. Use `--yolo` only when you intentionally want to remove Temote's local boundaries.
+
+Install the bundled Codex plugin:
 
 ```sh
-cargo binstall temote-mcp --force
-temote-mcp migrate --dry-run
-temote-mcp migrate
-temote-mcp up --profile cloudflare
+temote codex plugin install
 ```
 
-`migrate` handles both legacy runtime ownership and compatible legacy Cloudflare configuration. It never overwrites an existing `public.env` or a different existing Tunnel token, copies only supported Temote Cloudflare/runtime keys from checkout-local `.env`, and does not stop independently started local sessions. `temote-mcp up --profile cloudflare` can also bootstrap the compatible configuration migration when the destination is still missing.
-
-On macOS, the canonical default is `~/.config/temote-mcp/public.env`. A file left at the previous accidental `~/Library/Application Support/temote-mcp/public.env` location is recognized as a migration source. Linux continues to use its normal config directory semantics, and `TEMOTE_MCP_ENV_FILE` remains the explicit override.
-
-Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
-
-## Start sessions
-
-For an always-on host, configure a named root, run one lifecycle supervisor, then start the HTTP ingress separately:
-
-```sh
-# Example host layout:
-# ~/src -> /Volumes/devstorage/Developer
-export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp supervisor
-
-# From another terminal/service. Existing deployments default to Cloudflare.
-temote-mcp up --profile cloudflare
-# Or use Tailscale Funnel + Temote local OAuth:
-# temote-mcp up --profile tailscale
-# Or bootstrap and use an outbound-only OpenAI Secure MCP Tunnel.
-# Both commands prompt for the required API key without terminal echo when the
-# corresponding environment variable is absent:
-# temote-mcp openai setup --workspace-id <workspace-id>
-# temote-mcp up --profile openai
-```
-
-After replacing the installed binary, apply it to session ownership explicitly:
-
-```sh
-temote-mcp upgrade --dry-run
-temote-mcp upgrade
-```
-
-`upgrade` validates the target supervisor/control/lifecycle schemas before stopping anything, fences lifecycle mutations, aborts when an integration/approval operation is in flight, and requires the invoking environment to reproduce each credential-bearing session's memory-only restart context. Its owner-only restore plan stores restart-context key names but never credential values. Active runtimes are gracefully drained, the new supervisor is `exec`'d with the same PID, the intended active sessions are recreated with their prior IDs/permissions/restart policy, and every restored socket is probed before success. Compatible direct ingress can remain running; incompatible protocol/schema changes fail closed. The binary-owned Codex plugin is reconciled afterward, but an already-running Codex client must be restarted. A supervisor from before this handoff protocol needs one manual restart to bootstrap the first transition.
-
-Direct `temote-mcp up` ingress is **single-host per public endpoint**. Set `TEMOTE_MCP_HOST_ID=ubuntu1` (or another stable non-secret identifier) to make host ownership explicit in startup, `doctor`, supervisor, and session diagnostics; when unset, Temote falls back to the OS hostname. Do not run the same Cloudflare Tunnel token/hostname concurrently on multiple Temote hosts as direct-ingress replicas: Cloudflare routing is not Temote-session-aware, while session state remains host-local. For one public endpoint spanning multiple hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway described in [multi-host Cloudflare gateway](docs/gateway.md).
-
-An authenticated MCP client can then use:
-
-```text
-session_list
-session_start(path="src/my-project", session_id="my-project")
-session_info(session_id="my-project")
-```
-
-Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode. HTTP `serve/up` delegates session ownership and Tailscale OAuth approval to the local lifecycle supervisor over its owner-only Unix socket. Use `temote-mcp session console` for approvals. `temote-mcp down` stops only the HTTP origin/managed ingress; the lifecycle supervisor and its sessions remain alive.
-
-For local development, the first `session start` automatically starts the local lifecycle supervisor when it is not already running. New sessions default to sandboxed, approval-free `agent` mode:
-
-```sh
-export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp session start my-project --path src/my-project
-temote-mcp session list
-temote-mcp session info my-project
-temote-mcp session permission my-project status
-temote-mcp session permission my-project allow /path/to/extra-root
-temote-mcp session restart-policy my-project on-failure
-temote-mcp session console
-temote-mcp session stop my-project
-```
-
-The approval console is an attachment, not the runtime owner. Closing its terminal or sending stdin EOF leaves session runtimes alive; approval-required operations fail closed until a console reconnects. Lifecycle metadata records `starting`, `active`, `stopping`, `stopped`, and `crashed`, including crash reason and last error. `session list` probes the socket and never reports dead runtime metadata as `active`. Detached permission changes use the owner-only supervisor socket and do not restart the runtime. Restart policy defaults to `never`; explicit `on-failure` uses bounded exponential backoff with a five-attempt limit and records restart count/timestamps/limit reason. Captured start credentials remain memory-only, so a supervisor process restart never silently resumes credential-bearing automatic restarts; use explicit `session restart` after such a supervisor restart.
-
-For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a shorthand for starting the current directory and also bootstraps the local supervisor when needed. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
-
-## Codex plugin and Agent Skill
-
-For an installed Temote binary, the normal local Codex path is binary-owned plugin installation:
-
-```sh
-temote-mcp codex plugin install
-temote-mcp codex status
-temote-mcp codex diagnose --json
-```
-
-The installer writes the plugin under `CODEX_HOME` (or `~/.codex`), enables `temote-mcp@debug` in Codex configuration, and pins the exact Temote executable that performed the install in both the generated MCP configuration and `.temote-mcp-bin`. It does not silently fall back to a different ambient `temote-mcp` on `PATH`. After upgrading Temote, run `temote-mcp codex plugin install` again so the installed plugin moves to the new binary/version. Remove it with `temote-mcp codex plugin uninstall`. Restart an already-running Codex session after install or uninstall so its loaded plugin inventory matches disk. Install and uninstall are serialized and transactional: a complete validated bundle is atomically swapped into place, Codex config is replaced atomically without following symlinks, and uninstall disables config before bundle cleanup. `codex status --json` reports recoverable transaction artifacts, dangling config, disabled bundles, and stale versions.
-
-The repository root remains a directly inspectable local Codex plugin for development: `.codex-plugin/plugin.json` exposes the existing `skills/temote-mcp` guidance and `.mcp.json` launches `temote-mcp mcp` from `PATH`.
-
-The plugin is intentionally thin: session lifecycle, named-root resolution, sandboxing, approvals, OAuth, and ingress remain owned by the native Temote binary. Local CLI session start bootstraps the supervisor when needed; always-on HTTP/gateway deployments still run the supervisor explicitly as shown above. ChatGPT and other remote clients continue to use the Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel profiles rather than the local stdio plugin path.
-
-For coding agents that consume Agent Skills without Codex plugins, install the same bundled Skill directly:
+For other Agent Skill clients:
 
 ```sh
 gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 ```
 
-Specify `--agent codex`, `--agent claude-code`, or another supported agent when needed.
+Select the session, probe the backend, start a task with a fresh `operation_id`, and read its retained state and scoped evidence. The [usage guide](docs/usage.md) covers the full lifecycle.
 
-## More documentation
+## Documentation
 
-- [Using sessions and tools](docs/usage.md)
+- [Sessions and task tools](docs/usage.md)
 - [Managed sessions and named roots](docs/managed-sessions.md)
-- [Remote connection profiles: Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel](docs/public-http.md)
-- [Multi-host Cloudflare gateway](docs/gateway.md)
-- [Linux sandbox and crates.io packaging](docs/linux-sandbox.md)
-- [Building, testing, and releasing](docs/development.md)
+- [Authenticated MCP and ingress](docs/public-http.md)
+- [Temote Fabric](docs/gateway.md)
+- [Build, tests, and release](docs/development.md)
+- [Repository agent instructions](AGENTS.md)
 
-In a repository checkout, `just up` and `just down` are development wrappers that build or select the checkout binary and delegate to these commands. Installed users do not need `just`.
+## Attribution and license
 
-Repository-specific instructions for coding agents are in [AGENTS.md](AGENTS.md).
-
-## Origin and license
-
-This project is derived from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp). The name **Temote** draws on [@mr_konn's proposal of 「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), coined as the opposite of “remote.” See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution details.
-
-Licensed under MIT and Apache-2.0 as described in the repository license files.
+This project derives from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp). **Temote** takes its name from [@mr_konn's proposal of 「テモート」 as the opposite of remote](https://x.com/mr_konn/status/1318116448519114752?s=46). See [third-party notices](THIRD_PARTY_NOTICES.md). The repository is licensed under MIT and Apache-2.0.

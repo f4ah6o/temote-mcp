@@ -22,6 +22,7 @@ use crate::approvals::{
 };
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::host_identity;
+use crate::local_tasks::{self, SessionInstance, TaskPacket};
 use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
 use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
@@ -54,6 +55,9 @@ pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 const UPGRADE_PLAN_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
+const MAX_UPGRADE_BLOCKER_DIAGNOSTICS: usize = 8;
+const MAX_UPGRADE_BLOCKER_REASON_BYTES: usize = 1024;
+const SAFE_UPGRADE_RESTART_CONTEXT_KEYS: &[&str] = &["LANG", "LC_ALL", "PATH"];
 const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
@@ -95,6 +99,12 @@ pub(crate) fn installed_upgrade_locator() -> Result<PathBuf> {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
     Ping,
+    /// A versioned-by-shape request envelope for operations that must not
+    /// trigger lifecycle maintenance. Keep this allowlist separate from
+    /// `ControlRequest` so callers cannot wrap arbitrary commands here.
+    ReadOnlyDiagnostic {
+        request: ReadOnlyDiagnosticRequest,
+    },
     Approval {
         session_id: String,
         request: Request,
@@ -102,6 +112,14 @@ enum ControlRequest {
     Start {
         path: String,
         session_id: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
+        #[serde(default)]
+        public: bool,
+    },
+    StartManaged {
+        operation_id: Uuid,
+        request: crate::repository_store::ManagedRequest,
         #[serde(default)]
         environment: CapturedStartEnvironment,
         #[serde(default)]
@@ -118,6 +136,9 @@ enum ControlRequest {
     Info {
         session_id: String,
     },
+    Task(Box<TaskPacket>),
+    McpTask(Box<crate::mcp_tasks::TaskPacket>),
+    McpEvidence(Box<crate::mcp_tasks::EvidencePacket>),
     RepositoryCloneAdmission {
         session_id: String,
         root: String,
@@ -192,6 +213,32 @@ enum ControlRequest {
     },
     AttachConsole,
     AttachActivity(AttachActivityRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum ReadOnlyDiagnosticRequest {
+    Ping,
+    List,
+    Info {
+        session_id: String,
+    },
+    PermissionStatus {
+        session_id: String,
+    },
+    GcPreview {
+        limit: usize,
+    },
+    UpgradePreview {
+        executable: PathBuf,
+        #[serde(default)]
+        installed_locator: Option<PathBuf>,
+        target_version: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -324,7 +371,10 @@ impl SessionBackend {
         match self {
             #[cfg(test)]
             Self::InProcess(supervisor) => list_session_views(supervisor).await,
-            Self::LocalControl => request_session_views().await,
+            // MCP serving is operational discovery and must keep working with
+            // supervisors that predate the restricted diagnostic envelope.
+            // CLI and doctor diagnostics call `request_session_views` directly.
+            Self::LocalControl => request_session_views_operational().await,
         }
     }
 
@@ -359,6 +409,9 @@ impl SessionBackend {
                 "named_roots": supervisor.named_root_names(),
                 "repository_clone_admission_supported": true,
             })),
+            // This status probe is part of operational host/session workflows
+            // and must remain compatible with older lifecycle supervisors.
+            // Strict diagnostics call `read_only_local_status` directly.
             Self::LocalControl => request(ControlRequest::Ping).await,
         }
     }
@@ -436,6 +489,45 @@ impl SessionBackend {
         }
     }
 
+    pub async fn start_managed(
+        &self,
+        operation_id: Uuid,
+        managed_request: crate::repository_store::ManagedRequest,
+    ) -> Result<Value> {
+        let result = match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor
+                    .start_managed_repository(
+                        operation_id,
+                        managed_request,
+                        true,
+                        CapturedStartEnvironment::default(),
+                    )
+                    .await
+            }
+            Self::LocalControl => {
+                request(ControlRequest::StartManaged {
+                    operation_id,
+                    request: managed_request,
+                    environment: CapturedStartEnvironment::default(),
+                    public: true,
+                })
+                .await
+            }
+        };
+        result.map_err(|error| {
+            let message = format!("{error:#}");
+            if message.contains("operation_conflict") {
+                anyhow::anyhow!("operation_conflict: operation_id was accepted with different inputs")
+            } else if message.contains("reconciliation_required") {
+                anyhow::anyhow!("reconciliation_required: managed provisioning ownership cannot be proven")
+            } else {
+                anyhow::anyhow!("managed provisioning failed; retry with the same operation_id to inspect its receipt")
+            }
+        })
+    }
+
     pub async fn stop(&self, session_id: &str) -> Result<()> {
         match self {
             #[cfg(test)]
@@ -504,6 +596,10 @@ impl SessionBackend {
             }
         }
     }
+}
+
+pub(crate) async fn read_only_local_status() -> Result<Value> {
+    read_only_request(ReadOnlyDiagnosticRequest::Ping).await
 }
 
 fn require_repository_clone_admission_capability(status: &Value) -> Result<()> {
@@ -947,6 +1043,33 @@ pub async fn start_named(session_id: String, path: String) -> Result<()> {
     print_json(&result)
 }
 
+pub async fn start_managed_named(
+    source: String,
+    operation_id: String,
+    base: Option<String>,
+    vcs: String,
+) -> Result<()> {
+    let operation_id = Uuid::parse_str(&operation_id).context("operation_id must be a UUID")?;
+    let repository = crate::session_source::RepositoryId::parse(&source, "github.com")?;
+    let vcs =
+        serde_json::from_value(Value::String(vcs)).context("vcs must be auto, jujutsu, or git")?;
+    let managed_request = crate::repository_store::ManagedRequest {
+        repository,
+        base,
+        vcs,
+    };
+    managed_request.validate()?;
+    ensure_supervisor_for_start().await?;
+    let result = request(ControlRequest::StartManaged {
+        operation_id,
+        request: managed_request,
+        environment: CapturedStartEnvironment::capture(),
+        public: false,
+    })
+    .await?;
+    print_json(&result)
+}
+
 pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     ensure_supervisor_for_start().await?;
@@ -961,7 +1084,7 @@ pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> 
 }
 
 pub async fn list() -> Result<()> {
-    let result = request(ControlRequest::List).await?;
+    let result = read_only_request(ReadOnlyDiagnosticRequest::List).await?;
     let sessions: Vec<SessionView> = serde_json::from_value(result)?;
     println!("SESSION\tSTATUS\tPID\tPERMISSION\tCWD");
     for session in sessions {
@@ -982,7 +1105,53 @@ pub async fn list() -> Result<()> {
 }
 
 pub async fn info(session_id: String) -> Result<()> {
-    let result = request(ControlRequest::Info { session_id }).await?;
+    let result = read_only_request(ReadOnlyDiagnosticRequest::Info { session_id }).await?;
+    print_json(&result)
+}
+
+#[cfg(feature = "network")]
+pub(crate) async fn event_session_view(session_id: &str) -> Result<SessionView> {
+    serde_json::from_value(
+        request(ControlRequest::Info {
+            session_id: session_id.to_owned(),
+        })
+        .await?,
+    )
+    .context("invalid authoritative session view")
+}
+
+pub async fn task(invocation: crate::task_cli::TaskInvocation) -> Result<()> {
+    let ping = request(ControlRequest::Ping).await?;
+    anyhow::ensure!(
+        ping.get("local_task_protocol").and_then(Value::as_u64)
+            == Some(local_tasks::PROTOCOL_VERSION),
+        "running supervisor does not support local task protocol v{}; use MCP task tools or update the supervisor before using `task --local`",
+        local_tasks::PROTOCOL_VERSION
+    );
+    let view: SessionView = serde_json::from_value(
+        request(ControlRequest::Info {
+            session_id: invocation.session_id.clone(),
+        })
+        .await?,
+    )?;
+    anyhow::ensure!(view.status == "active", "session is not active");
+    let packet = TaskPacket {
+        schema_version: local_tasks::PROTOCOL_VERSION,
+        session_id: invocation.session_id,
+        instance: SessionInstance {
+            cwd: view.cwd,
+            started_at: view.started_at,
+            process_id: view.process_id,
+            permission_mode: view.permission_mode,
+            permitted_directories: view.permitted_directories,
+            grants: view.grants,
+        },
+        action: invocation.action,
+    };
+    packet.validate()?;
+    let result = request(ControlRequest::Task(Box::new(packet))).await.context(
+        "reconciliation_required: local task response uncertain; reconcile with `task list/get --local` or MCP, and never retry with a fresh operation ID"
+    )?;
     print_json(&result)
 }
 
@@ -1001,7 +1170,11 @@ pub async fn forget(session_id: String) -> Result<()> {
 }
 
 pub async fn gc(apply: bool, limit: usize) -> Result<()> {
-    let result = request(ControlRequest::Gc { apply, limit }).await?;
+    let result = if apply {
+        request(ControlRequest::Gc { apply, limit }).await?
+    } else {
+        read_only_request(ReadOnlyDiagnosticRequest::GcPreview { limit }).await?
+    };
     print_json(&result)
 }
 
@@ -1024,10 +1197,13 @@ pub async fn permission(
     session_id: String,
     command: crate::cli::SessionPermissionCommand,
 ) -> Result<()> {
+    if matches!(&command, crate::cli::SessionPermissionCommand::Status) {
+        let result =
+            read_only_request(ReadOnlyDiagnosticRequest::PermissionStatus { session_id }).await?;
+        return print_json(&result);
+    }
     let control_request = match command {
-        crate::cli::SessionPermissionCommand::Status => {
-            ControlRequest::PermissionStatus { session_id }
-        }
+        crate::cli::SessionPermissionCommand::Status => unreachable!("handled above"),
         crate::cli::SessionPermissionCommand::Ask => ControlRequest::PermissionMode {
             session_id,
             permission_mode: Some(config::PermissionMode::Ask),
@@ -1149,14 +1325,68 @@ async fn handle_control_connection(
     supervisor: Arc<SessionSupervisor>,
     console_registration: mpsc::Sender<mpsc::Sender<ApprovalPrompt>>,
 ) -> Result<()> {
-    let (line, buffered_input) =
+    let (line, buffered_input, mcp_relay) =
         tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut stream))
             .await
             .context("timed out waiting for supervisor control request")??;
     let request: ControlRequest = serde_json::from_str(line.trim())
         .map_err(|_| anyhow::anyhow!("invalid control request"))?;
+    anyhow::ensure!(
+        mcp_relay
+            == matches!(
+                &request,
+                ControlRequest::McpTask(_) | ControlRequest::McpEvidence(_)
+            ),
+        "MCP task relay requires its dedicated frame"
+    );
+    anyhow::ensure!(
+        !mcp_relay || !buffered_input,
+        "unexpected trailing MCP task relay input"
+    );
 
     match request {
+        ControlRequest::ReadOnlyDiagnostic { request } => match request {
+            ReadOnlyDiagnosticRequest::UpgradePreview {
+                executable,
+                installed_locator,
+                target_version,
+                environment,
+                force,
+            } => {
+                handle_upgrade_request(
+                    stream,
+                    supervisor,
+                    UpgradeControlRequest {
+                        executable,
+                        installed_locator,
+                        target_version,
+                        environment,
+                        dry_run: true,
+                        force,
+                        expected_sessions: None,
+                    },
+                    false,
+                )
+                .await
+            }
+            request => {
+                let result = dispatch_read_only_diagnostic(request, &supervisor).await;
+                let response = match result {
+                    Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
+                    Err(error) => {
+                        json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")})
+                    }
+                };
+                stream
+                    .write_all(&encode_line_with_limit(
+                        &response,
+                        MAX_CONTROL_MESSAGE_BYTES,
+                    )?)
+                    .await?;
+                let _ = stream.shutdown().await;
+                Ok(())
+            }
+        },
         ControlRequest::AttachConsole => {
             handle_console_attachment(stream, console_registration).await
         }
@@ -1186,10 +1416,16 @@ async fn handle_control_connection(
                     force,
                     expected_sessions,
                 },
+                true,
             )
             .await
         }
         request => {
+            let response_limit = match &request {
+                ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_RESPONSE_BYTES,
+                ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+                _ => MAX_CONTROL_MESSAGE_BYTES,
+            };
             let result = dispatch_request(request, &supervisor).await;
             let response = match result {
                 Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
@@ -1197,32 +1433,72 @@ async fn handle_control_connection(
                     json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")})
                 }
             };
-            stream.write_all(&encode_line(&response)?).await?;
+            stream
+                .write_all(&encode_line_with_limit(&response, response_limit)?)
+                .await?;
             let _ = stream.shutdown().await;
             Ok(())
         }
     }
 }
 
+async fn dispatch_read_only_diagnostic(
+    request: ReadOnlyDiagnosticRequest,
+    supervisor: &Arc<SessionSupervisor>,
+) -> Result<Value> {
+    match request {
+        ReadOnlyDiagnosticRequest::Ping => Ok(supervisor_status(supervisor)?),
+        ReadOnlyDiagnosticRequest::List => {
+            Ok(serde_json::to_value(list_session_views(supervisor).await?)?)
+        }
+        ReadOnlyDiagnosticRequest::Info { session_id }
+        | ReadOnlyDiagnosticRequest::PermissionStatus { session_id } => Ok(serde_json::to_value(
+            inspect_session_read_only(&session_id).await?,
+        )?),
+        ReadOnlyDiagnosticRequest::GcPreview { limit } => Ok(serde_json::to_value(
+            supervisor.gc_session_metadata_read_only(limit).await?,
+        )?),
+        ReadOnlyDiagnosticRequest::UpgradePreview { .. } => {
+            unreachable!("upgrade preview is handled before generic control dispatch")
+        }
+    }
+}
+
+fn supervisor_status(supervisor: &SessionSupervisor) -> Result<Value> {
+    Ok(json!({
+        "status": "active",
+        "host_id": host_identity::resolve()?,
+        "version": env!("CARGO_PKG_VERSION"),
+        "boot_generation": crate::boot_identity::generation(),
+        "pid": std::process::id(),
+        "control_protocol": CONTROL_PROTOCOL_VERSION,
+        "local_task_protocol": local_tasks::PROTOCOL_VERSION,
+        "mcp_task_protocol": crate::mcp_tasks::PROTOCOL_VERSION,
+        "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
+        "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
+        "roots_configured": supervisor.roots_configured(),
+        "named_roots": supervisor.named_root_names(),
+        "repository_clone_admission_supported": true,
+    }))
+}
+
 async fn dispatch_request(
     request: ControlRequest,
     supervisor: &Arc<SessionSupervisor>,
 ) -> Result<Value> {
+    match &request {
+        ControlRequest::McpTask(packet) => packet.validate()?,
+        ControlRequest::McpEvidence(packet) => packet.validate()?,
+        _ => {}
+    }
     supervisor.reap_finished().await;
     match request {
-        ControlRequest::Ping => Ok(json!({
-            "status": "active",
-            "host_id": host_identity::resolve()?,
-            "version": env!("CARGO_PKG_VERSION"),
-            "boot_generation": crate::boot_identity::generation(),
-            "pid": std::process::id(),
-            "control_protocol": CONTROL_PROTOCOL_VERSION,
-            "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
-            "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
-            "roots_configured": supervisor.roots_configured(),
-            "named_roots": supervisor.named_root_names(),
-            "repository_clone_admission_supported": true,
-        })),
+        ControlRequest::ReadOnlyDiagnostic { .. } => {
+            unreachable!("read-only diagnostics are dispatched before legacy maintenance")
+        }
+        // Kept as a legacy command for operational handshakes. New diagnostic
+        // callers use the restricted envelope above.
+        ControlRequest::Ping => supervisor_status(supervisor),
         ControlRequest::Approval {
             session_id,
             request,
@@ -1250,6 +1526,17 @@ async fn dispatch_request(
             }
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::StartManaged {
+            operation_id,
+            request,
+            environment,
+            public,
+        } => {
+            environment.validate()?;
+            supervisor
+                .start_managed_repository(operation_id, request, public, environment)
+                .await
+        }
         ControlRequest::StartLocal {
             cwd,
             session_id,
@@ -1268,6 +1555,9 @@ async fn dispatch_request(
         ControlRequest::Info { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::Task(packet) => local_tasks::dispatch(*packet).await,
+        ControlRequest::McpTask(packet) => crate::mcp_tasks::dispatch(*packet).await,
+        ControlRequest::McpEvidence(packet) => crate::mcp_tasks::dispatch_evidence(*packet).await,
         ControlRequest::RepositoryCloneAdmission {
             session_id,
             root,
@@ -1677,6 +1967,7 @@ async fn handle_upgrade_request(
     mut stream: UnixStream,
     supervisor: Arc<SessionSupervisor>,
     request: UpgradeControlRequest,
+    reap_before_preview: bool,
 ) -> Result<()> {
     let UpgradeControlRequest {
         executable,
@@ -1706,15 +1997,27 @@ async fn handle_upgrade_request(
         classify_helper_generation(installed_locator.as_deref().unwrap_or(&executable));
 
     if dry_run {
-        let preview = supervisor
-            .preview_upgrade_plan(
-                &target_version,
-                capabilities.control_protocol,
-                capabilities.lifecycle_schema,
-                &environment,
-                force,
-            )
-            .await;
+        let preview = if reap_before_preview {
+            supervisor
+                .preview_upgrade_plan_with_maintenance(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                )
+                .await
+        } else {
+            supervisor
+                .preview_upgrade_plan(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                )
+                .await
+        };
         let preview = match preview {
             Ok(preview) => preview,
             Err(error) => {
@@ -2444,6 +2747,12 @@ pub struct RemoteUpgradePreflight {
 pub async fn remote_upgrade_preflight(
     executable: &InstalledUpgradeExecutable,
 ) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_read_only_with_force(executable, false).await
+}
+
+pub(crate) async fn remote_upgrade_preflight_for_apply(
+    executable: &InstalledUpgradeExecutable,
+) -> Result<RemoteUpgradePreflight> {
     upgrade_preflight_with_force(executable, false).await
 }
 
@@ -2468,23 +2777,59 @@ async fn upgrade_preflight_with_force(
     executable: &InstalledUpgradeExecutable,
     force: bool,
 ) -> Result<RemoteUpgradePreflight> {
-    let ping = upgrade_request(ControlRequest::Ping).await?;
+    upgrade_preflight_inner(executable, force, false).await
+}
+
+async fn upgrade_preflight_read_only_with_force(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_inner(executable, force, true).await
+}
+
+async fn upgrade_preflight_inner(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+    read_only: bool,
+) -> Result<RemoteUpgradePreflight> {
+    let ping = if read_only {
+        read_only_request(ReadOnlyDiagnosticRequest::Ping).await?
+    } else {
+        upgrade_request(ControlRequest::Ping).await?
+    };
     validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
         .context("running supervisor did not report its version")?
         .to_owned();
-    let preview_value = upgrade_request(ControlRequest::Upgrade {
-        executable: executable.execution_path().to_owned(),
-        installed_locator: Some(executable.path.clone()),
-        target_version: executable.target_version.clone(),
-        environment: CapturedStartEnvironment::capture(),
-        dry_run: true,
-        force,
-        expected_sessions: None,
-    })
-    .await?;
+    let environment = CapturedStartEnvironment::capture();
+    let preview_value = if read_only {
+        upgrade_request(ControlRequest::ReadOnlyDiagnostic {
+            request: ReadOnlyDiagnosticRequest::UpgradePreview {
+                executable: executable.execution_path().to_owned(),
+                installed_locator: Some(executable.path.clone()),
+                target_version: executable.target_version.clone(),
+                environment,
+                force,
+            },
+        })
+        .await
+        .context(
+            "read-only supervisor upgrade preview is unsupported; no legacy maintenance request was attempted",
+        )?
+    } else {
+        upgrade_request(ControlRequest::Upgrade {
+            executable: executable.execution_path().to_owned(),
+            installed_locator: Some(executable.path.clone()),
+            target_version: executable.target_version.clone(),
+            environment,
+            dry_run: true,
+            force,
+            expected_sessions: None,
+        })
+        .await?
+    };
     let helper_generation = preview_helper_generation(&preview_value, &executable.path);
     let preview: crate::supervisor::SupervisorUpgradePreview =
         serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
@@ -2731,11 +3076,12 @@ fn codex_plugin_reconcile_command(
 
 pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let executable = capture_installed_upgrade_executable()?;
-    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     if dry_run {
+        let preflight = upgrade_preflight_read_only_with_force(&executable, force).await?;
         println!("{}", serde_json::to_string_pretty(&preflight)?);
         return Ok(());
     }
+    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
     ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
     // Every non-destructive gate must pass before --force may stop
@@ -2746,8 +3092,11 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let stopped_unrestorable = if preflight.blocked_session_count > 0 {
         anyhow::ensure!(
             force,
-            "upgrade is blocked by {} session(s)",
-            preflight.blocked_session_count
+            "{}",
+            blocked_upgrade_diagnostics(
+                preflight.blocked_session_count,
+                &preflight.blocked_sessions,
+            )
         );
         let planned_sessions = preflight.planned_sessions.clone();
         let stopped = stop_unrestorable_sessions(
@@ -2832,6 +3181,99 @@ fn ensure_upgrade_compatibility_gates(preflight: &RemoteUpgradePreflight) -> Res
         "sandbox helper generation is not compatible with the running supervisor"
     );
     Ok(())
+}
+
+fn blocked_upgrade_diagnostics(
+    blocked_session_count: usize,
+    blocked_sessions: &[crate::supervisor::UpgradeSessionBlocker],
+) -> String {
+    let mut message = format!("upgrade is blocked by {blocked_session_count} session(s)");
+    let details_count = blocked_sessions
+        .len()
+        .min(blocked_session_count)
+        .min(MAX_UPGRADE_BLOCKER_DIAGNOSTICS);
+
+    for blocker in blocked_sessions.iter().take(details_count) {
+        let valid_id = config::validate_session_id(&blocker.id).is_ok();
+        let session_id = if valid_id {
+            blocker.id.as_str()
+        } else {
+            "[unavailable]"
+        };
+        let reason = safe_upgrade_blocker_reason(blocker, valid_id);
+        message.push_str(&format!("\n- session {session_id}: {reason}"));
+    }
+
+    if blocked_session_count > details_count || blocked_sessions.len() > details_count {
+        message.push_str("\n- additional blocker details omitted");
+    }
+    message
+}
+
+fn safe_upgrade_blocker_reason(
+    blocker: &crate::supervisor::UpgradeSessionBlocker,
+    valid_id: bool,
+) -> String {
+    let reason = blocker.reason.as_str();
+    if reason.len() > MAX_UPGRADE_BLOCKER_REASON_BYTES || reason.chars().any(char::is_control) {
+        return "reason unavailable".to_owned();
+    }
+
+    if reason == "session runtime has ended; lifecycle maintenance is pending" {
+        return "session runtime has ended; lifecycle maintenance is pending".to_owned();
+    }
+    if !valid_id {
+        return "reason unavailable".to_owned();
+    }
+
+    let id = blocker.id.as_str();
+    for (suffix, safe_reason) in [
+        (
+            "has no in-memory restart context",
+            "restart context is unavailable",
+        ),
+        (
+            "named root no longer resolves to its current cwd",
+            "named root no longer resolves to the session workspace",
+        ),
+        (
+            "local cwd no longer resolves to its current cwd",
+            "session working directory no longer resolves",
+        ),
+        (
+            "has no lifecycle metadata",
+            "lifecycle metadata is unavailable",
+        ),
+        (
+            "is not in active lifecycle state during upgrade preflight",
+            "session is not active",
+        ),
+        (
+            "disappeared during upgrade preflight",
+            "session changed during preflight",
+        ),
+    ] {
+        if reason == format!("session {id} {suffix}") {
+            return safe_reason.to_owned();
+        }
+    }
+
+    let key_prefix = format!("session {id} restart context is unavailable or changed for keys: ");
+    if let Some(keys) = reason.strip_prefix(&key_prefix) {
+        let safe_keys = keys
+            .split(", ")
+            .filter(|key| SAFE_UPGRADE_RESTART_CONTEXT_KEYS.contains(key))
+            .collect::<BTreeSet<_>>();
+        if !safe_keys.is_empty() {
+            return format!(
+                "restart context is unavailable or changed for keys: {}",
+                safe_keys.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+        return "restart context is unavailable or changed; key details omitted".to_owned();
+    }
+
+    "reason unavailable".to_owned()
 }
 
 /// True while the supervisor still runs the session instance the upgrade
@@ -3015,15 +3457,125 @@ async fn request(request: ControlRequest) -> Result<Value> {
     request_at_path(&path, request).await
 }
 
+async fn read_only_request(request: ReadOnlyDiagnosticRequest) -> Result<Value> {
+    let path = config::supervisor_socket_path()?;
+    read_only_request_at_path(&path, request).await
+}
+
+async fn read_only_request_at_path(
+    path: &Path,
+    request: ReadOnlyDiagnosticRequest,
+) -> Result<Value> {
+    read_only_request_at_path_until(
+        path,
+        request,
+        tokio::time::Instant::now() + UPGRADE_CONTROL_RPC_TIMEOUT,
+    )
+    .await
+}
+
+async fn read_only_request_at_path_until(
+    path: &Path,
+    request: ReadOnlyDiagnosticRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    upgrade_request_at_path_until(
+        path,
+        ControlRequest::ReadOnlyDiagnostic { request },
+        deadline,
+    )
+    .await
+    .context(
+        "read-only supervisor diagnostics are unsupported or unavailable; no legacy maintenance request was attempted",
+    )
+}
+
 async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
     let mut stream = connect_supervisor_at(path).await?;
-    stream.write_all(&encode_line(&request)?).await?;
+    let mcp_relay = matches!(
+        &request,
+        ControlRequest::McpTask(_) | ControlRequest::McpEvidence(_)
+    );
+    let request_limit = match &request {
+        ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_REQUEST_BYTES,
+        ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_REQUEST_BYTES,
+        _ => MAX_CONTROL_MESSAGE_BYTES,
+    };
+    let bytes = encode_line_with_limit(&request, request_limit)?;
+    if mcp_relay {
+        stream.write_all(crate::mcp_tasks::FRAME_PREFIX).await?;
+    }
+    stream.write_all(&bytes).await?;
     finish_control_request_half_close(stream.shutdown().await)?;
     let mut reader = BufReader::new(stream);
-    let line = read_line_limited(&mut reader, "supervisor response").await?;
+    let response_limit = match &request {
+        ControlRequest::McpTask(_) => crate::mcp_tasks::MAX_RESPONSE_BYTES,
+        ControlRequest::McpEvidence(_) => crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+        _ => MAX_CONTROL_MESSAGE_BYTES,
+    };
+    let line = read_line_with_limit(&mut reader, "supervisor response", response_limit).await?;
+    anyhow::ensure!(
+        !mcp_relay || line.ends_with('\n'),
+        "incomplete MCP task relay response"
+    );
     let response: ControlResponse =
         serde_json::from_str(line.trim()).context("invalid supervisor response")?;
     ensure_response_ok(response)
+}
+
+/// Only a successful legacy Ping lacking the new capability permits direct
+/// MCP execution. Negotiation failures and all relay errors are terminal; a
+/// possibly accepted operation must never move to a second runtime owner.
+pub(crate) async fn mcp_task(packet: crate::mcp_tasks::TaskPacket) -> Result<Option<Value>> {
+    let path = config::supervisor_socket_path()?;
+    mcp_task_at_path(&path, packet).await
+}
+
+async fn mcp_task_at_path(
+    path: &Path,
+    packet: crate::mcp_tasks::TaskPacket,
+) -> Result<Option<Value>> {
+    mcp_relay_at_path(path, ControlRequest::McpTask(Box::new(packet))).await
+}
+
+pub(crate) async fn mcp_evidence(
+    packet: crate::mcp_tasks::EvidencePacket,
+) -> Result<Option<Value>> {
+    let path = config::supervisor_socket_path()?;
+    mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet))).await
+}
+
+async fn mcp_relay_at_path(path: &Path, request: ControlRequest) -> Result<Option<Value>> {
+    match &request {
+        ControlRequest::McpTask(packet) => packet.validate()?,
+        ControlRequest::McpEvidence(packet) => packet.validate()?,
+        _ => anyhow::bail!("unsupported MCP relay operation"),
+    }
+    let ping = tokio::time::timeout(
+        CONTROL_READ_TIMEOUT,
+        request_at_path(path, ControlRequest::Ping),
+    )
+    .await
+    .context("MCP task relay capability negotiation timed out")??;
+    anyhow::ensure!(
+        ping.get("status").and_then(Value::as_str) == Some("active"),
+        "invalid supervisor Ping"
+    );
+    let Some(version) = ping.get("mcp_task_protocol") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        version.as_u64() == Some(crate::mcp_tasks::PROTOCOL_VERSION),
+        "unsupported supervisor MCP task relay protocol"
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(300),
+        request_at_path(path, request),
+    )
+    .await
+    .context("reconciliation_required: MCP task relay timed out; reconcile through the supervisor and preserve operation_id")?
+    .context("reconciliation_required: MCP task relay failed; reconcile through the supervisor and preserve operation_id")?;
+    Ok(Some(result))
 }
 
 fn finish_control_request_half_close(result: std::io::Result<()>) -> Result<()> {
@@ -3049,6 +3601,40 @@ pub(crate) async fn activity_replay(
         .await
         .context("timed out connecting to session supervisor")??;
     activity_replay_on_stream(stream, session_id, tail).await
+}
+
+/// Follow the supervisor's actual lifecycle activity seam. A gap is fatal:
+/// event delivery must never infer missing transitions from a later snapshot.
+#[cfg(feature = "network")]
+pub(crate) async fn follow_lifecycle_activity(
+    sender: tokio::sync::mpsc::Sender<ActivityEvent>,
+) -> Result<()> {
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    let mut connection = ActivityClientConnection::attach(stream, None, 0, true).await?;
+    loop {
+        match connection.next_frame().await? {
+            Some(ActivityClientFrame::Event(event)) => {
+                if matches!(
+                    event.operation(),
+                    temote_mcp::activity::contract::ActivityOperation::SessionStart
+                        | temote_mcp::activity::contract::ActivityOperation::SessionStop
+                        | temote_mcp::activity::contract::ActivityOperation::SessionRestart
+                        | temote_mcp::activity::contract::ActivityOperation::SessionCrash
+                        | temote_mcp::activity::contract::ActivityOperation::SessionAutoRestart
+                ) {
+                    sender
+                        .send(event)
+                        .await
+                        .context("lifecycle event receiver closed")?;
+                }
+            }
+            Some(ActivityClientFrame::End) => {}
+            Some(ActivityClientFrame::Gap { .. }) => anyhow::bail!("lifecycle activity stream gap"),
+            None => anyhow::bail!("lifecycle activity stream closed"),
+        }
+    }
 }
 
 pub async fn run_activity_command(
@@ -3655,7 +4241,7 @@ async fn upgrade_request_at_path_until(
 ) -> Result<Value> {
     tokio::time::timeout_at(deadline, request_at_path(path, request))
         .await
-        .map_err(|_| anyhow::anyhow!("supervisor upgrade control request timed out"))?
+        .map_err(|_| anyhow::anyhow!("supervisor control request timed out"))?
 }
 
 fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
@@ -3885,6 +4471,8 @@ async fn persist_crash(
 /// relabeling them as stopped, crashed, or active.
 const SESSION_STATUS_DEGRADED: &str = "degraded";
 const SESSION_WORKSPACE_DEGRADED: &str = "session workspace is missing or not resolvable";
+const SESSION_METADATA_DEGRADED: &str =
+    "supervisor-owned session metadata is missing or unreadable";
 const SESSION_LIVENESS_UNKNOWN: &str = "session liveness could not be determined safely";
 
 pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
@@ -4021,14 +4609,18 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
 }
 
 async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<SessionView>> {
-    let owned_ids = supervisor.owned_session_ids().await;
-    let owned = owned_ids.iter().cloned().collect::<HashSet<_>>();
+    let snapshots = supervisor.owned_session_snapshots().await;
+    let owned = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect::<HashSet<_>>();
     let mut sessions = Vec::new();
 
-    for id in owned_ids {
-        let session = inspect_session_read_only(&id)
-            .await
-            .with_context(|| format!("failed to inspect supervisor-owned session {id}"))?;
+    for snapshot in snapshots {
+        let session = match inspect_session_read_only(&snapshot.id).await {
+            Ok(session) => session,
+            Err(_) => degraded_owned_session_view(snapshot).await?,
+        };
         push_control_session_view(&mut sessions, session, true)?;
     }
 
@@ -4054,8 +4646,69 @@ async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<Sessio
     Ok(sessions)
 }
 
+async fn degraded_owned_session_view(snapshot: config::Session) -> Result<SessionView> {
+    let id = snapshot.id.clone();
+    let yolo = snapshot.yolo();
+    // The lifecycle file is a separate durable record and the same session ID
+    // can be reused. Only copy facts from the incarnation held by this runtime
+    // snapshot. Lifecycle records currently have no full instance UUID.
+    let lifecycle = config::read_session_lifecycle(&id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.started_at == snapshot.started_at);
+    Ok(SessionView {
+        host_id: host_identity::resolve()?,
+        id: id.clone(),
+        session_id: id,
+        status: SESSION_STATUS_DEGRADED.to_owned(),
+        // A socket probe alone cannot bind liveness to this retained runtime
+        // instance when durable metadata is unavailable.
+        pid: None,
+        process_id: snapshot.process_id,
+        cwd: snapshot.cwd,
+        permitted_directories: snapshot.permitted_directories,
+        started_at: snapshot.started_at,
+        stopped_at: lifecycle.as_ref().and_then(|state| state.stopped_at),
+        exit_reason: lifecycle
+            .as_ref()
+            .and_then(|state| state.exit_reason.clone()),
+        last_error: Some(SESSION_METADATA_DEGRADED.to_owned()),
+        permission_mode: snapshot.permission_mode,
+        yolo,
+        grants: snapshot.grants,
+        logical_path: lifecycle
+            .as_ref()
+            .and_then(|state| state.logical_path.clone()),
+        workspace: None,
+        restart_policy: lifecycle.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            |state| state.restart_policy.clone(),
+        ),
+        restart_count: lifecycle.as_ref().map_or(0, |state| state.restart_count),
+        last_restart_at: lifecycle.as_ref().and_then(|state| state.last_restart_at),
+        next_restart_at: lifecycle.as_ref().and_then(|state| state.next_restart_at),
+        restart_limit_reason: lifecycle.and_then(|state| state.restart_limit_reason),
+    })
+}
+
 pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
-    let result = request(ControlRequest::List).await?;
+    let path = config::supervisor_socket_path()?;
+    request_session_views_at_path(&path).await
+}
+
+async fn request_session_views_at_path(path: &Path) -> Result<Vec<SessionView>> {
+    let result = read_only_request_at_path(path, ReadOnlyDiagnosticRequest::List).await?;
+    serde_json::from_value(result).context("invalid supervisor session list response")
+}
+
+pub(crate) async fn request_session_views_operational() -> Result<Vec<SessionView>> {
+    let path = config::supervisor_socket_path()?;
+    request_session_views_operational_at_path(&path).await
+}
+
+async fn request_session_views_operational_at_path(path: &Path) -> Result<Vec<SessionView>> {
+    let result = request_at_path(path, ControlRequest::List).await?;
     serde_json::from_value(result).context("invalid supervisor session list response")
 }
 
@@ -4066,7 +4719,7 @@ async fn request_upgrade_session_views() -> Result<Vec<SessionView>> {
 
 pub(crate) async fn session_views_for_mcp() -> Result<Vec<SessionView>> {
     if supervisor_is_available().await? {
-        request_session_views().await
+        request_session_views_operational().await
     } else {
         filesystem_session_views_read_only().await
     }
@@ -4707,16 +5360,20 @@ fn status_name(status: LifecycleStatus) -> &'static str {
 }
 
 fn encode_line<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    encode_line_with_limit(value, MAX_CONTROL_MESSAGE_BYTES)
+}
+
+fn encode_line_with_limit<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value)?;
     anyhow::ensure!(
-        bytes.len() < MAX_CONTROL_MESSAGE_BYTES,
-        "supervisor control message exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
+        bytes.len() < limit,
+        "supervisor control message exceeds {limit} bytes"
     );
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)> {
+async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool, bool)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let read = (&mut reader)
@@ -4732,26 +5389,40 @@ async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)>
         read <= MAX_CONTROL_MESSAGE_BYTES,
         "supervisor control request exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
     );
-    Ok((line, !reader.buffer().is_empty()))
+    if line.as_bytes() == crate::mcp_tasks::FRAME_PREFIX {
+        let line = read_line_with_limit(
+            &mut reader,
+            "MCP task relay request",
+            crate::mcp_tasks::MAX_REQUEST_BYTES,
+        )
+        .await?;
+        anyhow::ensure!(line.ends_with('\n'), "incomplete MCP task relay request");
+        return Ok((line, !reader.buffer().is_empty(), true));
+    }
+    Ok((line, !reader.buffer().is_empty(), false))
 }
 
 async fn read_line_limited<R>(reader: &mut R, label: &str) -> Result<String>
 where
     R: AsyncBufReadExt + Unpin,
 {
+    read_line_with_limit(reader, label, MAX_CONTROL_MESSAGE_BYTES).await
+}
+
+async fn read_line_with_limit<R>(reader: &mut R, label: &str, limit: usize) -> Result<String>
+where
+    R: AsyncBufReadExt + Unpin,
+{
     let mut line = String::new();
     let read = reader
-        .take((MAX_CONTROL_MESSAGE_BYTES + 1) as u64)
+        .take((limit + 1) as u64)
         .read_line(&mut line)
         .await
         .with_context(|| format!("failed to read {label}"))?;
     if read == 0 {
         return Ok(String::new());
     }
-    anyhow::ensure!(
-        read <= MAX_CONTROL_MESSAGE_BYTES,
-        "{label} exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
-    );
+    anyhow::ensure!(read <= limit, "{label} exceeds {limit} bytes");
     Ok(line)
 }
 
@@ -4791,6 +5462,8 @@ mod tests {
         (server, accepted)
     }
 
+    const READ_ONLY_DIAGNOSTIC_CHILD_ENV: &str = "TEMOTE_TEST_READ_ONLY_DIAGNOSTIC_PRIVATE_PROCESS";
+
     #[test]
     fn control_request_half_close_only_tolerates_not_connected() {
         assert!(finish_control_request_half_close(Ok(())).is_ok());
@@ -4810,6 +5483,387 @@ mod tests {
                 .to_string()
                 .contains("failed to half-close supervisor control request")
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_legacy_requires_successful_ping_without_new_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                ControlRequest::Ping
+            ));
+            stream
+                .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "local_task_protocol": 1}})).unwrap())
+                .await
+                .unwrap();
+        });
+        assert!(
+            mcp_task_at_path(
+                &path,
+                crate::mcp_tasks::tests::start_packet("first".to_owned())
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        server.await.unwrap();
+        // Socket absence is an error, not proof of an explicitly legacy owner.
+        assert!(
+            mcp_task_at_path(
+                &temp.path().join("absent.sock"),
+                crate::mcp_tasks::tests::start_packet("first".to_owned())
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_negotiation_failures_never_select_legacy_fallback() {
+        for result in [
+            None,
+            Some(json!({"ok": false, "error": "supervisor unavailable"})),
+            Some(json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": null}})),
+            Some(json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 2}})),
+            Some(json!({"ok": true, "result": {"mcp_task_protocol": 1}})),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_control_request(&mut stream).await.unwrap();
+                if let Some(result) = result {
+                    stream
+                        .write_all(&encode_line(&result).unwrap())
+                        .await
+                        .unwrap();
+                }
+            });
+            assert!(
+                mcp_task_at_path(
+                    &path,
+                    crate::mcp_tasks::tests::start_packet("first".to_owned())
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_routes_all_operations_and_large_frames_to_advertised_owner() {
+        use crate::orchestration::{Backend, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected in [
+                Operation::Status,
+                Operation::TaskStart,
+                Operation::TaskGet,
+                Operation::TaskControl,
+                Operation::TaskList,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(!relay);
+                assert!(matches!(
+                    serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                    ControlRequest::Ping
+                ));
+                stream
+                    .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap())
+                    .await
+                    .unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(relay);
+                let ControlRequest::McpTask(packet) = serde_json::from_str(&line).unwrap() else {
+                    panic!("typed MCP relay")
+                };
+                packet.validate().unwrap();
+                assert_eq!(packet.operation, expected);
+                assert_eq!(packet.actor.transport, "mcp-public");
+                if expected == Operation::TaskStart {
+                    assert!(line.len() > 6 * 1024 * 1024);
+                    assert_eq!(packet.args["continuation"]["type"], "previous_task");
+                }
+                let response = json!({"ok": true, "result": {"operation": expected, "bounded_view": "a".repeat(128 * 1024)}});
+                assert!(encode_line(&response).is_err());
+                stream
+                    .write_all(
+                        &encode_line_with_limit(&response, crate::mcp_tasks::MAX_RESPONSE_BYTES)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        for operation in [
+            Operation::Status,
+            Operation::TaskStart,
+            Operation::TaskGet,
+            Operation::TaskControl,
+            Operation::TaskList,
+        ] {
+            let args = match operation {
+                Operation::Status => json!({}),
+                Operation::TaskStart => {
+                    crate::mcp_tasks::tests::start_packet("\u{1}".repeat(1024 * 1024)).args
+                }
+                Operation::TaskGet => json!({"task_id": Uuid::new_v4(), "wait_ms": 30_000}),
+                Operation::TaskControl => {
+                    json!({"task_id": Uuid::new_v4(), "operation_id": Uuid::new_v4(), "action": "interrupt"})
+                }
+                Operation::TaskList => json!({"limit": 128}),
+            };
+            let packet = crate::mcp_tasks::TaskPacket::new(
+                Backend::Codex,
+                operation,
+                &args,
+                &crate::mcp_tasks::tests::session(),
+                true,
+            )
+            .unwrap();
+            let result = mcp_task_at_path(&path, packet).await.unwrap().unwrap();
+            assert_eq!(result["operation"], json!(operation));
+            assert_eq!(result["bounded_view"].as_str().unwrap().len(), 128 * 1024);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_uncertainty_and_errors_never_select_legacy_fallback() {
+        for response in [
+            None,
+            Some(json!({"ok": false, "error": "owner rejected"})),
+            Some(json!({"ok": true, "result": "unterminated"})),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_control_request(&mut stream).await.unwrap();
+                stream
+                    .write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap())
+                    .await
+                    .unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, _, relay) = read_control_request(&mut stream).await.unwrap();
+                assert!(relay);
+                if let Some(response) = response {
+                    let mut bytes = encode_line(&response).unwrap();
+                    if response["ok"] == true {
+                        bytes.pop();
+                    }
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            let result = mcp_task_at_path(
+                &path,
+                crate::mcp_tasks::tests::start_packet("first".to_owned()),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "relay errors must never return the legacy None route"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_does_not_expand_ordinary_control_or_local_task_frames() {
+        let packet = crate::mcp_tasks::tests::start_packet("a".repeat(128 * 1024));
+        assert!(encode_line(&ControlRequest::McpTask(Box::new(packet))).is_err());
+        let local = ControlRequest::Task(Box::new(TaskPacket {
+            schema_version: local_tasks::PROTOCOL_VERSION,
+            session_id: "relay-test".to_owned(),
+            instance: (&crate::mcp_tasks::tests::session()).into(),
+            action: local_tasks::TaskAction::Control {
+                backend: local_tasks::BackendName::Codex,
+                task_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
+                action: local_tasks::ControlAction::Steer,
+                input: Some("a".repeat(64 * 1024)),
+            },
+        }));
+        assert!(encode_line(&local).is_err());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            let _ = client
+                .write_all(&vec![b'x'; MAX_CONTROL_MESSAGE_BYTES + 1])
+                .await;
+        });
+        assert!(read_control_request(&mut server).await.is_err());
+        drop(server);
+        writer.await.unwrap();
+    }
+
+    // Invoked in a separate test process so the evidence OnceLock belongs to
+    // the supervisor fixture, never to the frontend test's address space.
+    #[tokio::test]
+    async fn mcp_relay_evidence_owner_process_fixture() {
+        let Some(manifest) = std::env::var_os("TEMOTE_TEST_MCP_EVIDENCE_MANIFEST") else {
+            return;
+        };
+        let manifest = PathBuf::from(manifest);
+        let root = manifest.parent().unwrap();
+        let cwd = std::fs::canonicalize(root).unwrap();
+        let mut session = crate::mcp_tasks::tests::session();
+        session.cwd = cwd.clone();
+        session.permitted_directories = vec![cwd];
+        session.process_id = std::process::id();
+        let reference = crate::evidence::store_for_session(
+            &session,
+            "\u{1}".repeat(crate::evidence::MAX_READ_BYTES + 11),
+        )
+        .unwrap()
+        .unwrap();
+        let listener = UnixListener::bind(root.join("evidence.sock")).unwrap();
+        let pending_manifest = manifest.with_extension("pending");
+        std::fs::write(
+            &pending_manifest,
+            serde_json::to_vec(&json!({"session": session, "evidence": reference})).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(pending_manifest, &manifest).unwrap();
+        for _ in 0..6 {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(&line).unwrap(),
+                ControlRequest::Ping
+            ));
+            stream.write_all(&encode_line(&json!({"ok": true, "result": {"status": "active", "mcp_task_protocol": 1}})).unwrap()).await.unwrap();
+            drop(stream);
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(relay);
+            let ControlRequest::McpEvidence(packet) = serde_json::from_str(&line).unwrap() else {
+                panic!("typed evidence relay")
+            };
+            let response = match packet.read_for_session(&session) {
+                Ok(chunk) => json!({"ok": true, "result": chunk}),
+                Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            };
+            stream
+                .write_all(
+                    &encode_line_with_limit(
+                        &response,
+                        crate::mcp_tasks::MAX_EVIDENCE_RESPONSE_BYTES,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_reads_supervisor_evidence_across_process_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("manifest.json");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_control::tests::mcp_relay_evidence_owner_process_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TEMOTE_TEST_MCP_EVIDENCE_MANIFEST", &manifest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !manifest.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "evidence owner exited before readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "evidence owner readiness timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let session: config::Session = serde_json::from_value(manifest["session"].clone()).unwrap();
+        assert_ne!(session.process_id, std::process::id());
+        let id = Uuid::parse_str(manifest["evidence"]["evidence_id"].as_str().unwrap()).unwrap();
+        assert!(
+            crate::evidence::read_for_session(&session, id, 0, 1).is_err(),
+            "the frontend must not possess the supervisor's evidence"
+        );
+        let path = temp.path().join("evidence.sock");
+        for (offset, expected) in [
+            (0, crate::evidence::MAX_READ_BYTES),
+            (crate::evidence::MAX_READ_BYTES, 11),
+        ] {
+            let packet = crate::mcp_tasks::EvidencePacket::new(&json!({"evidence_id": id, "offset_bytes": offset, "max_bytes": crate::evidence::MAX_READ_BYTES}), &session, true).unwrap();
+            let chunk = mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(chunk["content"].as_str().unwrap(), "\u{1}".repeat(expected));
+            assert_eq!(chunk["returned_bytes"], expected);
+            assert_eq!(chunk["total_bytes"], crate::evidence::MAX_READ_BYTES + 11);
+        }
+        for change in 0..3 {
+            let mut replacement = session.clone();
+            match change {
+                0 => replacement.cwd = std::fs::canonicalize(temp.path().join("..")).unwrap(),
+                1 => replacement.process_id += 1,
+                _ => replacement.permission_mode = config::PermissionMode::Ask,
+            }
+            let packet = crate::mcp_tasks::EvidencePacket::new(
+                &json!({"evidence_id": id}),
+                &replacement,
+                true,
+            )
+            .unwrap();
+            assert!(
+                mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                    .await
+                    .is_err()
+            );
+        }
+        // The frontend owns this ID, but a modern supervisor miss must stay an
+        // error rather than crossing to the frontend's private evidence store.
+        let local = crate::evidence::store_for_session(&session, "frontend-only".to_owned())
+            .unwrap()
+            .unwrap();
+        let packet = crate::mcp_tasks::EvidencePacket::new(
+            &json!({"evidence_id": local.evidence_id}),
+            &session,
+            true,
+        )
+        .unwrap();
+        assert!(
+            mcp_relay_at_path(&path, ControlRequest::McpEvidence(Box::new(packet)))
+                .await
+                .is_err()
+        );
+        assert!(child.wait().unwrap().success());
     }
 
     #[tokio::test]
@@ -4924,6 +5978,30 @@ mod tests {
         serde_json::from_str(line.trim()).unwrap()
     }
 
+    async fn request_read_only_test(
+        supervisor: &Arc<SessionSupervisor>,
+        request: ReadOnlyDiagnosticRequest,
+    ) -> Value {
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(supervisor),
+            registration,
+        ));
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(&encode_line(&ControlRequest::ReadOnlyDiagnostic { request }).unwrap())
+            .await
+            .unwrap();
+        client.get_mut().shutdown().await.unwrap();
+        let response = read_activity_test_json(&mut client).await;
+        task.await.unwrap().unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        response["result"].clone()
+    }
+
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("volume");
@@ -4956,11 +6034,306 @@ mod tests {
         );
         assert_eq!(result["pid"], std::process::id());
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(result["local_task_protocol"], local_tasks::PROTOCOL_VERSION);
+        assert_eq!(
+            result["mcp_task_protocol"],
+            crate::mcp_tasks::PROTOCOL_VERSION
+        );
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);
         assert_eq!(result["repository_clone_admission_supported"], true);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostics_do_not_reap_finished_sessions_or_reconcile_lifecycle() {
+        if std::env::var_os(READ_ONLY_DIAGNOSTIC_CHILD_ENV).is_some() {
+            read_only_diagnostics_private_fixture().await;
+            return;
+        }
+
+        // `config::state_dir()` intentionally uses a process-private test
+        // root. Run the ghost-active fixture in its own process so unrelated
+        // parallel tests cannot reconcile it as a stale session.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_control::tests::read_only_diagnostics_do_not_reap_finished_sessions_or_reconcile_lifecycle",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(READ_ONLY_DIAGNOSTIC_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private diagnostic fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn read_only_diagnostics_private_fixture() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("readonly-diagnostic-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo", Some(&id)).await.unwrap();
+        supervisor
+            .set_restart_policy(&id, "on-failure")
+            .await
+            .unwrap();
+        supervisor.crash_for_test(&id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if config::read_session_lifecycle(&id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == LifecycleStatus::Crashed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test runtime did not persist its crashed state");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Model a process that exited before its lifecycle record was
+        // reconciled. Read-only Info must report the contradiction without
+        // rewriting this durable fixture.
+        let mut lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        lifecycle.status = LifecycleStatus::Active;
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+
+        let metadata_path = config::session_path(&id).unwrap();
+        let lifecycle_path = config::session_lifecycle_path(&id).unwrap();
+        let metadata_before = tokio::fs::read(&metadata_path).await.unwrap();
+        let lifecycle_before = tokio::fs::read(&lifecycle_path).await.unwrap();
+        assert!(supervisor.is_managed_for_test(&id).await);
+
+        request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::Ping).await;
+        request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::List).await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::Info {
+                session_id: id.clone(),
+            },
+        )
+        .await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::PermissionStatus {
+                session_id: id.clone(),
+            },
+        )
+        .await;
+        request_read_only_test(
+            &supervisor,
+            ReadOnlyDiagnosticRequest::GcPreview { limit: 10 },
+        )
+        .await;
+
+        assert!(supervisor.is_managed_for_test(&id).await);
+        assert_eq!(
+            tokio::fs::read(&metadata_path).await.unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let executable = _temp.path().join("fake-upgrade-target");
+            std::fs::write(
+                &executable,
+                b"#!/bin/sh\nif [ \"$1\" = \"supervisor\" ] && [ \"$2\" = \"--capabilities\" ]; then echo '{\"version\":\"test-version\",\"control_protocol\":2,\"lifecycle_schema\":1,\"upgrade_plan_schema\":1}'; else exit 2; fi\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let preview = request_read_only_test(
+                &supervisor,
+                ReadOnlyDiagnosticRequest::UpgradePreview {
+                    executable,
+                    installed_locator: None,
+                    target_version: "test-version".to_owned(),
+                    environment: CapturedStartEnvironment::default(),
+                    force: false,
+                },
+            )
+            .await;
+            assert!(
+                !preview["active_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|session| session["session_id"] == id)
+            );
+            assert!(
+                preview["blocked_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|blocker| {
+                        blocker["session_id"] == id
+                            && blocker["reason"]
+                                .as_str()
+                                .unwrap()
+                                .contains("lifecycle maintenance is pending")
+                    }),
+                "preview did not classify the ended runtime conservatively: {preview}"
+            );
+        }
+        assert!(supervisor.is_managed_for_test(&id).await);
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+
+        supervisor.reap_finished().await;
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostics_fail_closed_on_legacy_supervisor_without_ping_fallback() {
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum LegacyControlRequest {
+            Ping,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(serde_json::from_str::<LegacyControlRequest>(&line).is_err());
+            drop(stream);
+            let second_connection =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+            (line, second_connection.is_ok())
+        });
+
+        let error = read_only_request_at_path(&path, ReadOnlyDiagnosticRequest::Ping)
+            .await
+            .unwrap_err();
+        let (line, used_fallback) = server.await.unwrap();
+        assert!(
+            !used_fallback,
+            "diagnostic request retried with a legacy command"
+        );
+        let sent: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(sent["command"], "read_only_diagnostic");
+        assert_eq!(sent["request"]["operation"], "ping");
+        assert!(error.to_string().contains("no legacy maintenance request"));
+
+        let mut mutating = json!({
+            "command": "read_only_diagnostic",
+            "request": {"operation": "stop", "session_id": "example"}
+        });
+        assert!(serde_json::from_value::<ControlRequest>(mutating.take()).is_err());
+    }
+
+    #[tokio::test]
+    async fn operational_session_list_keeps_legacy_compatibility_while_diagnostics_fail_closed() {
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum LegacyControlRequest {
+            List,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-list.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (legacy_line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(matches!(
+                serde_json::from_str::<LegacyControlRequest>(&legacy_line).unwrap(),
+                LegacyControlRequest::List
+            ));
+            stream
+                .write_all(&encode_line(&json!({"ok": true, "result": []})).unwrap())
+                .await
+                .unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (diagnostic_line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            assert!(serde_json::from_str::<LegacyControlRequest>(&diagnostic_line).is_err());
+            drop(stream);
+            let fallback = tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok();
+            (legacy_line, diagnostic_line, fallback)
+        });
+
+        let operational = request_session_views_operational_at_path(&path)
+            .await
+            .unwrap();
+        assert!(operational.is_empty());
+        let diagnostic = request_session_views_at_path(&path).await.unwrap_err();
+        assert!(
+            format!("{diagnostic:#}").contains("no legacy maintenance request"),
+            "strict diagnostic should explain that it did not fallback: {diagnostic:#}"
+        );
+
+        let (legacy_line, diagnostic_line, fallback) = server.await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&legacy_line).unwrap()["command"],
+            "list"
+        );
+        let diagnostic: Value = serde_json::from_str(&diagnostic_line).unwrap();
+        assert_eq!(diagnostic["command"], "read_only_diagnostic");
+        assert_eq!(diagnostic["request"]["operation"], "list");
+        assert!(!fallback, "strict diagnostics attempted a legacy fallback");
+    }
+
+    #[tokio::test]
+    async fn read_only_diagnostic_first_request_is_bounded_and_never_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stalled-diagnostic.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (line, _, relay) = read_control_request(&mut stream).await.unwrap();
+            assert!(!relay);
+            let fallback = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok();
+            (line, fallback)
+        });
+
+        let error = read_only_request_at_path_until(
+            &path,
+            ReadOnlyDiagnosticRequest::Ping,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "diagnostic Ping did not use the bounded request deadline: {error:#}"
+        );
+        let (line, fallback) = server.await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["command"], "read_only_diagnostic");
+        assert_eq!(request["request"]["operation"], "ping");
+        assert!(!fallback, "diagnostic Ping attempted a legacy fallback");
     }
 
     #[test]
@@ -5845,6 +7218,151 @@ mod tests {
         supervisor.shutdown().await.unwrap();
         cleanup(&healthy_id).await;
         cleanup(&stale_id).await;
+    }
+
+    #[tokio::test]
+    async fn session_list_degrades_missing_and_corrupt_owned_metadata_without_repair() {
+        let (_temp, roots, _) = named_root_fixture(&["healthy", "damaged"]);
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let healthy_id = format!("list-healthy-{}", uuid::Uuid::new_v4());
+        let damaged_id = format!("list-damaged-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start("src/healthy", Some(&healthy_id))
+            .await
+            .unwrap();
+        supervisor
+            .start("src/damaged", Some(&damaged_id))
+            .await
+            .unwrap();
+        let path = config::session_path(&damaged_id).unwrap();
+        let lifecycle_path = config::session_lifecycle_path(&damaged_id).unwrap();
+        let lifecycle_before = tokio::fs::read(&lifecycle_path).await.unwrap();
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        let missing = list_session_views(&supervisor).await.unwrap();
+        assert!(
+            !path.exists(),
+            "read-only listing must not recreate missing metadata"
+        );
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+        assert_eq!(
+            missing
+                .iter()
+                .find(|view| view.session_id == healthy_id)
+                .unwrap()
+                .status,
+            "active"
+        );
+        let damaged = missing
+            .iter()
+            .find(|view| view.session_id == damaged_id)
+            .unwrap();
+        assert_eq!(damaged.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(
+            damaged.last_error.as_deref(),
+            Some(SESSION_METADATA_DEGRADED)
+        );
+        assert!(damaged.workspace.is_none());
+        assert_ne!(damaged.status, "active");
+
+        let corrupt = b"{invalid metadata";
+        tokio::fs::write(&path, corrupt).await.unwrap();
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), corrupt);
+        assert_eq!(
+            tokio::fs::read(&lifecycle_path).await.unwrap(),
+            lifecycle_before
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|view| view.session_id == healthy_id)
+                .unwrap()
+                .status,
+            "active"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|view| view.session_id == damaged_id)
+                .unwrap()
+                .status,
+            SESSION_STATUS_DEGRADED
+        );
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&healthy_id).await;
+        cleanup(&damaged_id).await;
+    }
+
+    #[tokio::test]
+    async fn degraded_owned_snapshot_never_claims_active_pid() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = format!("snapshot-degraded-{}", uuid::Uuid::new_v4());
+        let snapshot = config::Session {
+            id: id.clone(),
+            cwd: fixture.path().to_path_buf(),
+            permitted_directories: Vec::new(),
+            started_at: 42,
+            process_id: 1234,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let view = degraded_owned_session_view(snapshot).await.unwrap();
+        assert_eq!(view.session_id, id);
+        assert_eq!(view.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(view.process_id, 1234);
+        assert_eq!(view.pid, None);
+        assert_eq!(view.last_error.as_deref(), Some(SESSION_METADATA_DEGRADED));
+        assert!(view.workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn degraded_owned_snapshot_ignores_lifecycle_from_reused_id() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = format!("snapshot-reused-{}", uuid::Uuid::new_v4());
+        let snapshot = config::Session {
+            id: id.clone(),
+            cwd: fixture.path().to_path_buf(),
+            permitted_directories: Vec::new(),
+            started_at: 42,
+            process_id: 1234,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let mut stale = config::SessionLifecycle::starting(41, Some("old/repo".to_owned()));
+        stale.stopped_at = Some(50);
+        stale.exit_reason = Some("old incarnation".to_owned());
+        stale.restart_policy = "old policy".to_owned();
+        stale.restart_count = 7;
+        config::save_session_lifecycle(&id, &stale).await.unwrap();
+
+        let view = degraded_owned_session_view(snapshot.clone()).await.unwrap();
+        assert_eq!(view.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(view.started_at, 42);
+        assert_eq!(view.stopped_at, None);
+        assert_eq!(view.exit_reason, None);
+        assert_eq!(view.logical_path, None);
+        assert_eq!(view.restart_policy, "unknown");
+        assert_eq!(view.restart_count, 0);
+
+        stale.started_at = snapshot.started_at;
+        stale.exit_reason = Some("matching incarnation".to_owned());
+        stale.logical_path = Some("current/repo".to_owned());
+        config::save_session_lifecycle(&id, &stale).await.unwrap();
+        let matching = degraded_owned_session_view(snapshot).await.unwrap();
+        assert_eq!(matching.stopped_at, Some(50));
+        assert_eq!(
+            matching.exit_reason.as_deref(),
+            Some("matching incarnation")
+        );
+        assert_eq!(matching.logical_path.as_deref(), Some("current/repo"));
+        tokio::fs::remove_file(config::session_lifecycle_path(&id).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -7013,6 +8531,76 @@ mod tests {
             validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
         assert!(error.to_string().contains("session instance changed"));
         validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_keep_count_and_safe_session_reasons() {
+        let blockers = vec![crate::supervisor::UpgradeSessionBlocker {
+            id: "blocked-a".to_owned(),
+            reason: "session blocked-a has no in-memory restart context".to_owned(),
+        }];
+
+        let message = blocked_upgrade_diagnostics(1, &blockers);
+
+        assert!(message.starts_with("upgrade is blocked by 1 session(s)"));
+        assert!(message.contains("session blocked-a: restart context is unavailable"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_only_show_allowlisted_restart_context_keys() {
+        let blockers = vec![crate::supervisor::UpgradeSessionBlocker {
+            id: "blocked-a".to_owned(),
+            reason: "session blocked-a restart context is unavailable or changed for keys: LANG, PATH, KINTONE_PASSWORD, RAW_SECRET_SENTINEL".to_owned(),
+        }];
+
+        let message = blocked_upgrade_diagnostics(1, &blockers);
+
+        assert!(message.contains("keys: LANG, PATH"));
+        assert!(!message.contains("KINTONE_PASSWORD"));
+        assert!(!message.contains("RAW_SECRET_SENTINEL"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_fail_closed_for_malformed_and_oversized_input() {
+        let blockers = vec![
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "../ID_SECRET_SENTINEL".to_owned(),
+                reason: "raw error SECRET_REASON_SENTINEL".to_owned(),
+            },
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "blocked-newline".to_owned(),
+                reason: "session blocked-newline has no in-memory restart context\nINJECTED_SECRET_SENTINEL".to_owned(),
+            },
+            crate::supervisor::UpgradeSessionBlocker {
+                id: "blocked-oversized".to_owned(),
+                reason: format!("SECRET_OVERSIZED_SENTINEL{}", "x".repeat(MAX_UPGRADE_BLOCKER_REASON_BYTES)),
+            },
+        ];
+
+        let message = blocked_upgrade_diagnostics(3, &blockers);
+
+        assert!(message.contains("session [unavailable]: reason unavailable"));
+        assert_eq!(message.matches("reason unavailable").count(), 3);
+        assert!(!message.contains("ID_SECRET_SENTINEL"));
+        assert!(!message.contains("SECRET_REASON_SENTINEL"));
+        assert!(!message.contains("INJECTED_SECRET_SENTINEL"));
+        assert!(!message.contains("SECRET_OVERSIZED_SENTINEL"));
+    }
+
+    #[test]
+    fn blocked_upgrade_diagnostics_bound_detail_count_and_output_size() {
+        let blockers = (0..MAX_UPGRADE_BLOCKER_DIAGNOSTICS + 3)
+            .map(|index| crate::supervisor::UpgradeSessionBlocker {
+                id: format!("blocked-{index}"),
+                reason: format!("session blocked-{index} has no in-memory restart context"),
+            })
+            .collect::<Vec<_>>();
+
+        let message = blocked_upgrade_diagnostics(blockers.len(), &blockers);
+
+        assert_eq!(message.matches("restart context is unavailable").count(), 8);
+        assert!(message.contains("additional blocker details omitted"));
+        assert!(message.len() < 2048);
     }
 
     fn force_stop_preflight_fixture(ids: &[&str]) -> RemoteUpgradePreflight {

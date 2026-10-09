@@ -90,6 +90,12 @@ pub async fn preflight() -> Result<(InstalledUpgradeExecutable, RemoteUpgradePre
     Ok((executable, preflight))
 }
 
+pub async fn preflight_for_apply() -> Result<(InstalledUpgradeExecutable, RemoteUpgradePreflight)> {
+    let executable = session_control::capture_installed_upgrade_executable()?;
+    let preflight = session_control::remote_upgrade_preflight_for_apply(&executable).await?;
+    Ok((executable, preflight))
+}
+
 pub(crate) async fn prepare_apply(
     executable: InstalledUpgradeExecutable,
     preflight: RemoteUpgradePreflight,

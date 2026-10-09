@@ -1,13 +1,185 @@
 # O0: head-independent observation / context / memory plane
 
-Status: open umbrella — O1–O4 locally implemented/qualified; direct-agent prompt ingress O1P remains; Cloudflare remote acceptance is centralized in the live matrix
+Status: open
+Model: unknown
+Created: 2026-09-25
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Track the observation and context umbrella after local O1–O4 work, with direct-agent prompt ingress and live Fabric qualification still outstanding.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Direct-agent prompt coverage and remote qualification remain outside the already implemented local observation core.
+
+## 目標
+
+Track the observation and context umbrella after local O1–O4 work, with direct-agent prompt ingress and live Fabric qualification still outstanding.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: 17. Explicit non-goals
+
+初期 scope に含めない:
+
+- autonomous task planning
+- backend/model auto routing
+- generic workflow engine
+- agent inbox / mail system
+- social multi-agent chat
+- generic RAG platform
+- vector database requirement
+- LoRA / adapter routing
+- hidden chain-of-thought capture
+- Temote 外の全 chat transcript の収集
+- worker による task state の直接変更
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Fixed design from source
+
+**2. Product boundary**
+
+### 2.1 Temote core
+
+Temote core は引き続き **正しく実行すること**を担当する。
+
+- Task / Execution / Workspace identity
+- authorization / permission
+- operation receipt / idempotency
+- backend lifecycle
+- evidence / verification / delivery
+- reconciliation
+
+### 2.2 Observation plane
+
+Observation plane は **何が観測されたかを記録すること**を担当する。
+
+- normalized instruction
+- task / execution / workspace linkage
+- backend target
+- state transition
+- evidence / verification / delivery reference
+- caller-visible backend result / error
+- provenance / timestamps / revision
+
+### 2.3 Memory worker
+
+Memory worker は **観測から再利用可能な knowledge を導出すること**を担当する。
+
+- current facts
+- decisions
+- constraints
+- unresolved questions
+- failure patterns
+- project / repository summaries
+- supersession relationships
+
+worker の出力は source of truth ではない。raw observation と Temote の authoritative state から再生成可能な projection とする。
+
+### 2.4 Context resolver
+
+Context resolver は **次の head に必要な情報だけを返すこと**を担当する。
+
+planner ではない。task 分解、実装方針、backend/model 自動選択は行わない。
+
+**7. Raw observations vs derived knowledge**
+
+```text
+authoritative state
+  Temote Task / Execution / Evidence
+            |
+            +---------+
+                      v
+              Raw Observation
+              append-only-ish
+                      |
+                      v
+                Memory Worker
+                      |
+                      v
+              Derived Knowledge
+```
+
+Raw observation:
+
+- worker によって書き換えない
+- provenance を失わない
+- worker model を変更しても同じ入力にできる
+
+Derived knowledge:
+
+- dedupe 可
+- supersede 可
+- confidence / support refs を持つ
+- worker を交換して再構築可
+
+## 受け入れ条件
+
+Complete source criteria from “20. Acceptance criteria” (unchecked items remain unverified):
+
+The checked O1–O4 items below preserve their historical local qualification. This parent additionally remains open until the following child and live evidence is complete:
+
+- [ ] Direct-agent prompt ingress, verified hook capability or explicit unsupported coverage, correlation, and context projection meet `issues/open/20261001-agent-prompt-observation-ingress.md` without collecting hidden prompts.
+- [ ] The Fabric remote observation/context acceptance rows in `issues/open/20260908-live-acceptance-matrix.md` carry actual live evidence or remain visibly NOT RUN; local PASS is not remote PASS.
+
+- [x] head が変わっても repository/task の relevant context を Temote から取得できる
+- [x] coding agent に memory maintenance prompt / tool call を要求しない
+- [x] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
+- [x] caller/agent claim と Temote verified execution state を区別する
+- [x] raw observation は worker output から独立して保持される
+- [x] derived knowledge は support refs を持ち、再生成可能
+- [x] superseded/stale knowledge を current fact として返さない
+- [x] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
+- [x] MCP/local/HTTP/Fabric remote frontend で semantic observation contract が変わらない
+- [x] secrets を observation metadata / ordinary output に複製しない
+- [x] raw transcript dump を通常の public surface にしない
+- [x] worker failure 時も task execution は独立して継続できる
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`agent-prompt-hook-capabilities`](../done/20261005-agent-prompt-hook-capabilities.md)
+- [`agent-prompt-correlation-context`](../done/20261005-agent-prompt-correlation-context.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: open umbrella — O1–O4 locally implemented/qualified; direct-agent prompt ingress O1P remains; Cloudflare remote acceptance is centralized in the live matrix
 
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Cloud extension: `issues/done/20260926-cloud-observation-knowledge-plane.md`
 Fabric naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
-Created: 2026-09-25 (Asia/Tokyo)
+> Historical Created: 2026-09-25 (Asia/Tokyo)
 
 ## 0. 2026-10-01 triage
 

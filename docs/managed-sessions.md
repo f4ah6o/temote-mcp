@@ -50,9 +50,9 @@ temote-mcp session restart mitsumori
 
 `session list` reports `starting`, `active`, `stopping`, `stopped`, or `crashed` and probes the runtime socket before treating a session as live. Stale metadata with a dead socket is never shown as `active`.
 
-`session info` includes the non-secret `host_id`, cwd, permitted directories, permission mode, start/stop timestamps, exit reason, last error, logical named-root path when available, restart policy, restart count, most recent restart time, pending restart time, and any terminal restart-limit reason.
+`session info` includes the non-secret `host_id`, cwd, permitted directories, permission mode, start/stop timestamps, exit reason, last error, logical named-root path when available, restart policy, restart count, most recent restart time, pending restart time, and any terminal restart-limit reason. New normal sessions persist the root name and root-relative path separately from their canonical host cwd. Legacy records without a logical root remain readable and can restart only at their unchanged, provable stored cwd.
 
-For compatibility, `temote-mcp start <id>` remains available. It asks the running local supervisor to start the current directory instead of owning the runtime itself. `--yolo` remains a local-only option. The public MCP `session_start` contract still cannot request yolo mode.
+For compatibility, `temote-mcp start <id>` remains available. It asks the running local supervisor to reverse-resolve the current directory into its most specific configured named root. A new normal session fails before runtime creation when no roots are configured or cwd is outside them; configure `TEMOTE_MCP_ROOTS` on the host or start within an admitted root. `--yolo` remains a local-only option. The public MCP `session_start` contract still cannot request yolo mode.
 
 Detached permission management is local-only and travels over the same owner-only supervisor Unix socket. `permission allow/revoke` keeps the existing canonical-path and symlink containment rules; the session cwd cannot be revoked. `permission ask/agent/yolo` is explicit, and none of these mutations restart the runtime or discard runtime state. Persisted permitted roots are restored when that same session/cwd is explicitly restarted.
 
@@ -122,6 +122,8 @@ Direct `serve/up` ingress remains a separate process; it can keep running when t
 Restart policy defaults to `never`. `temote-mcp session restart-policy <id> on-failure` enables automatic restart only after unexpected runtime failure; graceful stop never restarts. Automatic restart uses bounded exponential delays of 1, 2, 4, 8, and 16 seconds and then settles in `crashed` after five attempts. Lifecycle state records `restart_count`, `last_restart_at`, `next_restart_at`, and `restart_limit_reason`. The original captured start environment is retained only in supervisor memory and is never persisted; after the supervisor process itself restarts, pending credential-bearing automatic restart is intentionally not resumed and the session remains `crashed` with an explanatory reason until an explicit `session restart`.
 
 ## HTTP managed sessions
+
+Repository-source starts, their replay contract, and the generated workspace layout are described in [Managed repository provisioning](managed-provisioning.md).
 
 An authenticated direct HTTP MCP client can use:
 

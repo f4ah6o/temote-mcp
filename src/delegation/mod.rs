@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use crate::report_contract::{
+    self, MAX_DELEGATION_ARRAY_ITEMS as MAX_REPORT_ARRAY_ITEMS, MAX_REPORT_ARGUMENT_CHARS,
+    MAX_REPORT_ARRAY_ITEM_CHARS, MAX_REPORT_COMMIT_CHARS, MAX_REPORT_SUMMARY_CHARS, REPORT_FIELDS,
+    ReportProfile,
+};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -22,23 +27,6 @@ const ARTIFACT_DIRECTORY_PREFIX: &str = "temote-codex-delegation-";
 const MAX_PARENT_RESULT_BYTES: usize = 4096;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
-const REPORT_FIELDS: &[&str] = &[
-    "status",
-    "summary",
-    "base_commit",
-    "changed_files",
-    "checks",
-    "unresolved",
-    "requested_model",
-    "requested_effort",
-    "observed_model",
-    "observed_effort",
-];
-const MAX_REPORT_SUMMARY_CHARS: usize = 1200;
-const MAX_REPORT_COMMIT_CHARS: usize = 200;
-const MAX_REPORT_ARGUMENT_CHARS: usize = 256;
-const MAX_REPORT_ARRAY_ITEMS: usize = 128;
-const MAX_REPORT_ARRAY_ITEM_CHARS: usize = 512;
 const MAX_EVIDENCE_STRING_BYTES: usize = 256;
 const MAX_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -48,52 +36,6 @@ const MAX_EVENT_LINE_BYTES: usize = 128 * 1024;
 thread_local! {
     static TEST_ARTIFACT_TEMP_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
-
-const OUTPUT_SCHEMA: &str = r#"{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "status",
-    "summary",
-    "base_commit",
-    "changed_files",
-    "checks",
-    "unresolved",
-    "requested_model",
-    "requested_effort",
-    "observed_model",
-    "observed_effort"
-  ],
-  "properties": {
-    "status": {
-      "type": "string",
-      "enum": ["completed", "failed", "blocked", "needs_decision"]
-    },
-    "summary": { "type": "string", "maxLength": 1200 },
-    "base_commit": { "type": "string", "maxLength": 200 },
-    "changed_files": {
-      "type": "array",
-      "maxItems": 128,
-      "items": { "type": "string", "maxLength": 512 }
-    },
-    "checks": {
-      "type": "array",
-      "maxItems": 128,
-      "items": { "type": "string", "maxLength": 512 }
-    },
-    "unresolved": {
-      "type": "array",
-      "maxItems": 128,
-      "items": { "type": "string", "maxLength": 512 }
-    },
-    "requested_model": { "type": "string", "maxLength": 256 },
-    "requested_effort": { "type": "string", "maxLength": 256 },
-    "observed_model": { "type": ["string", "null"], "maxLength": 256 },
-    "observed_effort": { "type": ["string", "null"], "maxLength": 256 }
-  }
-}
-"#;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
@@ -888,7 +830,7 @@ fn create_artifacts_in(directory: &Path) -> Result<Artifacts, String> {
     };
     let mut schema = create_private_file(&paths.schema)?;
     schema
-        .write_all(OUTPUT_SCHEMA.as_bytes())
+        .write_all(report_contract::DELEGATION_OUTPUT_SCHEMA.as_bytes())
         .and_then(|_| schema.sync_all())
         .map_err(|error| format!("could not write Codex delegation output schema: {error}"))?;
     drop(schema);
@@ -1019,62 +961,7 @@ fn read_report(path: &Path, max_bytes: usize) -> ReportState {
 }
 
 fn validate_report_schema(report: &Value) -> bool {
-    let Some(object) = report.as_object() else {
-        return false;
-    };
-    if object.len() != REPORT_FIELDS.len()
-        || REPORT_FIELDS
-            .iter()
-            .any(|field| !object.contains_key(*field))
-    {
-        return false;
-    }
-
-    matches!(
-        object.get("status").and_then(Value::as_str),
-        Some("completed" | "failed" | "blocked" | "needs_decision")
-    ) && bounded_report_string(object.get("summary"), MAX_REPORT_SUMMARY_CHARS)
-        && bounded_report_string(object.get("base_commit"), MAX_REPORT_COMMIT_CHARS)
-        && bounded_report_array(
-            object.get("changed_files"),
-            MAX_REPORT_ARRAY_ITEMS,
-            MAX_REPORT_ARRAY_ITEM_CHARS,
-        )
-        && bounded_report_array(
-            object.get("checks"),
-            MAX_REPORT_ARRAY_ITEMS,
-            MAX_REPORT_ARRAY_ITEM_CHARS,
-        )
-        && bounded_report_array(
-            object.get("unresolved"),
-            MAX_REPORT_ARRAY_ITEMS,
-            MAX_REPORT_ARRAY_ITEM_CHARS,
-        )
-        && bounded_report_string(object.get("requested_model"), MAX_REPORT_ARGUMENT_CHARS)
-        && bounded_report_string(object.get("requested_effort"), MAX_REPORT_ARGUMENT_CHARS)
-        && bounded_nullable_report_string(object.get("observed_model"), MAX_REPORT_ARGUMENT_CHARS)
-        && bounded_nullable_report_string(object.get("observed_effort"), MAX_REPORT_ARGUMENT_CHARS)
-}
-
-fn bounded_report_string(value: Option<&Value>, max_chars: usize) -> bool {
-    value
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.chars().count() <= max_chars)
-}
-
-fn bounded_nullable_report_string(value: Option<&Value>, max_chars: usize) -> bool {
-    value.is_some_and(|value| value.is_null() || bounded_report_string(Some(value), max_chars))
-}
-
-fn bounded_report_array(value: Option<&Value>, max_items: usize, max_chars: usize) -> bool {
-    value.is_some_and(|value| {
-        value.as_array().is_some_and(|items| {
-            items.len() <= max_items
-                && items
-                    .iter()
-                    .all(|item| bounded_report_string(Some(item), max_chars))
-        })
-    })
+    report_contract::validate(report, ReportProfile::Delegation)
 }
 
 fn serialize_parent_result(result: &DelegationResult) -> Result<String, serde_json::Error> {

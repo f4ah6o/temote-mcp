@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config;
+#[cfg(unix)]
+use crate::prompt_ingress::{self, Kind as PromptKind};
 
 use super::{
     CONTEXT_SCHEMA_VERSION, JournalStatus, ListFilter, Observation, ObservationContent,
@@ -23,6 +25,138 @@ const MAX_REFS: usize = 64;
 const MAX_REFS_PER_TASK: usize = 8;
 const MAX_QUERY_BYTES: usize = 512;
 const MAX_REPOSITORY_BYTES: usize = 256;
+
+#[cfg(unix)]
+fn prompt_context_projection(session: &config::Session) -> Value {
+    let (prompt_records, degraded) =
+        match prompt_ingress::Store::default_store().and_then(|store| store.for_session(session)) {
+            Ok(records) => (records, false),
+            Err(_) => (Vec::new(), true),
+        };
+    let prompt_refs: Vec<Value> = prompt_records
+        .iter()
+        .rev()
+        .take(16)
+        .map(|record| {
+            json!({
+                "observation_id": record.id,
+                "agent": record.envelope.agent,
+                "kind": record.envelope.kind,
+                "gap_reason": record.envelope.gap_reason,
+                "observed_at": record.observed_at,
+                "body_sha256": record.body_sha256,
+                "task_id": record.envelope.task_id,
+                "execution_id": record.envelope.execution_id,
+                "agent_turn_id": record.envelope.agent_turn_id,
+                "correlation_links": record.correlations.iter().take(8).map(|link| json!({
+                    "task_id": link.task_id, "execution_id": link.execution_id,
+                    "agent_turn_id": link.agent_turn_id,
+                    "authority": "canonical_backend_task_identity",
+                })).collect::<Vec<_>>(),
+                "provenance": "owner_local_source_asserted",
+                "correlation": if !record.correlations.is_empty() { "exact_backend_task" }
+                    else if record.envelope.task_id.is_some() { "explicit" } else { "unbound" },
+            })
+        })
+        .collect();
+    let latest_user_intent = prompt_records
+        .iter()
+        .rev()
+        .find(|record| record.envelope.kind == PromptKind::UserPromptAccepted)
+        .map(|record| {
+            json!({
+                "observation_id": record.id,
+                "observed_at": record.observed_at,
+                "agent": record.envelope.agent,
+                "body_sha256": record.body_sha256,
+                "provenance": "direct_agent_local_ingress",
+                "content": "owner_local_only",
+            })
+        });
+    let recent_user_steers: Vec<Value> = prompt_refs
+        .iter()
+        .filter(|value| value["kind"] == "user_steer_accepted")
+        .take(8)
+        .cloned()
+        .collect();
+    let mut seen_conversations = BTreeSet::new();
+    let mut active_agent_conversations = Vec::new();
+    let mut prompt_conversations = Vec::new();
+    for record in prompt_records.iter().rev() {
+        let key = (
+            format!("{:?}", record.envelope.agent),
+            record.envelope.conversation_id.clone(),
+        );
+        if !seen_conversations.insert(key) {
+            continue;
+        }
+        if prompt_conversations.len() >= 8 {
+            break;
+        }
+        let gap = prompt_records.iter().rev().find(|other| {
+            other.envelope.agent == record.envelope.agent
+                && other.envelope.conversation_id == record.envelope.conversation_id
+                && other.envelope.kind == PromptKind::PromptObservationGap
+        });
+        active_agent_conversations.push(json!({
+            "agent": record.envelope.agent,
+            "conversation_id": record.envelope.conversation_id,
+            "last_observed_at": record.observed_at,
+        }));
+        prompt_conversations.push(json!({
+            "agent": record.envelope.agent,
+            "conversation_id": record.envelope.conversation_id,
+            "coverage": "partial",
+            "reason": "observed events do not prove complete direct-conversation history",
+            "last_observed_at": record.observed_at,
+            "last_source_event_id": record.envelope.source_event_id,
+            "gap_detected": gap.is_some(),
+            "gap_reason": gap.and_then(|event| event.envelope.gap_reason),
+        }));
+    }
+    let last = prompt_records.last().map(|record| record.observed_at);
+    let age = last.map(|time| config::unix_time().saturating_sub(time));
+    let worker_refs = prompt_ingress::worker_eligible(
+        &prompt_records,
+        config::unix_time(),
+        prompt_ingress::WorkerPolicy {
+            max_age_seconds: 86_400,
+            max_items: 8,
+        },
+    )
+    .unwrap_or_default();
+    json!({
+        "latest_user_intent": latest_user_intent,
+        "recent_user_steers": recent_user_steers,
+        "active_agent_conversations": active_agent_conversations,
+        "prompt_refs": prompt_refs,
+        "prompt_worker_eligible_refs": worker_refs,
+        "prompt_observation_coverage": prompt_ingress::installed_capabilities(),
+        "prompt_conversation_coverage": prompt_conversations,
+        "prompt_observation_freshness": {
+            "last_observed_at": last, "age_seconds": age,
+            "stale": age.is_none_or(|age| age > 86_400),
+            "degraded": degraded,
+            "session_instance": {"started_at": session.started_at, "process_id": session.process_id},
+        },
+    })
+}
+
+#[cfg(not(unix))]
+fn prompt_context_projection(_session: &config::Session) -> Value {
+    json!({
+        "latest_user_intent": null,
+        "recent_user_steers": [],
+        "active_agent_conversations": [],
+        "prompt_refs": [],
+        "prompt_worker_eligible_refs": [],
+        "prompt_observation_coverage": [{"agent": "codex", "coverage": "unavailable", "reason": "local Unix prompt ingress is unavailable on this platform"},
+            {"agent": "devin_acp", "coverage": "unavailable", "reason": "local Unix prompt ingress is unavailable on this platform"},
+            {"agent": "devin_cloud", "coverage": "unavailable", "reason": "local Unix prompt ingress is unavailable on this platform"}],
+        "prompt_conversation_coverage": [],
+        "prompt_observation_freshness": {"last_observed_at": null, "stale": true, "degraded": false},
+    })
+}
 
 /// Terminal task states on the shared contract.
 fn is_terminal(status: &str) -> bool {
@@ -243,6 +377,10 @@ pub(crate) fn resolve(session: &config::Session, args: &Value) -> Result<Value> 
 
     let repository = repository_label(session);
     let mut notes: Vec<String> = Vec::new();
+    let prompt = prompt_context_projection(session);
+    if prompt["prompt_observation_freshness"]["degraded"] == true {
+        notes.push("owner-local prompt observations could not be read".to_owned());
+    }
     if !status.exists {
         notes.push("no observation journal exists for this session yet".to_owned());
     }
@@ -445,6 +583,14 @@ pub(crate) fn resolve(session: &config::Session, args: &Value) -> Result<Value> 
         "unresolved": unresolved,
         "recent_related_tasks": related,
         "refs": refs,
+        "latest_user_intent": prompt["latest_user_intent"],
+        "recent_user_steers": prompt["recent_user_steers"],
+        "active_agent_conversations": prompt["active_agent_conversations"],
+        "prompt_refs": prompt["prompt_refs"],
+        "prompt_worker_eligible_refs": prompt["prompt_worker_eligible_refs"],
+        "prompt_observation_coverage": prompt["prompt_observation_coverage"],
+        "prompt_conversation_coverage": prompt["prompt_conversation_coverage"],
+        "prompt_observation_freshness": prompt["prompt_observation_freshness"],
         "freshness": {
             "resolved_revision": status.revision,
             "at_least_revision": filters.at_least_revision,

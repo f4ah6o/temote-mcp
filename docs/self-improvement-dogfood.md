@@ -127,8 +127,8 @@ model. Neither mode is live synthesis qualification. From the repository root,
 run:
 
 ```sh
-node gateway/scripts/memory-dogfood.mjs --phase baseline --mode fixture --extractor disabled
-node gateway/scripts/memory-dogfood.mjs --phase candidate --mode fixture --extractor fixture
+node fabric/scripts/memory-dogfood.mjs --phase baseline --mode fixture --extractor disabled
+node fabric/scripts/memory-dogfood.mjs --phase candidate --mode fixture --extractor fixture
 ```
 
 A fixture run reports `live_synthesis: NOT RUN` and `qualification:
@@ -140,7 +140,7 @@ Live mode starts two dedicated local supervisors and host agents with isolated
 waits for host A's observation to sync, stops only that harness-owned host,
 resolves repository context while it is offline, runs task B on host B, and
 checks Queue replay and repository isolation. It never stops a production host
-or deploys to Cloudflare. `npm ci` in `gateway/` is required first. Preserve
+or deploys to Cloudflare. `npm ci` in `fabric/` is required first. Preserve
 the exact baseline binary and use the candidate binary built from the tested
 checkout. The task model and `--effort` select the delegated coding run; the
 extractor model and `--extractor-reasoning-effort` independently configure
@@ -151,13 +151,13 @@ requires `--extractor live`, accepts `low`, `medium`, `high`, `minimal`, `none`,
 The environment fallback is `TEMOTE_MCP_MEMORY_REASONING_EFFORT`.
 
 ```sh
-node gateway/scripts/memory-dogfood.mjs --phase baseline --mode live \
+node fabric/scripts/memory-dogfood.mjs --phase baseline --mode live \
   --extractor disabled \
   --baseline-binary dogfood/runs/memory-20260928/baseline-bin/temote-mcp \
   --backend codex --model <available-model> --effort <available-effort> \
   --extractor-profile opencode-go/glm-5.3-flash
 
-node gateway/scripts/memory-dogfood.mjs --phase candidate --mode live \
+node fabric/scripts/memory-dogfood.mjs --phase candidate --mode live \
   --extractor live --candidate-binary target/debug/temote-mcp \
   --backend codex --model <same-model> --effort <same-effort> \
   --extractor-profile opencode-go/glm-5.3-flash \
@@ -207,14 +207,14 @@ Cloudflare remote gate.
 The delegated task scenario observes execution behavior; it does not discover
 new tool definitions or deploy Fabric. Use the runtime observations to identify
 friction, then change the authoritative Rust registry when a tool needs a fix.
-Fabric (currently `gateway/`) consumes the generated public host-routing
+Fabric (currently `fabric/`) consumes the generated public host-routing
 projection, including descriptions and input schemas:
 
 ```text
 src/mcp.rs::tools() + public host-routing projection
   -> just generate-tools
-  -> gateway/contract/routed-tool-metadata.json
-  -> gateway/src/protocol.js::PUBLIC_TOOLS
+  -> fabric/contract/routed-tool-metadata.json
+  -> fabric/src/protocol.js::PUBLIC_TOOLS
   -> Worker MCP tools/list
 ```
 
@@ -223,9 +223,9 @@ After retaining a baseline binary and observation, run:
 ```sh
 just generate-tools
 just check-generated
-npm ci --prefix gateway
-npm test --prefix gateway
-npm run deploy:dry-run --prefix gateway
+npm ci --prefix fabric
+npm test --prefix fabric
+npm run deploy:dry-run --prefix fabric
 ```
 
 Run generation twice and compare the artifact bytes. The generator’s fixture

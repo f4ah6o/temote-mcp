@@ -69,6 +69,7 @@ const DENY_KEYS_SUBSTRING: &[&str] = &[
 /// stays empty until a caller identity model exists; today only the
 /// transport is authoritative.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActorRef {
     pub transport: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

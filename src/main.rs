@@ -5,14 +5,23 @@ mod access;
 mod activity_runtime;
 mod approvals;
 mod boot_identity;
+mod change;
+mod change_cli;
 mod child_env;
 pub(crate) mod cli;
 mod codex_app_server;
+#[cfg(unix)]
+mod codex_prompt_observer;
 mod config;
+mod delivery;
 mod devin_acp;
 #[cfg(feature = "network")]
 mod devin_cloud;
 mod doctor;
+mod environment_preparation;
+mod environment_prepare_cli;
+#[cfg(feature = "network")]
+mod events_host;
 mod evidence;
 mod friction;
 #[cfg(feature = "network")]
@@ -27,25 +36,36 @@ mod lifecycle;
 mod line_protocol;
 #[cfg(feature = "network")]
 mod local_oauth;
+mod local_tasks;
 mod managed_worktree;
 mod mcp;
+mod mcp_tasks;
 mod named_roots;
 mod observation;
 #[cfg(feature = "network")]
 mod openai_tunnel;
 #[cfg(feature = "network")]
+mod opencode_private_workspace;
+#[cfg(feature = "network")]
 mod opencode_server;
+#[cfg(feature = "network")]
+mod opencode_workspace;
 mod orchestration;
 mod pending_interaction;
 mod platform_paths;
 mod profile;
+#[cfg(unix)]
+mod prompt_ingress;
 #[cfg(feature = "network")]
 mod provider;
+mod report_contract;
 mod repository_clone;
+mod repository_store;
 mod session_control;
 #[allow(dead_code)]
 mod session_source;
 mod supervisor;
+mod task_cli;
 #[cfg(test)]
 mod test_support;
 #[cfg(all(feature = "network", unix))]
@@ -53,6 +73,7 @@ mod upgrade_coordinator;
 mod upgrade_transaction;
 #[allow(dead_code)]
 mod vcs;
+mod workspace_provisioning;
 
 use temote_mcp::sandbox;
 
@@ -60,7 +81,6 @@ use temote_mcp::sandbox;
 use std::net::SocketAddr;
 #[cfg(feature = "network")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "network")]
 #[cfg(feature = "network")]
 use std::time::Duration;
 
@@ -71,7 +91,7 @@ use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = match cli::parse_env() {
-        Ok(cli::ParseOutcome::Run(cli)) => cli,
+        Ok(cli::ParseOutcome::Run(cli)) => *cli,
         Ok(cli::ParseOutcome::Print(output)) => {
             print!("{output}");
             return Ok(());
@@ -87,7 +107,7 @@ async fn main() -> Result<()> {
     {
         session_control::initialize_installed_upgrade_locator_from(installed_locator)?;
     } else if let Some(installed_locator) =
-        std::env::var_os(session_control::INTERNAL_INSTALLED_LOCATOR_ENV)
+        temote_mcp::environment::var_os(session_control::INTERNAL_INSTALLED_LOCATOR_ENV)
     {
         session_control::initialize_installed_upgrade_locator_from(std::path::Path::new(
             &installed_locator,
@@ -152,10 +172,82 @@ async fn main() -> Result<()> {
             follow,
         } => session_control::run_activity_command(session_id, tail, follow).await,
         cli::Command::Observation { command } => observation::cli::run_observation_command(command),
+        #[cfg(unix)]
+        cli::Command::PromptIngress => observation::cli::run_prompt_ingress_listener().await,
+        #[cfg(unix)]
+        cli::Command::PromptLink {
+            prompt_id,
+            session_id,
+            task_id,
+        } => observation::cli::link_prompt_to_task(prompt_id, &session_id, task_id).await,
+        #[cfg(unix)]
+        cli::Command::Friction { command } => match command {
+            cli::FrictionCommand::ScanMany {
+                session_ids,
+                consumer_id,
+                generation,
+            } => {
+                observation::cli::run_friction_scan_many(&session_ids, &consumer_id, generation)
+                    .await
+            }
+            cli::FrictionCommand::Scan {
+                session_id,
+                consumer_id,
+                generation,
+            } => observation::cli::run_friction_scan(&session_id, &consumer_id, generation).await,
+            cli::FrictionCommand::Preview { fingerprint } => {
+                observation::cli::preview_friction_candidate(&fingerprint)
+            }
+            cli::FrictionCommand::KnownIssue {
+                fingerprint,
+                issue_ref,
+                consumer_id,
+                generation,
+            } => observation::cli::mark_friction_known_issue(
+                &fingerprint,
+                &issue_ref,
+                &consumer_id,
+                generation,
+            ),
+            cli::FrictionCommand::RecordPr {
+                fingerprint,
+                pr_url,
+            } => observation::cli::record_friction_pr_receipt(&fingerprint, &pr_url).await,
+            cli::FrictionCommand::ReconcilePr { fingerprint } => {
+                observation::cli::reconcile_friction_pr(&fingerprint).await
+            }
+            cli::FrictionCommand::Publish {
+                fingerprint,
+                publication_session_id,
+                temote_repo_root,
+                model,
+                effort,
+                authorization,
+            } => {
+                observation::cli::publish_friction_candidate(
+                    &fingerprint,
+                    &publication_session_id,
+                    &temote_repo_root,
+                    &model,
+                    &effort,
+                    &authorization,
+                )
+                .await
+            }
+        },
+        cli::Command::Task { request } => session_control::task(request).await,
+        cli::Command::EnvironmentPrepare { request } => environment_prepare_cli::run(request).await,
+        cli::Command::Change { request } => change_cli::run_managed(request).await,
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await
             }
+            cli::SessionCommand::StartManaged {
+                source,
+                operation_id,
+                base,
+                vcs,
+            } => session_control::start_managed_named(source, operation_id, base, vcs).await,
             cli::SessionCommand::List => session_control::list().await,
             cli::SessionCommand::Info { session_id } => session_control::info(session_id).await,
             cli::SessionCommand::Stop { session_id } => session_control::stop(session_id).await,
@@ -256,6 +348,42 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        #[cfg(feature = "network")]
+        cli::Command::FabricStatus => {
+            load_public_env()?;
+            let status = gateway::fabric_status().await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            anyhow::ensure!(
+                status.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+                "Fabric is not ready; review the stage diagnostics above."
+            );
+            Ok(())
+        }
+        #[cfg(feature = "network")]
+        cli::Command::EventsSender { addr } => {
+            load_public_env()?;
+            let bearer =
+                temote_mcp::environment::var("TEMOTE_MCP_EVENTS_SENDER_BEARER").map_err(|_| {
+                    anyhow::anyhow!(
+                        "event sender bearer must be supplied through runtime injection"
+                    )
+                })?;
+            anyhow::ensure!(
+                bearer.len() >= 32,
+                "event sender bearer must have at least 32 bytes"
+            );
+            anyhow::ensure!(
+                addr.ip().is_loopback(),
+                "event sender must bind a loopback address"
+            );
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, temote_mcp::events_sender::router(bearer))
+                .with_graceful_shutdown(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
+            Ok(())
+        }
         #[cfg(feature = "network")]
         cli::Command::GatewayAgent {
             gateway_url,
@@ -472,7 +600,7 @@ fn default_public_env_file() -> Result<PathBuf> {
 
 #[cfg(feature = "network")]
 fn public_env_file() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TEMOTE_MCP_ENV_FILE") {
+    if let Some(path) = temote_mcp::environment::var_os("TEMOTE_MCP_ENV_FILE") {
         return Ok(PathBuf::from(path));
     }
     default_public_env_file()
@@ -790,8 +918,12 @@ fn migrate_legacy_cloudflare_config(dry_run: bool) -> Result<()> {
 pub(crate) fn load_public_env() -> Result<()> {
     let path = public_env_file()?;
     if let Some(bytes) = read_private_public_env(&path)? {
-        dotenvy::from_read(std::io::Cursor::new(bytes))
-            .with_context(|| format!("failed to load {}", path.display()))?;
+        dotenvy::from_read(std::io::Cursor::new(bytes)).map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse runtime environment file {}",
+                path.display()
+            )
+        })?;
     }
     Ok(())
 }

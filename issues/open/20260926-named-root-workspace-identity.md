@@ -1,13 +1,118 @@
 # Require named-root-backed workspace admission for all host-local sessions
 
-Status: design ready / implementation not started — 2026-09-29 session-first correction applied; NR1 を polished packet 化: `issues/polished/20260927-named-root-reverse-resolution.md` (ready)。NR0 は `NamedRoots` (`src/named_roots.rs`) + supervisor 集約でほぼ充足しており、残存の ad-hoc 解析が無いことの確認を NR1 packet の step 1 に含めた。
+Status: open
+Model: unknown
+Created: 2026-09-26
+Updated: 2026-10-05
+Branch: codex/20261005-complete-issues-fabric
+
+## 概要
+
+Require named-root admission for all host-local sessions while keeping logical workspace identity distinct from physical cwd.
+
+## 背景
+
+The detailed design, decisions, and historical evidence remain in 「既存設計・履歴」 below. This 2026-10-05 normalization records the current work boundary without claiming implementation or test completion.
+
+## 問題
+
+Physical cwd alone is neither a stable logical identity nor sufficient named-root admission across entry points.
+
+## 目標
+
+Require named-root admission for all host-local sessions while keeping logical workspace identity distinct from physical cwd.
+
+## 対象外
+
+Do not expand this packet into unrelated backend execution, broad host access, or changes to the repository safety invariants. Existing completed slices and their evidence remain historical facts.
+
+### Preserved scope boundary: 17. Non-goals
+
+- Requiring all Hosts to use the same physical filesystem path.
+- Treating root name as repository identity.
+- Removing `TEMOTE_MCP_ROOTS`.
+- Automatically discovering or authorizing arbitrary repositories.
+- Letting remote callers create filesystem roots.
+- Solving repository/worktree identity entirely in this issue.
+
+## 提案する方針
+
+Follow the preserved detailed contract and split remaining independent phases into the linked child packets where listed. Keep accepted side effects idempotent, scoped, and reconcilable. Use the current source and docs as the implementation baseline.
+
+### Preserved fixed contract: 1. Decision
+
+Make **named-root-backed filesystem admission mandatory for every host-local Temote workspace**, while separating that admission coordinate from durable Workspace / Session identity.
+
+However, do **not** make the environment variable `TEMOTE_MCP_ROOTS` itself the architectural requirement.
+
+The invariant should be:
+
+> Every host-local workspace Temote executes in is contained by a configured named-root registry (directly or through a configured managed-workspace pool backed by one of those roots).
+
+For an existing-workspace compatibility session, `<root-name>/<relative-path>` remains the logical location coordinate.
+
+For a new managed-repository session, the durable identity is instead `SessionId / RepositoryId / WorkspaceId / ChangeId`; Temote allocates the physical workspace under an admitted root. The caller does not need to provide that generated path.
+
+This correction is specified by `issues/open/20260929-session-first-managed-provisioning.md`.
+
+`TEMOTE_MCP_ROOTS` remains one supported source for populating the registry.
+
+Future sources may include a Temote config file or explicit root-management CLI.
+
+## 受け入れ条件
+
+Complete source criteria from “16. Acceptance criteria” (unchecked items remain unverified):
+
+- [ ] Every newly created managed session has a named root.
+- [ ] Every newly created managed session has a root-relative logical path.
+- [ ] Local and remote session creation use the same root resolver.
+- [ ] `temote-mcp start <id>` cannot create an unregistered absolute/cwd workspace.
+- [ ] Cwd shorthand reverse-resolves into a named root when valid.
+- [ ] Missing root configuration fails closed.
+- [ ] Missing root target fails closed.
+- [ ] No HOME, `/`, repository-only, or arbitrary cwd fallback exists.
+- [ ] Remote callers cannot register or broaden roots.
+- [ ] Session metadata can distinguish logical workspace identity from physical cwd.
+- [ ] Persisted legacy sessions have a safe migration path.
+- [ ] Nested/overlapping root behavior is deterministic and tested.
+- [ ] Host root remapping does not mutate active session cwd.
+- [ ] Fabric/shared metadata does not treat host absolute paths as global identity.
+- [ ] `TEMOTE_MCP_ROOTS` remains supported but is not the only possible configuration source.
+- [ ] Documentation describes one consistent workspace identity model.
+
+## テスト計画
+
+- Run focused unit and integration tests for the behaviors and boundaries specified in the preserved design.
+- Run `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, and `git diff --check`; run `(cd fabric && npm test)` for shared protocol or Fabric changes. Record host-only and external gates as NOT RUN until actually executed.
+
+## リスク
+
+- Preserve session ownership, canonical scope, approval, bounded evidence, and fail-closed routing; do not reinterpret an unknown state as success.
+
+## 変更履歴
+
+Assess user-visible, operational, compatibility, and migration effects during implementation and add a `CHANGES.md` entry when applicable; this issue-only preparation does not edit the changelog.
+
+## 注記
+
+- 2026-10-05: Normalized the issue. This is a preparation record; unchecked criteria and external gates remain incomplete.
+
+## 2026-10-05 実行パケット
+
+- [`named-root-identity-enforcement`](../done/20261005-named-root-identity-enforcement.md)
+
+These are planned packets, not completed implementation. The parent remains open until applicable children and acceptance evidence are complete.
+
+## 既存設計・履歴
+
+> Historical Status: design ready / implementation not started — 2026-09-29 session-first correction applied; NR1 を polished packet 化: `issues/done/20260927-named-root-reverse-resolution.md` (ready)。NR0 は `NamedRoots` (`src/named_roots.rs`) + supervisor 集約でほぼ充足しており、残存の ad-hoc 解析が無いことの確認を NR1 packet の step 1 に含めた。
 Repository: `f4ah6o/temote-mcp`  
 Related:
 - `issues/open/20260924-temote-development-harness-restructure.md`
 - `issues/done/20260925-f1-repository-store-workspace-contract.md`
 - `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-temote-fabric-product-boundary.md`
-Created: 2026-09-26 (Asia/Tokyo)
+> Historical Created: 2026-09-26 (Asia/Tokyo)
 
 ## 1. Decision
 

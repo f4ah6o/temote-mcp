@@ -96,7 +96,7 @@ fn helper_candidates(executable: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn helper_executable() -> Result<PathBuf> {
-    let executable = match std::env::var_os("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR") {
+    let executable = match crate::environment::var_os("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR") {
         Some(locator) => std::fs::canonicalize(locator)?,
         None => std::env::current_exe()?,
     };

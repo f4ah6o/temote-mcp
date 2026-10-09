@@ -1,8 +1,8 @@
-# Multi-host Cloudflare gateway
+# Temote Fabric on Cloudflare
 
 [日本語](gateway.ja.md)
 
-Temote Fabric is currently implemented under `gateway/`. This optional Worker exposes one MCP endpoint for a federated set of Temote hosts. A macOS machine, a Linux machine, and a Windows 11 machine running Temote in WSL2 can each run one supervisor plus one host-level gateway agent. The MCP client discovers hosts and selects a host and session without configuring a separate MCP server entry per machine.
+Temote Fabric is currently implemented under `fabric/`. This optional Worker exposes one MCP endpoint for a federated set of Temote hosts. A macOS machine, a Linux machine, and a Windows 11 machine running Temote in WSL2 can each run one supervisor plus one host-level gateway agent. The MCP client discovers hosts and selects a host and session without configuring a separate MCP server entry per machine.
 
 Native Windows execution remains a later milestone. Windows 11 federation currently means Temote running inside WSL2.
 
@@ -18,6 +18,8 @@ Native Windows execution remains a later milestone. Windows 11 federation curren
 - Knowledge is a derived, provenance-bearing projection. It does not authorize or start execution.
 
 A host reconnect increments its generation. Requests and responses from an older generation or process `instance_id` are rejected. Timed-out or disconnected tool calls are not automatically replayed, because routed operations may be non-idempotent.
+
+New host agents negotiate up to eight concurrent RPCs; gateways that do not advertise capacity keep the original serial protocol. When all slots are occupied, the agent sends a lease heartbeat without accepting another request. Accepted RPCs remain owned across a transport reconnect, and a failed response upload retries only the same response envelope. Generation replacement still fences old responses; no RPC is automatically replayed.
 
 ## Host identity and authentication
 
@@ -35,26 +37,56 @@ Each local host receives only its own token through `TEMOTE_MCP_GATEWAY_HOST_TOK
 
 ## Deploy
 
-Run repository `just` commands from the repository root. Run npm and Wrangler commands from `gateway/`, where the pinned package, lockfile, and `wrangler.toml` live; the working directory does not carry between separate code blocks.
+Use the pinned `cf` CLI and `cloudflare.config.ts` for the canonical deployment.
+The ignored `TEMOTE_DEPLOYMENT_CONFIG` profile selects the Worker, database,
+domain and non-secret Access policy. Follow the staged [naming migration](naming-migration.md)
+when upgrading an existing Gateway; retain both namespace IDs, the D1 ID and
+the source credential authority. Capture a D1 Time Travel bookmark before
+applying migrations, and verify foreign-key integrity afterward.
+
+```sh
+# Repository root
+just generate-tools
+just check-generated
+(cd fabric && npm test)
+# From the Fabric source directory, with a reviewed non-secret profile:
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf build
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf deploy --prebuilt --dry-run
+TEMOTE_DEPLOYMENT_CONFIG=.cloudflare/deployment.json cf deploy --prebuilt
+```
+
+Existing secrets are inherited by name. New secrets require authorized runtime
+injection; do not copy secret values into a profile or command. Events and
+memory capabilities remain disabled until their dependencies are configured.
+An upload or dry-run does not prove domain routing, Access authentication or
+Host/session availability. Verify those after each applicable stage.
+
+### Wrangler compatibility deployment
+
+The following procedure retains the legacy Wrangler configuration for existing
+operators. Its command flags apply to Wrangler, while the package's deployment
+scripts now invoke `cf`.
+
+Run repository `just` commands from the repository root. Run npm and Wrangler commands from `fabric/`, where the pinned package, lockfile, and `wrangler.toml` live; the working directory does not carry between separate code blocks.
 
 1. Use Node.js 22 or newer and install the pinned deploy tooling:
 
 ```sh
-(cd gateway && npm ci)
+(cd fabric && npm ci)
 ```
 
 2. Select a public target, inspect its existing ownership, and configure Cloudflare Access for the whole hostname **before publishing**. Enable Managed OAuth for human MCP clients and a Service Auth policy for host agents. See [Deployment target](#deployment-target). Keep `workers_dev = false`.
-3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, inspect pending migrations, and apply them using the pinned Wrangler from `gateway/`. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing knowledge, support, and supersession rows; review it against the target database before applying. Keep existing Durable Object class names and bindings when updating a deployed Worker.
+3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, inspect pending migrations, and apply them using the pinned Wrangler from `fabric/`. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing knowledge, support, and supersession rows; review it against the target database before applying. Keep existing Durable Object class names and bindings when updating a deployed Worker.
 
 ```sh
-(cd gateway && npx wrangler d1 migrations list temote-observation --remote)
-(cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
+(cd fabric && npx wrangler d1 migrations list temote-observation --remote)
+(cd fabric && npx wrangler d1 migrations apply temote-observation --remote)
 ```
 
 4. Store the per-host token map interactively; preserve `HOST_TOKEN` only if legacy per-session agents still need it. The Access service token and Temote host bearer token are independent credentials.
 
 ```sh
-(cd gateway && npx wrangler secret put HOST_TOKENS_JSON)
+(cd fabric && npx wrangler secret put HOST_TOKENS_JSON)
 ```
 
 5. Generate and check metadata, run tests, then bundle without publishing. After remote configuration and secrets are verified, deploy with the selected target:
@@ -64,15 +96,15 @@ Run repository `just` commands from the repository root. Run npm and Wrangler co
 just generate-tools
 just check-generated
 
-# gateway/
-(cd gateway && npm test)
-(cd gateway && npm run deploy:dry-run -- --keep-vars)
-(cd gateway && npm run deploy -- --keep-vars)
+# fabric/
+(cd fabric && npm test)
+(cd fabric && npx wrangler deploy --dry-run --keep-vars)
+(cd fabric && npx wrangler deploy --keep-vars)
 ```
 
 6. Verify health and authenticated MCP reachability using the checks below. A deploy without a target can upload a version without publishing it.
 
-The public MCP URL is `https://<gateway-host>/mcp`. The Worker imports `gateway/contract/routed-tool-metadata.json` generated from Rust; see [generation and stale checks](development.md#connected-runtime-contract-parity). A bundle dry-run proves configuration/build validity, not remote authentication, secret presence or endpoint readiness.
+The public MCP URL is `https://<gateway-host>/mcp`. The Worker imports `fabric/contract/routed-tool-metadata.json` generated from Rust; see [generation and stale checks](development.md#connected-runtime-contract-parity). A bundle dry-run proves configuration/build validity, not remote authentication, secret presence or endpoint readiness.
 
 The D1 schema includes observation, memory-run, checkpoint, outbox, and knowledge tables. Inspect all pending migrations before applying them. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing rows and provenance, so review it against the target database before applying. Memory extraction is disabled by default (`MEMORY_ENABLED = "false"`). To enable the OpenAI-compatible extractor, set `MEMORY_ENABLED = "true"`, `MEMORY_EXTRACTOR = "openai_compatible"`, a full `MEMORY_ENDPOINT` URL, `MEMORY_MODEL`, `MEMORY_TIMEOUT_MS`, `MEMORY_INPUT_BUDGET_BYTES`, `MEMORY_OUTPUT_BUDGET_BYTES`, `MEMORY_MAX_ATTEMPTS`, `MEMORY_BATCH_SIZE`, and `MEMORY_PROJECTION_GENERATION` in the existing Worker config. Store `MEMORY_API_KEY` as a Worker secret; never put its value in `wrangler.toml`, `.dev.vars.example`, or an evaluation artifact. Increase `MEMORY_PROJECTION_GENERATION` monotonically when changing extraction semantics so an older worker cannot replace the active projection.
 
@@ -81,10 +113,10 @@ Optionally set `MEMORY_REASONING_EFFORT` to `low`, `medium`, `high`, `minimal`, 
 `MEMORY_OUTPUT_BUDGET_BYTES` continues to cap the extracted JSON content. Separately, the HTTP response JSON envelope is capped at `min(80 KiB, 2 × MEMORY_OUTPUT_BUDGET_BYTES + 16 KiB)`: 32 KiB at the default 8 KiB content budget and 80 KiB at the 32 KiB maximum. The adapter reads only the response `content`; provider `reasoning_content` and `usage` are ignored, never logged or persisted, and never reused. If the provider response includes `finish_reason`, only `stop` is accepted; any other value is rejected without advancing the checkpoint. A genuinely absent `finish_reason` is allowed. An oversized envelope also fails without advancing the checkpoint. After correcting the provider or response-budget configuration, increase `MEMORY_PROJECTION_GENERATION` to retry retained observations as a new projection.
 
 ```sh
-(cd gateway && npx wrangler secret put MEMORY_API_KEY)
+(cd fabric && npx wrangler secret put MEMORY_API_KEY)
 ```
 
-`wrangler secret put` creates a Worker deployment immediately. Run it only as part of configuring the intended target, after checking the target and Access policy. See [Wrangler secret management](https://developers.cloudflare.com/workers/configuration/secrets/). Set `MEMORY_ENABLED` to `false` to pause extraction or `true` to enable it, then deploy the reviewed Worker config. The `temote-memory` Queue and five-minute scheduled sweep are declared in `gateway/wrangler.toml`; preserve both bindings when deploying. Queue messages are at-least-once wake-ups; the D1 outbox marks unsent or stale work due after 60 seconds, and the next five-minute sweep requeues it, including recovery when a Queue send response was lost. A provider run stops retrying after `MEMORY_MAX_ATTEMPTS` and reports `failed` with a bounded error code through `context_status`; the sweep does not override that limit. To retry after fixing a provider or input failure, monotonically increase `MEMORY_PROJECTION_GENERATION` and deploy the reviewed config. This requests a new producer version that reprocesses retained observations from the start while the prior active projection remains readable until the rebuild catches up. Treat this as an explicit rebuild with provider cost. Use `context_status` to inspect synchronization and worker freshness after configuration. Do not enable the `fixture` extractor in a live deployment.
+`wrangler secret put` creates a Worker deployment immediately. Run it only as part of configuring the intended target, after checking the target and Access policy. See [Wrangler secret management](https://developers.cloudflare.com/workers/configuration/secrets/). Set `MEMORY_ENABLED` to `false` to pause extraction or `true` to enable it, then deploy the reviewed Worker config. The `temote-memory` Queue and five-minute scheduled sweep are declared in `fabric/wrangler.toml`; preserve both bindings when deploying. Queue messages are at-least-once wake-ups; the D1 outbox marks unsent or stale work due after 60 seconds, and the next five-minute sweep requeues it, including recovery when a Queue send response was lost. A provider run stops retrying after `MEMORY_MAX_ATTEMPTS` and reports `failed` with a bounded error code through `context_status`; the sweep does not override that limit. To retry after fixing a provider or input failure, monotonically increase `MEMORY_PROJECTION_GENERATION` and deploy the reviewed config. This requests a new producer version that reprocesses retained observations from the start while the prior active projection remains readable until the rebuild catches up. Treat this as an explicit rebuild with provider cost. Use `context_status` to inspect synchronization and worker freshness after configuration. Do not enable the `fixture` extractor in a live deployment.
 
 Changing the adapter version isolates new runs from completed runs under the previous producer version, including runs that were incorrectly marked complete. Before deploying the version 5 adapter, monotonically increase `MEMORY_PROJECTION_GENERATION` to rebuild from retained observations; raw observations are unchanged. Until the new projection is published, the prior valid projection remains readable but is marked stale. Use `context_status` to distinguish that rebuild state from a complete current projection.
 
@@ -96,10 +128,10 @@ If projection preparation would exceed the 512-statement commit cap, the Worker 
 
 `workers_dev = false` means a deploy without a route or custom domain does not publish the Worker and can print `No targets deployed`. Treat that output as a failure even when the command exits 0, and choose exactly one target:
 
-Before invoking Wrangler, run the repository-local preflight with the intended target. This command runs from `gateway/`:
+Before invoking Wrangler, run the repository-local preflight with the intended target. This command runs from `fabric/`:
 
 ```sh
-cd gateway
+cd fabric
 npm run deploy:preflight -- --hostname gateway.example.com --route 'gateway.example.com/*'
 ```
 
@@ -107,7 +139,7 @@ The preflight reports `target_missing`, `target_mismatch`, or `remote_unknown` a
 
 | Option | Use when | Target setup | Access | Verification |
 | --- | --- | --- | --- | --- |
-| A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `gateway/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | Run Wrangler status from `gateway/`; use the Access-authenticated `/healthz` check below. |
+| A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `fabric/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | Run Wrangler status from `fabric/`; use the Access-authenticated `/healthz` check below. |
 | B. Existing DNS + Worker route | A DNS record already exists and must not be deleted. | Pass the exact pattern to the deploy, for example `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`. | Protect the whole hostname with a Cloudflare Access application. | Same as A; also confirm the route pattern points at `temote-mcp-gateway` in the Cloudflare dashboard. |
 
 Both options follow the same rules:
@@ -120,17 +152,17 @@ Both options follow the same rules:
 
 ### Verify a deployment (read-only)
 
-Run the Wrangler command from `gateway/`. The whole hostname is protected by Access, so send the service-token credentials accepted by its Service Auth policy for the health check. Keep these values in a protected environment or secret store; do not paste them into the command or logs:
+Run the Wrangler command from `fabric/`. The whole hostname is protected by Access, so send the service-token credentials accepted by its Service Auth policy for the health check. Keep these values in a protected environment or secret store; do not paste them into the command or logs:
 
 ```sh
-(cd gateway && npx wrangler deployments status --name temote-mcp-gateway)
+(cd fabric && npx wrangler deployments status --name temote-mcp-gateway)
 curl --silent --show-error --fail \
-  --header "CF-Access-Client-Id: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID:?set the Access service-token client ID}" \
-  --header "CF-Access-Client-Secret: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET:?set the Access service-token client secret}" \
+  --header "CF-Access-Client-Id: ${TEMOTE_FABRIC_ACCESS_CLIENT_ID:?set the Access service-token client ID}" \
+  --header "CF-Access-Client-Secret: ${TEMOTE_FABRIC_ACCESS_CLIENT_SECRET:?set the Access service-token client secret}" \
   "https://<gateway-host>/healthz"
 ```
 
-`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`). The Worker does not require a client token for `/healthz`; Cloudflare Access still protects the hostname at the edge. A direct-origin response or a different service identity means the hostname still points at the wrong target. `contractFingerprint` is the SHA-256 digest of the public tool contract; it must equal `gateway/contract/public-tools.fingerprint` from the deployed source revision and the `server_contract_fingerprint` reported by the local/connected server's `session_info`.
+`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-fabric","readiness":"ready","identity":"temote-fabric","compatibilityIdentity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`). The Worker does not require a client token for `/healthz`; Cloudflare Access still protects the hostname at the edge. A direct-origin response or a different service identity means the hostname still points at the wrong target. `contractFingerprint` is the SHA-256 digest of the public tool contract; it must equal `fabric/contract/public-tools.fingerprint` from the deployed source revision and the `server_contract_fingerprint` reported by the local/connected server's `session_info`.
 
 For MCP `tools/list` and other `/mcp` requests, use an MCP client authenticated through Access Managed OAuth as a user whose email is in `ACCESS_ALLOWED_EMAILS`. The Worker verifies the Access JWT's signature, audience, issuer, expiry, subject, and allowlisted email. An Access service token is for host-agent Service Auth and the `/healthz` smoke check; its JWT has no user email and an empty subject, so it does not satisfy `/mcp`'s user-identity check. Do not set the local/test `CLIENT_TOKEN` on the production Worker.
 
@@ -138,7 +170,7 @@ For MCP `tools/list` and other `/mcp` requests, use an MCP client authenticated 
 
 Rollback removes only the exact Worker route or custom domain that was added:
 
-1. Remove the exact route pattern or custom-domain binding for `<gateway-host>` in the Cloudflare dashboard or by reverting `gateway/wrangler.toml`, then deploy the previous target set.
+1. Remove the exact route pattern or custom-domain binding for `<gateway-host>` in the Cloudflare dashboard or by reverting `fabric/wrangler.toml`, then deploy the previous target set.
 2. Leave the DNS record, the Access application, and the Tunnel untouched so the direct origin remains usable.
 3. Confirm with `curl -sSf https://<gateway-host>/healthz` and the dashboard that the hostname no longer resolves to the Worker, then restore the intended direct-origin configuration if needed.
 
@@ -151,23 +183,25 @@ Configure named roots on the machine running the supervisor. Only root names are
 macOS example:
 
 ```sh
-export TEMOTE_MCP_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
-export TEMOTE_MCP_GATEWAY_HOST_ID=mac-main
-export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
-export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<token assigned to mac-main>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
-export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
+export TEMOTE_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
+export TEMOTE_FABRIC_HOST_ID=mac-main
+export TEMOTE_FABRIC_URL=https://<gateway-host>
+export TEMOTE_FABRIC_HOST_TOKEN='<token assigned to mac-main>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_ID='<Access service-token ID>'
+export TEMOTE_FABRIC_ACCESS_CLIENT_SECRET='<Access service-token secret>'
 
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id mac-main
+temote fabric connect --host-id mac-main
 ```
+
+Run the supervisor and `fabric connect` in separate foreground terminals. `fabric connect` is also available as `temote-mcp gateway-agent`; both use the same reconnecting Host protocol. Existing `TEMOTE_MCP_GATEWAY_*` environment names remain supported as fallback aliases, while `TEMOTE_FABRIC_*` takes precedence. Check readiness with `temote fabric status`: it prints configuration, supervisor, remote endpoint identity, authorization, host lease/generation, and publicly usable session stages. It is read-only and exits unsuccessfully unless every stage is ready; credentials and remote response bodies are never printed. It uses a restricted local diagnostic request; if the running supervisor does not support that request, the local stage is unavailable and the CLI does not send a legacy maintenance probe.
 
 Linux uses the same model with Linux paths. On Windows 11, run the supervisor and agent inside WSL2 and use WSL paths such as `/mnt/d/Developer`:
 
 ```sh
-export TEMOTE_MCP_ROOTS='{"src":"/mnt/d/Developer"}'
+export TEMOTE_ROOTS='{"src":"/mnt/d/Developer"}'
 temote-mcp supervisor
-temote-mcp gateway-agent --host-id win-main --platform wsl2
+temote fabric connect --host-id win-main --platform wsl2
 ```
 
 The existing host-level `gateway-agent --host-id` automatically sends bounded observation batches over its authenticated channel: at most 32 records or 512 KiB per batch, on a five-second loop with an eight-second sync request timeout. It writes locally first, so a Fabric timeout or authorization failure does not fail a delegated task or replay its backend operation. The agent scans retained session journals, including terminal observations created when the ordinary `task_get` polling observes completion, and persists an owner-only per-host, per-Fabric-endpoint, per-session cursor. It does not independently poll a backend after its caller stops polling. `committed_through_revision` records the highest source revision confirmed committed to D1; `acked_through_revision` is the contiguous source revision D1 can confirm. The delivered cursor can advance across a known gap so later retained records still sync, while the gap remains visible and `complete=false`. The source revision cursors are not cloud sequence numbers.
@@ -186,7 +220,7 @@ Instruction and error previews are excluded from cloud sync by default. `TEMOTE_
 
 Keep this setting unchanged until every pending batch for that host and Fabric endpoint is ACKed. D1 may commit a batch while its response is lost; after restart, the host retries from its durable cursor. If the preview setting changed, the retried payload differs and D1 rejects it with `409 conflicting_replay` rather than overwriting the committed observation. An opt-out retry omits previews. Do not weaken payload digest checks to make the retry appear successful. If a conflict occurs, restore the originally authorized preview policy and sync until ACK only when that upload remains authorized; otherwise stop that host agent and leave the source diagnosed. Turning previews off cannot undisclose preview text already committed to D1.
 
-`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs a read-only `/healthz` identity check and authenticated `/v1/hosts/status` probe. These classify the remote endpoint, Access authorization, and this host's active lease. Doctor also reports `session_availability` from the local supervisor's read-only session inventory as `listed_sessions`/`active_sessions` counts; this reuses the supervisor control protocol, never dispatches an MCP tool, and never mutates a session or lease. A confirmed inventory whose live (`active`/`starting`) session count is zero is reported as `failed`, not `ready`; an inventory that cannot be enumerated is `unavailable`. When a local host-level `gateway-agent` generation is recorded, doctor compares the authenticated gateway `generation` against it and reports `generation_replaced` when the remote generation is newer, so a superseded local agent is not mistaken for a healthy one. The host-level `gateway-agent` separately reports a bounded, non-secret `session_availability` value (`ready`, `session_unavailable`, or `unavailable`) on each poll; the authenticated `/v1/hosts/status` response returns the latest reported value, and an unreported value stays `not_checked` instead of being treated as `ready`. That remote value is derived read-only from the supervisor inventory and carries no session ID, path, or credential. Doctor never prints root paths or token values.
+`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_FABRIC_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs an Access-authenticated `/healthz` identity check and `/v1/hosts/status` probe without following redirects. These classify the remote endpoint, authorization, and this host's active lease and generation. Doctor also reports `session_availability` from the local supervisor's read-only session inventory as `listed_sessions`/`active_sessions`/`publicly_usable_sessions` counts; yolo/local-only sessions and sessions that are still starting do not count as publicly usable. This reuses a restricted supervisor diagnostic request, never dispatches an MCP tool, and never mutates a session or lease. An older running supervisor that does not support this request is reported as unavailable without receiving a legacy maintenance probe. An inventory with no active non-yolo session is reported as `failed`, not `ready`; an inventory that cannot be enumerated is `unavailable`. Doctor requires the gateway's active lease and generation to match the local host-agent record before reporting registration as ready. The host-level agent reports a bounded `session_availability` value (`ready`, `session_unavailable`, or `unavailable`) on each poll; an unreported value stays `not_checked`. Doctor never prints root paths, credential values, or remote response bodies.
 
 ## MCP workflow
 
@@ -200,7 +234,7 @@ session_start(host_id="linux-main", path="src/project-a", session_id="project-a"
 session_info(host_id="linux-main", session_id="project-a")
 ```
 
-`session_start` accepts only a named-root-relative logical path. The host-side public supervisor always creates a normal sandboxed session; a remote client cannot request `--yolo`.
+`session_start` accepts either a named-root-relative logical `path` or a typed repository `source` with a UUID `operation_id`, never both. Source provisioning returns a durable readiness/reconciliation receipt; see [managed provisioning](managed-provisioning.md). The host-side public supervisor always creates a normal sandboxed session; a remote client cannot request `--yolo`.
 
 The same human-friendly session ID may exist on multiple hosts:
 
@@ -295,6 +329,6 @@ The same Worker serves the Access-protected read-only dashboard at `/dash/`. See
 
 ## Development
 
-For local Worker development, copy `gateway/.dev.vars.example` to `gateway/.dev.vars`. Never commit `.dev.vars`, Worker secrets, Access service-token secrets, host bearer tokens, or endpoint environment files.
+For local Worker development, copy `fabric/.dev.vars.example` to `fabric/.dev.vars`. Never commit `.dev.vars`, Worker secrets, Access service-token secrets, host bearer tokens, or endpoint environment files.
 
 The routed tool schemas and MCP protocol versions are checked against a Rust-generated contract snapshot in both Rust and Node tests. `serverInfo.version` is the Cloudflare deployment revision from the `GATEWAY_DEPLOYMENT` version-metadata binding, not the Temote CLI CalVer.

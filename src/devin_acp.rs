@@ -45,10 +45,8 @@ const MAX_OPERATION_HISTORY: usize = 32;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
-const MAX_REPORT_BYTES: usize = 8 * 1024;
+use crate::report_contract::{self, MAX_TASK_REPORT_BYTES as MAX_REPORT_BYTES, ReportProfile};
 const MAX_RAW_RESULT_BYTES: usize = 16 * 1024;
-const MAX_REPORT_ARRAY_ITEMS: usize = 64;
-const MAX_SUMMARY_CHARS: usize = 1200;
 const MAX_ASSISTANT_TEXT_BYTES: usize = MAX_REPORT_BYTES * 4;
 const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -539,6 +537,12 @@ fn store_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn set_pending_summary(record: &mut TaskRecord, summary: Summary) {
+    // The summary has its own cursor. Runtime-owner observations must not
+    // invalidate verification tied to the task's semantic revision.
+    record.pending_interaction = Some(summary);
+}
+
 impl TaskStore {
     fn default_store() -> Result<Self> {
         Ok(Self {
@@ -777,9 +781,12 @@ impl TaskStore {
             .context("Devin session instance lifecycle state is unavailable")?;
         anyhow::ensure!(!entry.closing, "Devin session instance is closing");
         let mut record = self.load_locked(session, task_id)?;
+        let previous = record.clone();
         f(&mut record)?;
-        record.updated_at = config::unix_time();
-        self.save_locked(&record)?;
+        if record != previous {
+            record.updated_at = config::unix_time();
+            self.save_locked(&record)?;
+        }
         Ok(record)
     }
 
@@ -861,11 +868,12 @@ impl TaskStore {
             && pending_snapshot.session_id.as_deref() == record.acp_session_id.as_deref())
         .then_some(pending_snapshot.pending_count);
         let Some(pending_count) = pending_count else {
-            record.pending_interaction = Some(Summary::unavailable(
+            let summary = Summary::unavailable(
                 record.pending_interaction.as_ref(),
                 ProducerKind::RuntimeOwner,
                 record.generation,
-            )?);
+            )?;
+            set_pending_summary(&mut record, summary);
             if !runtime_registration_matches(session, task_id, runtime_instance_id)
                 || connection_signal
                     .as_ref()
@@ -881,11 +889,12 @@ impl TaskStore {
             && (!pending_snapshot.pending_state_ready
                 || record.status == TaskStatus::WaitingApproval)
         {
-            record.pending_interaction = Some(Summary::unavailable(
+            let summary = Summary::unavailable(
                 record.pending_interaction.as_ref(),
                 ProducerKind::RuntimeOwner,
                 record.generation,
-            )?);
+            )?;
+            set_pending_summary(&mut record, summary);
             if !runtime_registration_matches(session, task_id, runtime_instance_id)
                 || connection_signal
                     .as_ref()
@@ -910,7 +919,7 @@ impl TaskStore {
         } else {
             vec![InteractionType::Approval]
         };
-        record.pending_interaction = Some(Summary::observe(
+        let summary = Summary::observe(
             record.pending_interaction.as_ref(),
             state,
             Some(count),
@@ -919,7 +928,8 @@ impl TaskStore {
             ProducerKind::RuntimeOwner,
             record.generation,
             observed_at,
-        )?);
+        )?;
+        set_pending_summary(&mut record, summary);
         if !runtime_registration_matches(session, task_id, runtime_instance_id)
             || connection_signal
                 .as_ref()
@@ -1654,6 +1664,8 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "observed_model": record.observed_model,
         "report": record.report,
         "report_status": record.report_status.map(ReportStatus::as_str),
+        "report_source": record.report_status.map(|_| "final_message_compat"),
+        "report_capability": "unsupported_acp_native_contract",
         "raw_result_bytes": record.raw_result.as_ref().map(String::len),
         "raw_result_truncated": record.raw_result_truncated,
         "last_error": record.last_error,
@@ -1681,6 +1693,18 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
     view
 }
 
+fn task_view_after_reconciliation(record: &TaskRecord, after_revision: Option<u64>) -> Value {
+    if after_revision == Some(record.revision) {
+        json!({
+            "task_id": record.task_id,
+            "status": "not_modified",
+            "revision": record.revision,
+        })
+    } else {
+        task_view(record, None)
+    }
+}
+
 /// Bounded, expiring, session-scoped evidence for a terminal task's final
 /// assistant turn. The raw reply and report decode detail cross the boundary
 /// only through this evidence record, never inline in the task view, so it is
@@ -1698,6 +1722,8 @@ fn terminal_evidence_ref(
         "status": record.status.as_str(),
         "report": record.report,
         "report_status": record.report_status.map(ReportStatus::as_str),
+        "report_source": record.report_status.map(|_| "final_message_compat"),
+        "report_capability": "unsupported_acp_native_contract",
         "raw_result": record.raw_result,
         "raw_result_truncated": record.raw_result_truncated,
         "usage": record.usage,
@@ -1719,13 +1745,9 @@ fn store_evidence_for_instance(
     {
         return None;
     }
-    evidence::store(
-        &session.id,
-        &session.cwd,
-        serde_json::to_string(response).ok()?,
-    )
-    .ok()
-    .flatten()
+    evidence::store_for_session(session, serde_json::to_string(response).ok()?)
+        .ok()
+        .flatten()
 }
 
 // ---------- devin acp transport ----------
@@ -2965,16 +2987,22 @@ fn insert_runtime_unchecked(
         }
         let _ = take_runtime_if_instance(task_id, runtime_instance_id);
         if session_stopped {
-            let result = async {
-                wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
-                finalize_session_tasks(&owner, &store).await
-            }
-            .await;
-            if let Err(error) = result {
-                eprintln!(
-                    "failed to finalize Devin tasks after session {} stopped: {error:#}",
-                    owner.id
-                );
+            loop {
+                let result = async {
+                    wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
+                    finalize_session_tasks(&owner, &store).await
+                }
+                .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error) => {
+                        eprintln!(
+                            "failed to finalize Devin tasks after session {} stopped; retrying: {error:#}",
+                            owner.id
+                        );
+                        tokio::time::sleep(SESSION_STOP_POLL).await;
+                    }
+                }
             }
         }
     });
@@ -3053,15 +3081,48 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionStopObservation {
+    Active,
+    Inactive,
+    Replaced,
+    Unknown,
+}
+
+fn classify_session_observation(
+    same_instance: Result<bool, ()>,
+    active: Result<bool, ()>,
+) -> SessionStopObservation {
+    match same_instance {
+        Ok(false) => SessionStopObservation::Replaced,
+        Ok(true) => match active {
+            Ok(true) => SessionStopObservation::Active,
+            Ok(false) => SessionStopObservation::Inactive,
+            Err(()) => SessionStopObservation::Unknown,
+        },
+        Err(()) => SessionStopObservation::Unknown,
+    }
+}
+
+async fn observe_session_instance(owner: &SessionInstance) -> SessionStopObservation {
+    let same_instance = config::read_session_metadata(&owner.id)
+        .await
+        .map(|session| owner.matches(&session))
+        .map_err(|_| ());
+    let active = if same_instance == Ok(true) {
+        config::session_is_active(&owner.id).await.map_err(|_| ())
+    } else {
+        Err(())
+    };
+    classify_session_observation(same_instance, active)
+}
+
 async fn wait_for_session_stop(owner: SessionInstance) {
     loop {
-        let same_instance_active = match config::read_session_metadata(&owner.id).await {
-            Ok(session) if owner.matches(&session) => {
-                config::session_is_active(&owner.id).await.unwrap_or(false)
-            }
-            Ok(_) | Err(_) => false,
-        };
-        if !same_instance_active {
+        if matches!(
+            observe_session_instance(&owner).await,
+            SessionStopObservation::Inactive | SessionStopObservation::Replaced
+        ) {
             begin_session_instance_shutdown(&owner);
             return;
         }
@@ -3380,40 +3441,7 @@ fn parse_balanced_json(text: &str) -> Option<Value> {
 }
 
 fn report_shape_valid(report: &Value) -> bool {
-    let Some(object) = report.as_object() else {
-        return false;
-    };
-    let status_ok = object
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| {
-            matches!(
-                status,
-                "completed" | "failed" | "blocked" | "needs_decision"
-            )
-        });
-    if !status_ok {
-        return false;
-    }
-    if object
-        .get("summary")
-        .and_then(Value::as_str)
-        .is_none_or(|summary| summary.chars().count() > MAX_SUMMARY_CHARS)
-    {
-        return false;
-    }
-    for key in ["changed_files", "checks", "unresolved"] {
-        match object.get(key) {
-            Some(Value::Array(items))
-                if items.len() <= MAX_REPORT_ARRAY_ITEMS
-                    && items.iter().all(|item| item.is_string()) => {}
-            None => {}
-            _ => return false,
-        }
-    }
-    serde_json::to_vec(report)
-        .map(|bytes| bytes.len() <= MAX_REPORT_BYTES)
-        .unwrap_or(false)
+    report_contract::validate(report, ReportProfile::TaskReport)
 }
 
 async fn reconcile_task(
@@ -3431,8 +3459,10 @@ async fn reconcile_task(
             if record.status.is_terminal() {
                 return Ok(());
             }
-            record.status = TaskStatus::ReconciliationRequired;
-            record.revision = record.revision.saturating_add(1);
+            if record.status != TaskStatus::ReconciliationRequired {
+                record.status = TaskStatus::ReconciliationRequired;
+                record.revision = record.revision.saturating_add(1);
+            }
             let outcome = record.outcome();
             if let Some(receipt) = record
                 .operations
@@ -3459,8 +3489,10 @@ async fn reconcile_task(
                     if record.status.is_terminal() {
                         return Ok(());
                     }
-                    record.status = TaskStatus::Interrupted;
-                    record.revision = record.revision.saturating_add(1);
+                    if record.status != TaskStatus::Interrupted {
+                        record.status = TaskStatus::Interrupted;
+                        record.revision = record.revision.saturating_add(1);
+                    }
                     Ok(())
                 });
             }
@@ -3470,9 +3502,13 @@ async fn reconcile_task(
                     if record.status.is_terminal() {
                         return Ok(());
                     }
-                    record.status = TaskStatus::ReconciliationRequired;
-                    record.last_error = Some(error.clone());
-                    record.revision = record.revision.saturating_add(1);
+                    if record.status != TaskStatus::ReconciliationRequired
+                        || record.last_error.as_ref() != Some(&error)
+                    {
+                        record.status = TaskStatus::ReconciliationRequired;
+                        record.last_error = Some(error.clone());
+                        record.revision = record.revision.saturating_add(1);
+                    }
                     Ok(())
                 });
             }
@@ -3482,6 +3518,24 @@ async fn reconcile_task(
     let snap = client.snapshot();
     let derived = derive_acp_state(&record, &snap);
     apply_derived(session, owner, store, record, derived).await
+}
+
+fn fit_raw_result_to_record_limit(record: &mut TaskRecord) -> Result<()> {
+    while let Some(raw) = record.raw_result.as_ref() {
+        let size = serde_json::to_vec_pretty(record)?.len();
+        if size <= MAX_TASK_RECORD_BYTES {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !raw.is_empty(),
+            "terminal task metadata exceeds {MAX_TASK_RECORD_BYTES} bytes even without raw result"
+        );
+        let remaining = raw.len().saturating_sub(size - MAX_TASK_RECORD_BYTES);
+        let (bounded, _) = truncate_text(raw, remaining.min(raw.len() - 1));
+        record.raw_result = Some(bounded);
+        record.raw_result_truncated = true;
+    }
+    Ok(())
 }
 
 async fn apply_derived(
@@ -3495,6 +3549,7 @@ async fn apply_derived(
         if record.status.is_terminal() {
             return Ok(());
         }
+        let previous = record.clone();
         if record.status != derived.status {
             record.status = derived.status;
         }
@@ -3517,7 +3572,17 @@ async fn apply_derived(
         if derived.last_error.is_some() {
             record.last_error = derived.last_error.clone();
         }
-        record.revision = record.revision.saturating_add(1);
+        if record.status != previous.status
+            || record.usage != previous.usage
+            || record.observed_model != previous.observed_model
+            || record.report != previous.report
+            || record.report_status != previous.report_status
+            || record.raw_result != previous.raw_result
+            || record.raw_result_truncated != previous.raw_result_truncated
+            || record.last_error != previous.last_error
+        {
+            record.revision = record.revision.saturating_add(1);
+        }
         let outcome = record.outcome();
         if derived.status.is_terminal()
             && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
@@ -3527,6 +3592,7 @@ async fn apply_derived(
             receipt.phase = OperationPhase::Applied;
             receipt.outcome = outcome;
         }
+        fit_raw_result_to_record_limit(record)?;
         Ok(())
     })
 }
@@ -4032,6 +4098,21 @@ async fn task_get_with_store_and_binary(
     let task_id = required_uuid(args, "task_id")?;
     let after_revision = optional_u64(args, "after_revision")?;
     let owner = SessionInstance::from_session(session);
+    if session_instance_is_closing(&owner) {
+        if let Ok(current) = config::read_session_metadata(&owner.id).await {
+            anyhow::ensure!(
+                owner.matches(&current),
+                "Devin session instance is no longer current"
+            );
+        }
+        let record = {
+            let _guard = store.lock()?;
+            store.load_locked(session, task_id)?
+        };
+        let mut view = task_view(&record, None);
+        view["recovery_state"] = json!("owner_closing");
+        return Ok(view);
+    }
     let _load_permit = ensure_current_active_instance(&owner, session).await?;
     let (record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
 
@@ -4063,13 +4144,13 @@ async fn task_get_with_store_and_binary(
             }
             Err(_) => {
                 let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                    if !record.status.is_terminal() {
+                    if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
                         record.status = TaskStatus::Unknown;
                         record.revision = record.revision.saturating_add(1);
                     }
                     Ok(())
                 })?;
-                return Ok(task_view(&record, None));
+                return Ok(task_view_after_reconciliation(&record, after_revision));
             }
         };
 
@@ -4079,13 +4160,18 @@ async fn task_get_with_store_and_binary(
         Err(error) => {
             let record = store.update_if_instance_live(session, task_id, &owner, |record| {
                 if !record.status.is_terminal() {
-                    record.status = TaskStatus::Unknown;
-                    record.last_error = Some(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
-                    record.revision = record.revision.saturating_add(1);
+                    let last_error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
+                    if record.status != TaskStatus::Unknown
+                        || record.last_error.as_ref() != Some(&last_error)
+                    {
+                        record.status = TaskStatus::Unknown;
+                        record.last_error = Some(last_error);
+                        record.revision = record.revision.saturating_add(1);
+                    }
                 }
                 Ok(())
             })?;
-            return Ok(task_view(&record, None));
+            return Ok(task_view_after_reconciliation(&record, after_revision));
         }
     };
 
@@ -4562,6 +4648,16 @@ impl FakeAcp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_stops_only_on_confirmed_inactivity_or_replacement() {
+        use SessionStopObservation::*;
+        assert_eq!(classify_session_observation(Ok(true), Ok(true)), Active);
+        assert_eq!(classify_session_observation(Ok(true), Ok(false)), Inactive);
+        assert_eq!(classify_session_observation(Ok(false), Err(())), Replaced);
+        assert_eq!(classify_session_observation(Err(()), Err(())), Unknown);
+        assert_eq!(classify_session_observation(Ok(true), Err(())), Unknown);
+    }
+
     use super::*;
     use crate::approvals;
     use std::io;
@@ -4900,6 +4996,25 @@ mod tests {
             let fake = fake.lock().unwrap();
             fake.sessions.keys().next().unwrap().clone()
         };
+        let running = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        let revision = running["revision"].as_u64().unwrap();
+        let unchanged = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": revision}),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["status"], "not_modified");
+        assert_eq!(unchanged["revision"], revision);
         let report = json!({
             "status": "completed",
             "summary": "done",
@@ -4928,6 +5043,7 @@ mod tests {
         clear_fake();
 
         assert_eq!(out["status"], "completed");
+        assert!(out["revision"].as_u64().unwrap() > revision);
         assert_eq!(out["report"]["summary"], "done");
         assert_eq!(out["report_status"], "valid");
         assert_eq!(out["raw_result_bytes"], report.to_string().len() as u64);
@@ -5361,6 +5477,194 @@ mod tests {
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_derived_state_preserves_revision_until_transition() {
+        let root = tempdir();
+        let owner = session(&root, "derived-revision");
+        let instance = SessionInstance::from_session(&owner);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(instance.clone(), LifecycleEntry::new());
+        let store = test_store(&root);
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Running, Some("session-1"));
+        record.updated_at = config::unix_time().saturating_sub(10);
+        store.save(&record).unwrap();
+        for _ in 0..2 {
+            let current = store.read_record(task_id).unwrap();
+            let unchanged = DerivedAcpState {
+                status: TaskStatus::Running,
+                usage: None,
+                observed_model: None,
+                report: None,
+                report_status: None,
+                raw_result: None,
+                raw_result_truncated: false,
+                last_error: None,
+            };
+            assert_eq!(
+                apply_derived(&owner, &instance, &store, current, unchanged)
+                    .await
+                    .unwrap()
+                    .revision,
+                1
+            );
+            assert_eq!(
+                store.read_record(task_id).unwrap().updated_at,
+                record.updated_at
+            );
+        }
+        let changed = DerivedAcpState {
+            status: TaskStatus::WaitingApproval,
+            usage: None,
+            observed_model: None,
+            report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
+            last_error: None,
+        };
+        let current = store.read_record(task_id).unwrap();
+        assert_eq!(
+            apply_derived(&owner, &instance, &store, current, changed)
+                .await
+                .unwrap()
+                .revision,
+            2
+        );
+        let report = json!({"status": "completed", "summary": "done"});
+        let completed = DerivedAcpState {
+            status: TaskStatus::Completed,
+            usage: None,
+            observed_model: None,
+            report: Some(report.clone()),
+            report_status: Some(ReportStatus::Valid),
+            raw_result: Some(report.to_string()),
+            raw_result_truncated: false,
+            last_error: None,
+        };
+        let current = store.read_record(task_id).unwrap();
+        let finished = apply_derived(&owner, &instance, &store, current, completed)
+            .await
+            .unwrap();
+        assert_eq!(finished.revision, 3);
+        assert_eq!(finished.report, Some(report));
+        assert_eq!(
+            task_view_after_reconciliation(&finished, Some(2))["status"],
+            "completed"
+        );
+        assert_eq!(
+            task_view_after_reconciliation(&finished, Some(3))["status"],
+            "not_modified"
+        );
+        begin_session_instance_shutdown(&instance);
+        finish_session_shutdown(&instance).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_owner_can_read_retained_task_without_restarting_runtime() {
+        let root = tempdir();
+        let owner = session(&root, "closing-task-read");
+        let store = test_store(&root);
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                Some("session-1"),
+            ))
+            .unwrap();
+        let instance = SessionInstance::from_session(&owner);
+        begin_session_instance_shutdown(&instance);
+        let view = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            Path::new("missing-devin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["status"], "running");
+        assert_eq!(view["recovery_state"], "owner_closing");
+        let mut replacement = owner.clone();
+        replacement.started_at += 1;
+        assert!(store.load_locked(&replacement, task_id).is_err());
+        finish_session_shutdown(&instance).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_task_store_finalization_keeps_same_owner_cleanup_retryable() {
+        let root = tempdir();
+        let owner = session(&root, "retry-finalization");
+        let instance = SessionInstance::from_session(&owner);
+        let bad_path = root.join("bad-store");
+        std::fs::write(&bad_path, b"not a directory").unwrap();
+        begin_session_instance_shutdown(&instance);
+        assert!(
+            finalize_session_tasks(&instance, &TaskStore::new(bad_path))
+                .await
+                .is_err()
+        );
+        assert!(session_instance_is_closing(&instance));
+        let store = test_store(&root);
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(&owner, task_id, TaskStatus::Running, None))
+            .unwrap();
+        finalize_session_tasks(&instance, &store).await.unwrap();
+        assert_eq!(
+            store.read_record(task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        assert!(!session_instance_is_closing(&instance));
+    }
+
+    #[test]
+    fn terminal_raw_result_fits_near_limit_record_without_losing_replay_history() {
+        let root = tempdir();
+        let owner = session(&root, "bounded-terminal-result");
+        let store = test_store(&root);
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Completed, Some("session-1"));
+        record.report_status = Some(ReportStatus::Valid);
+        record.report = Some(json!({"status": "completed", "summary": "x".repeat(7000)}));
+        while serde_json::to_vec_pretty(&record).unwrap().len() < 54_000 {
+            record.operation_tombstones.push(OperationTombstone {
+                operation_id: Uuid::new_v4(),
+                request_fingerprint: Uuid::new_v4(),
+            });
+        }
+        let replay_id = record.operation_tombstones[0].operation_id;
+        store.save(&record).unwrap();
+        record.raw_result = Some("水".repeat(MAX_RAW_RESULT_BYTES / 3));
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() > MAX_TASK_RECORD_BYTES);
+        fit_raw_result_to_record_limit(&mut record).unwrap();
+        assert!(record.raw_result_truncated);
+        assert!(serde_json::to_vec_pretty(&record).unwrap().len() <= MAX_TASK_RECORD_BYTES);
+        store.save(&record).unwrap();
+        let reread = store.read_record(task_id).unwrap();
+        assert_eq!(reread.status, TaskStatus::Completed);
+        assert_eq!(reread.report_status, Some(ReportStatus::Valid));
+        assert!(reread.raw_result.is_some());
+        assert!(reread.raw_result_truncated);
+        let replay_fingerprint = reread.operation_tombstones[0].request_fingerprint;
+        assert!(
+            replay_operation(&reread, replay_id, replay_fingerprint)
+                .unwrap_err()
+                .to_string()
+                .contains("OPERATION_REPLAY_COMPACTED")
+        );
+        assert!(
+            reread
+                .operation_tombstones
+                .iter()
+                .any(|item| item.operation_id == replay_id)
+        );
     }
 
     #[test]

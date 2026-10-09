@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 use crate::config;
 
+#[cfg(unix)]
+pub(crate) mod consumer;
+#[cfg(unix)]
+pub(crate) mod publisher;
+
 const FRICTION_SCHEMA_VERSION: u64 = 1;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
 const MAX_EVENTS: usize = 512;
@@ -59,6 +64,10 @@ pub(crate) struct FrictionEvent {
     pub schema_version: u64,
     pub event_id: Uuid,
     pub session_id: String,
+    /// Legacy events without this complete fence are readable but cannot be
+    /// consumed as publishable source evidence.
+    #[serde(default)]
+    pub session_instance: Option<SourceInstance>,
     pub scope_cwd: PathBuf,
     pub occurred_at: u64,
     pub kind: FrictionKind,
@@ -68,6 +77,33 @@ pub(crate) struct FrictionEvent {
     pub outcome: EventOutcome,
     pub retry_group: Option<Uuid>,
     pub related_checkpoint: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceInstance {
+    pub host_id: String,
+    pub session_id: String,
+    pub started_at: u64,
+    pub process_id: u32,
+    pub scope_cwd: PathBuf,
+}
+
+impl SourceInstance {
+    pub(crate) fn of(session: &config::Session) -> Result<Self> {
+        validate_session_scope(session)?;
+        anyhow::ensure!(
+            session.started_at > 0 && session.process_id > 0,
+            "incomplete friction session instance"
+        );
+        Ok(Self {
+            host_id: crate::host_identity::resolve()?,
+            session_id: session.id.clone(),
+            started_at: session.started_at,
+            process_id: session.process_id,
+            scope_cwd: session.cwd.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +151,7 @@ impl Store {
             schema_version: FRICTION_SCHEMA_VERSION,
             event_id: Uuid::new_v4(),
             session_id: session.id.clone(),
+            session_instance: Some(SourceInstance::of(session)?),
             scope_cwd: session.cwd.clone(),
             occurred_at: config::unix_time(),
             kind,
@@ -330,6 +367,16 @@ fn validate_event(event: &FrictionEvent) -> Result<()> {
         "unsupported friction schema version"
     );
     config::validate_session_id(&event.session_id)?;
+    if let Some(instance) = &event.session_instance {
+        crate::host_identity::validate(&instance.host_id)?;
+        anyhow::ensure!(
+            instance.session_id == event.session_id
+                && instance.scope_cwd == event.scope_cwd
+                && instance.started_at > 0
+                && instance.process_id > 0,
+            "friction session instance mismatch"
+        );
+    }
     validate_persisted_scope(&event.scope_cwd)?;
     validate_optional_identifier(event.operation_class.as_deref(), "operation_class")?;
     validate_optional_identifier(event.tool_name.as_deref(), "tool_name")?;

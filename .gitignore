@@ -1,9 +1,11 @@
 /target
 /mutants.out
+/mutants.out.old/
 .env
 .env.*
 !.env.example
-gateway/.dev.vars
-gateway/node_modules/
+fabric/.dev.vars
+fabric/node_modules/
 .wrangler/
+.cloudflare/
 .DS_Store

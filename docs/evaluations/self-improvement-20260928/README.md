@@ -66,6 +66,6 @@ different candidate Temote server build was not part of this workflow change.
 
 Follow-up: evaluate a server-side terminal evidence handoff across live MCP
 processes, without weakening the runtime lease or bounded evidence boundary.
-The existing [bounded wait issue](../../../issues/open/20260927-bounded-wait-for-delegated-tasks.md)
+The existing [bounded wait issue](../../../issues/doing/20260927-bounded-wait-for-delegated-tasks.md)
 still owns the repeated poll overhead. Neither follow-up is counted as fixed
 by this cycle.

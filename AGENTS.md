@@ -6,9 +6,9 @@ Temote MCP is a Rust MCP server for delegating local-machine work through explic
 
 ## Repository rules
 
-- Product name: **Temote MCP**.
-- CLI/package name: `temote-mcp`.
-- Environment-variable prefix: `TEMOTE_MCP_`.
+- Product names: **Temote MCP** for the local Host and **Temote Fabric** for the remote connection plane.
+- CLI/package name: `temote`; `temote-mcp` remains a compatibility executable and plugin/skill ID.
+- Environment-variable prefix: `TEMOTE_`; Fabric Link uses `TEMOTE_FABRIC_`. Existing `TEMOTE_MCP_` names remain read-only compatibility aliases, with canonical names taking priority.
 - Keep `README.md` and `README.ja.md` short and user-oriented: what it is, installation, first session, Agent Skill installation, and links to deeper docs.
 - Put detailed human documentation under `docs/`.
 - Put repository-specific agent/development guidance here instead of expanding the README.
@@ -52,7 +52,7 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo check --no-default-features --all-targets
-(cd gateway && npm test)
+(cd fabric && npm test)
 git diff --check
 ```
 

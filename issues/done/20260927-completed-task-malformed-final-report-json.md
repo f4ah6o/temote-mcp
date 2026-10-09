@@ -3,7 +3,7 @@
 Status: done — implemented on `main` 2026-09-27 (see "Implementation notes (2026-09-27)" below)
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)  
-Related: `issues/open/20260927-native-structured-output-agent-backends.md`, `issues/polished/20260927-bound-task-record-with-raw-result.md` (residual record-size risk)
+Related: `issues/open/20260927-native-structured-output-agent-backends.md`, `issues/done/20260927-bound-task-record-with-raw-result.md` (residual record-size risk)
 
 Triage: keep this issue independent from native structured-output work. Native schemas reduce malformed reports; this issue owns the stronger fallback guarantee that an already-completed task never loses its bounded raw result when structured decoding fails.
 

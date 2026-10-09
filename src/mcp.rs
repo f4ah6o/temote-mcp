@@ -778,12 +778,13 @@ fn validate_gateway_session_start_source(tool: &Value) -> Result<()> {
         .and_then(Value::as_object)
         .context("session_start source schema requires properties")?;
     anyhow::ensure!(
-        properties.len() == 2
-            && properties.contains_key("path")
-            && properties.contains_key("session_id"),
-        "session_start source properties must be exactly path and session_id; update gateway routing before changing them"
+        properties.len() == 4
+            && ["path", "source", "operation_id", "session_id"]
+                .iter()
+                .all(|key| properties.contains_key(*key)),
+        "session_start source properties must be path, source, operation_id, and session_id; update gateway routing before changing them"
     );
-    for property in ["path", "session_id"] {
+    for property in ["path", "operation_id", "session_id"] {
         let property_schema = properties[property]
             .as_object()
             .with_context(|| format!("session_start {property} schema must be an object"))?;
@@ -792,15 +793,15 @@ fn validate_gateway_session_start_source(tool: &Value) -> Result<()> {
             "session_start {property} must remain a string"
         );
     }
-    let required = schema
-        .get("required")
+    let alternatives = schema
+        .get("oneOf")
         .and_then(Value::as_array)
-        .context("session_start source schema requires a required array containing path")?;
+        .context("session_start source schema requires path/source alternatives")?;
     anyhow::ensure!(
-        required
-            .iter()
-            .any(|property| property.as_str() == Some("path")),
-        "session_start source schema must require path"
+        alternatives.len() == 2
+            && alternatives[0]["required"] == json!(["path"])
+            && alternatives[1]["required"] == json!(["source", "operation_id"]),
+        "session_start source schema must require path or source with operation_id"
     );
     Ok(())
 }
@@ -889,15 +890,7 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
             }
         }
         if name == "session_start" {
-            let required = tool["inputSchema"]["required"]
-                .as_array_mut()
-                .context("validated session_start source requires a required array")?;
-            if !required
-                .iter()
-                .any(|property| property.as_str() == Some("host_id"))
-            {
-                required.insert(0, json!("host_id"));
-            }
+            tool["inputSchema"]["required"] = json!(["host_id"]);
         }
     }
     routed_tools.insert(0, json!({
@@ -1081,8 +1074,8 @@ fn stable_pretty_json(value: &Value) -> String {
 ///
 /// The local server reports this from `session_info` and `server/discover`;
 /// the gateway reports it from `/healthz`. Operators compare either value
-/// against `gateway/contract/public-tools.fingerprint`, which the snapshot test
-/// keeps in sync with `gateway/contract/routed-tools.json`.
+/// against `fabric/contract/public-tools.fingerprint`, which the snapshot test
+/// keeps in sync with `fabric/contract/routed-tools.json`.
 pub(crate) fn public_contract_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
     FINGERPRINT.get_or_init(|| {
@@ -1095,7 +1088,7 @@ pub(crate) fn public_contract_fingerprint() -> &'static str {
 fn tools(_public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness or workspace cannot be safely determined (status degraded). Returns session IDs, working directories, start times, status, and permission mode (ask/agent/yolo).","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
+        {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start from exactly one existing named-root path or repository source. Repository provisioning requires a caller-generated operation_id and returns a pending receipt until its delegated preparation is ready. Public sessions remain normal and never yolo.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"source":{"oneOf":[{"type":"string"},{"type":"object","properties":{"kind":{"const":"repository"},"repository":{"type":"string"},"base":{"type":"string"},"vcs":{"type":"string","enum":["auto","jujutsu","git"]}},"required":["kind","repository"],"additionalProperties":false}]},"operation_id":{"type":"string","format":"uuid"},"session_id":{"type":"string"}},"oneOf":[{"required":["path"]},{"required":["source","operation_id"]}],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -1104,20 +1097,20 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"context_status","title":"Inspect the session context plane","description":"Report the session observation journal's revision, size, compaction, and degradation counters plus the memory-worker status. Read-only and bounded; raw observation records are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
         {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, validate the concrete protocol response shapes Temote consumes, and return bounded model/effort plus best-effort version diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
-        {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. An optional typed continuation resumes a retained terminal Codex task's conversation in a new task. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256},"continuation":{"oneOf":[{"type":"object","properties":{"type":{"const":"new"}},"required":["type"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"previous_task"},"task_id":{"type":"string","format":"uuid"}},"required":["type","task_id"],"additionalProperties":false}]}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
+        {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"opencode_status","title":"Check OpenCode serve compatibility","description":"Probe the locally installed OpenCode binary by starting a short-lived opencode serve on loopback, validate health and provider inventory, and return bounded diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"opencode_task_start","title":"Start a scoped OpenCode task","description":"Accept an idempotent scoped OpenCode task mutation, persist acceptance before child side effects, then start a per-task opencode serve on loopback and create its session. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"agent":{"type":"string","minLength":1,"maxLength":256},"variant":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
-        {"name":"opencode_task_get","title":"Read a scoped OpenCode task","description":"Read and reconcile a retained OpenCode task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"opencode_task_start","title":"Start a scoped OpenCode task","description":"Accept an idempotent scoped OpenCode task mutation. workspace_requirement=managed_commands requires the host-authorized managed checkout and a safe command sandbox; unsupported command capability returns a structured blocker before acceptance. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"agent":{"type":"string","minLength":1,"maxLength":256},"variant":{"type":"string","minLength":1,"maxLength":256},"workspace_requirement":{"type":"string","enum":["managed_commands"]}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
+        {"name":"opencode_task_get","title":"Read a scoped OpenCode task","description":"Read and reconcile a retained OpenCode task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"opencode_task_control","title":"Control a scoped OpenCode task","description":"Idempotently steer, resume, interrupt, or answer one exact pending OpenCode permission/question interaction. answer uses interaction_id plus a structured answer object and never injects ordinary prompt text. Acceptance is persisted before the serve side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt","answer"]},"input":{"type":"string","minLength":1,"maxLength":1048576},"interaction_id":{"type":"string","format":"uuid"},"answer":{"type":"object","properties":{"reply":{"type":"string","enum":["once","always","reject"]},"message":{"type":"string","maxLength":1024},"answers":{"type":"array","maxItems":64,"items":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":4096}}}},"additionalProperties":false}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"devin_status","title":"Check Devin ACP compatibility","description":"Probe the locally installed Devin CLI by starting a short-lived devin acp on stdio, validate the initialize response shape Temote consumes, and return bounded agent capability diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"devin_task_start","title":"Start a scoped Devin task","description":"Accept an idempotent scoped Devin task mutation, persist acceptance before child side effects, then start a per-task devin acp child process over stdio and create its ACP session. operation_id is mandatory; no sandbox escape option is exposed. Set cloud=true to relay through `devin acp --cloud` to Devin Cloud instead of running the local agent; model and agent are ignored in cloud mode and must be omitted.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"agent":{"type":"string","minLength":1,"maxLength":256},"cloud":{"type":"boolean"}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
-        {"name":"devin_task_get","title":"Read a scoped Devin task","description":"Read and reconcile a retained Devin task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"devin_task_get","title":"Read a scoped Devin task","description":"Read and reconcile a retained Devin task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_task_control","title":"Control a scoped Devin task","description":"Idempotently steer, resume, or interrupt a retained scoped Devin task. Acceptance is persisted before the acp side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly. Resume requires the agent's advertised loadSession capability and fails closed without it.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"devin_cloud_status","title":"Check Devin Cloud API access","description":"Verify the configured Devin Cloud API v3 credential by calling /v3/self and return the authenticated principal, organization, and API base URL. The credential value itself is never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"devin_cloud_task_start","title":"Start a Devin Cloud session task","description":"Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"title":{"type":"string","minLength":1,"maxLength":256},"devin_mode":{"type":"string","description":"Devin session mode. The swe-2-medium/high/max values select SWE-2 reasoning effort only; they do not by themselves select promo or priority.","enum":["normal","fast","lite","ultra","fusion","swe-2-medium","swe-2-high","swe-2-max"]},"swe_tier":{"type":"string","description":"Optional SWE-2 service tier. promo preserves the selected SWE-2 mode and lets upstream account eligibility determine promotional pricing; priority resolves one exact account-visible SWE-2 priority/fast UID from the local Devin model catalog and fails closed if unavailable or ambiguous.","enum":["promo","priority"]},"repos":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"maxItems":16},"max_acu_limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
-        {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a legacy background sandbox job owned by the session. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
@@ -1146,6 +1139,50 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
             }
         });
     tools
+}
+
+fn parse_managed_start_source(source: &Value) -> Result<crate::repository_store::ManagedRequest> {
+    let (repository, base, vcs) = if let Some(source) = source.as_str() {
+        (source, None, crate::session_source::VcsPreference::Auto)
+    } else {
+        let object = source
+            .as_object()
+            .context("source must be a repository string or object")?;
+        anyhow::ensure!(
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "kind" | "repository" | "base" | "vcs")),
+            "source accepts only kind, repository, base, and vcs"
+        );
+        anyhow::ensure!(
+            object.get("kind").and_then(Value::as_str) == Some("repository"),
+            "source.kind must be repository"
+        );
+        let repository = object
+            .get("repository")
+            .and_then(Value::as_str)
+            .context("source.repository must be a string")?;
+        let base = object
+            .get("base")
+            .map(|value| value.as_str().context("source.base must be a string"))
+            .transpose()?
+            .map(str::to_owned);
+        let vcs = object
+            .get("vcs")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .context("source.vcs must be auto, jujutsu, or git")?
+            .unwrap_or_default();
+        (repository, base, vcs)
+    };
+    let repository = crate::session_source::RepositoryId::parse(repository, "github.com")?;
+    let request = crate::repository_store::ManagedRequest {
+        repository,
+        base,
+        vcs,
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 async fn call_tool(
@@ -1182,15 +1219,39 @@ async fn call_tool(
             .as_object()
             .context("session_start arguments must be an object")?;
         anyhow::ensure!(
-            object
-                .keys()
-                .all(|key| matches!(key.as_str(), "path" | "session_id")),
-            "session_start accepts only path and session_id"
+            object.keys().all(|key| matches!(
+                key.as_str(),
+                "path" | "source" | "operation_id" | "session_id"
+            )),
+            "session_start accepts only path, source, operation_id, and session_id"
+        );
+        anyhow::ensure!(
+            object.contains_key("path") != object.contains_key("source"),
+            "session_start requires exactly one of path or source"
+        );
+        if let Some(source) = object.get("source") {
+            anyhow::ensure!(
+                !object.contains_key("session_id"),
+                "managed source start allocates session_id"
+            );
+            let operation_id = object
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .context("managed source start requires operation_id")?;
+            let operation_id =
+                uuid::Uuid::parse_str(operation_id).context("operation_id must be a UUID")?;
+            let request = parse_managed_start_source(source)?;
+            let info = sessions.start_managed(operation_id, request).await?;
+            return text_result(serde_json::to_string_pretty(&info)?);
+        }
+        anyhow::ensure!(
+            !object.contains_key("operation_id"),
+            "path start does not accept operation_id"
         );
         let path = object
             .get("path")
             .and_then(Value::as_str)
-            .context("missing path")?;
+            .context("path must be a string")?;
         validate_path_argument(path, "path")?;
         let session_id = object
             .get("session_id")
@@ -1248,7 +1309,14 @@ async fn call_tool(
     let session_id = required_session_id(&args)?;
     if name == "session_info" {
         assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
-        let view = crate::session_control::inspect_session(&session_id).await?;
+        if let Some(receipt) =
+            crate::repository_store::RepositoryStore::new()?.find_by_session_id(&session_id)?
+        {
+            let mut rendered = crate::supervisor::reconciled_managed_view(&receipt, None).await;
+            rendered["server_contract_fingerprint"] = json!(public_contract_fingerprint());
+            return text_result(serde_json::to_string_pretty(&rendered)?);
+        }
+        let view = crate::session_control::inspect_session_read_only(&session_id).await?;
         if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
             approvals::activity(&view.session_id, "Read session info", None).await;
         }
@@ -1300,19 +1368,19 @@ async fn call_tool(
             "context_status" => text_result(serde_json::to_string_pretty(
                 &observation::resolver::status(&session, &args)?,
             )?),
-            "evidence_read" => evidence_read_tool(&args, &session),
+            "evidence_read" => evidence_read_tool(&args, &session, public).await,
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
-            "task_list" => task_list_tool(&args, &session).await,
+            "task_list" => task_list_tool(&args, &session, public).await,
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
             _ => match delegation_operation(name) {
                 Some((backend, operation)) => text_result(serde_json::to_string_pretty(
-                    &orchestration::invoke(
+                    &invoke_backend_task(
                         backend,
                         operation,
                         &args,
                         &session,
-                        &observation::ActorRef::mcp(public),
+                        public,
                         activity.as_ref(),
                     )
                     .await?,
@@ -1324,6 +1392,31 @@ async fn call_tool(
     .await;
     finish_covered_tool_activity(coverage, activity.as_ref(), &result);
     result
+}
+
+async fn invoke_backend_task(
+    backend: orchestration::Backend,
+    operation: orchestration::Operation,
+    args: &Value,
+    session: &config::Session,
+    public: bool,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let packet = crate::mcp_tasks::TaskPacket::new(backend, operation, args, session, public)?;
+    match crate::session_control::mcp_task(packet).await? {
+        Some(result) => Ok(result),
+        None => {
+            orchestration::invoke(
+                backend,
+                operation,
+                args,
+                session,
+                &observation::ActorRef::mcp(public),
+                activity,
+            )
+            .await
+        }
+    }
 }
 
 async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
@@ -1348,6 +1441,32 @@ async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
                 "last_error": session.last_error,
                 "permission_mode": session.permission_mode,
                 "yolo": session.yolo,
+            }),
+            MAX_SESSION_LIST_ENTRIES,
+            MAX_SESSION_LIST_BYTES,
+        )?;
+    }
+    for receipt in
+        crate::repository_store::RepositoryStore::new()?.list_nonready(MAX_SESSION_LIST_ENTRIES)?
+    {
+        let view = crate::supervisor::managed_provisioning_view(&receipt);
+        push_session_list_entry(
+            &mut sessions,
+            &mut session_bytes,
+            json!({
+                "session_id": receipt.session_id,
+                "cwd": Value::Null,
+                "started_at": receipt.accepted_at,
+                "stopped_at": Value::Null,
+                "status": view["status"],
+                "provisioning": view["provisioning"],
+                "workspace_id": receipt.workspace_id,
+                "repository_id": receipt.request.repository.logical_name(),
+                "pid": Value::Null,
+                "exit_reason": Value::Null,
+                "last_error": receipt.detail,
+                "permission_mode": "agent",
+                "yolo": false,
             }),
             MAX_SESSION_LIST_ENTRIES,
             MAX_SESSION_LIST_BYTES,
@@ -1489,32 +1608,19 @@ fn finish_covered_tool_activity(
     };
 }
 
-fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>> {
-    args.get(key)
-        .map(|value| {
-            let value = value
-                .as_u64()
-                .with_context(|| format!("{key} must be a non-negative integer"))?;
-            usize::try_from(value).with_context(|| format!("{key} is too large"))
-        })
-        .transpose()
-}
-
-fn evidence_read_tool(args: &Value, session: &config::Session) -> Result<Value> {
-    let evidence_id = args
-        .get("evidence_id")
-        .and_then(Value::as_str)
-        .context("missing evidence_id")
-        .and_then(|value| Uuid::parse_str(value).context("invalid evidence_id"))?;
-    let offset_bytes = optional_usize(args, "offset_bytes")?.unwrap_or(0);
-    let max_bytes = optional_usize(args, "max_bytes")?.unwrap_or(evidence::DEFAULT_READ_BYTES);
-    let chunk = evidence::read(
-        &session.id,
-        &session.cwd,
-        evidence_id,
-        offset_bytes,
-        max_bytes,
-    )?;
+async fn evidence_read_tool(
+    args: &Value,
+    session: &config::Session,
+    public: bool,
+) -> Result<Value> {
+    let packet = crate::mcp_tasks::EvidencePacket::new(args, session, public)?;
+    let chunk = match crate::session_control::mcp_evidence(packet).await? {
+        Some(chunk) => chunk,
+        // Frontend-local evidence belongs only to the explicitly legacy mode.
+        // A modern owner miss/error must never probe another process's store.
+        None => crate::mcp_tasks::EvidencePacket::new(args, session, public)?
+            .read_for_session(session)?,
+    };
     text_result(serde_json::to_string(&chunk)?)
 }
 
@@ -1871,7 +1977,7 @@ fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
 /// per-backend `unavailable` reporting live in
 /// [`orchestration::task_list`]; this adapter only bounds the argument
 /// surface to the advertised schema.
-async fn task_list_tool(args: &Value, session: &config::Session) -> Result<Value> {
+async fn task_list_tool(args: &Value, session: &config::Session, public: bool) -> Result<Value> {
     let object = args
         .as_object()
         .context("task_list arguments must be an object")?;
@@ -1881,7 +1987,17 @@ async fn task_list_tool(args: &Value, session: &config::Session) -> Result<Value
             .all(|key| matches!(key.as_str(), "session_id" | "limit")),
         "task_list accepts only session_id and limit"
     );
-    let mut view = orchestration::task_list(args, session).await?;
+    let packet = crate::mcp_tasks::TaskPacket::new(
+        orchestration::Backend::Codex,
+        orchestration::Operation::TaskList,
+        args,
+        session,
+        public,
+    )?;
+    let mut view = match crate::session_control::mcp_task(packet).await? {
+        Some(result) => result,
+        None => orchestration::task_list(args, session).await?,
+    };
     compact_task_list_view(&mut view);
     text_result(serde_json::to_string_pretty(&view)?)
 }
@@ -1953,6 +2069,10 @@ async fn stop_job_with_activity(
     cancel_pending_job_activity(&job.completion, ActivityCancellationReason::StopRequested);
     job.handle.abort();
     let _ = job.handle.await;
+    #[cfg(feature = "network")]
+    if let Err(error) = crate::events_host::record_stopped_job(&session.id, job_id).await {
+        eprintln!("Fabric job transition deferred: {error:#}");
+    }
     approvals::activity(
         &session.id,
         format!("Stopped {}", job.command),
@@ -2832,7 +2952,7 @@ mod tests {
     #[test]
     fn gateway_generated_contract_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("gateway")
+            .join("fabric")
             .join("contract")
             .join("routed-tools.json");
         let mut rendered = stable_pretty_json(&routed_gateway_contract());
@@ -2868,7 +2988,7 @@ mod tests {
         );
 
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("gateway")
+            .join("fabric")
             .join("contract")
             .join("routed-tool-metadata.json");
         if std::env::var_os("TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT").as_deref()
@@ -3020,9 +3140,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "session_start")
             .unwrap();
+        assert_eq!(routed_tool["inputSchema"]["required"], json!(["host_id"]));
         assert_eq!(
-            routed_tool["inputSchema"]["required"],
-            json!(["host_id", "path"])
+            routed_tool["inputSchema"]["oneOf"],
+            source["inputSchema"]["oneOf"]
         );
         assert_eq!(
             routed_tool["inputSchema"]["required"]
@@ -3042,15 +3163,17 @@ mod tests {
             1
         );
 
-        constrained_source["inputSchema"]["required"] = json!(["path", "session_id"]);
+        constrained_source["inputSchema"]["properties"]["source"]["description"] =
+            json!("managed source");
         let routed = route_gateway_tools(vec![constrained_source]).unwrap();
         let routed_tool = routed
             .iter()
             .find(|tool| tool["name"] == "session_start")
             .unwrap();
+        assert_eq!(routed_tool["inputSchema"]["required"], json!(["host_id"]));
         assert_eq!(
-            routed_tool["inputSchema"]["required"],
-            json!(["host_id", "path", "session_id"])
+            routed_tool["inputSchema"]["properties"]["source"]["description"],
+            "managed source"
         );
         assert_eq!(
             routed_tool["inputSchema"]["required"]
@@ -3061,6 +3184,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn managed_start_source_normalizes_and_rejects_ambiguous_values() {
+        let first = parse_managed_start_source(&json!("F4AH6O/Temote-MCP.git")).unwrap();
+        let second = parse_managed_start_source(&json!({
+            "kind": "repository", "repository": "github.com/f4ah6o/temote-mcp", "vcs": "auto"
+        }))
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.repository.logical_name(),
+            "github.com/f4ah6o/temote-mcp"
+        );
+        for invalid in [
+            json!("/tmp/repo"),
+            json!({"kind": "repository", "repository": "owner/repo", "base": "../main"}),
+            json!({"kind": "repository", "repository": "owner/repo", "vcs": "fallback"}),
+            json!({"kind": "repository", "repository": "owner/repo", "extra": true}),
+        ] {
+            assert!(
+                parse_managed_start_source(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -3085,7 +3233,7 @@ mod tests {
         assert!(route_gateway_tools(vec![required_future_property]).is_err());
 
         let mut missing_path_requirement = source;
-        missing_path_requirement["inputSchema"]["required"] = json!(["session_id"]);
+        missing_path_requirement["inputSchema"]["oneOf"] = json!([{"required": ["source"]}]);
         assert!(route_gateway_tools(vec![missing_path_requirement]).is_err());
 
         let mut missing_session_id = tools(true, true)
@@ -3226,7 +3374,7 @@ mod tests {
     #[test]
     fn gateway_generated_fingerprint_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("gateway")
+            .join("fabric")
             .join("contract")
             .join("public-tools.fingerprint");
         let rendered = format!("{}\n", public_contract_fingerprint());
