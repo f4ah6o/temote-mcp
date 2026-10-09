@@ -14,6 +14,8 @@ use crate::observation;
 use crate::profile;
 use crate::task_cli;
 
+const CLI_NAME: &str = "temote";
+
 pub struct Cli {
     pub command: Option<Command>,
 }
@@ -288,13 +290,13 @@ where
     if matches!(raw.get(1).map(String::as_str), Some("--version" | "-V")) {
         return Ok(ParseOutcome::Print(format!(
             "{} {}\n",
-            env!("CARGO_PKG_NAME"),
+            CLI_NAME,
             env!("CARGO_PKG_VERSION")
         )));
     }
 
     let mut args = noargs::RawArgs::new(raw.into_iter());
-    args.metadata_mut().app_name = env!("CARGO_PKG_NAME");
+    args.metadata_mut().app_name = CLI_NAME;
     args.metadata_mut().app_description = env!("CARGO_PKG_DESCRIPTION");
     noargs::HELP_FLAG.take_help(&mut args);
 
@@ -1990,6 +1992,7 @@ mod tests {
         let ParseOutcome::Print(help) = parse(argv(&["temote-mcp", "--help"])).unwrap() else {
             panic!("expected help");
         };
+        assert!(help.contains("Usage: temote [OPTIONS]"), "{help}");
         assert!(help.contains("doctor"));
         assert!(help.contains("start"));
         assert!(help.contains("mcp"));
@@ -2008,7 +2011,7 @@ mod tests {
         let ParseOutcome::Print(version) = parse(argv(&["temote-mcp", "-V"])).unwrap() else {
             panic!("expected version");
         };
-        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(version, format!("temote {}\n", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

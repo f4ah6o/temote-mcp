@@ -28,7 +28,7 @@
 
 - Fabric host links negotiate bounded concurrent RPC handling while preserving serial compatibility with older Workers; accepted RPCs survive reconnects, response uploads retry only the same envelope, and `temote fabric status` reports staged readiness with a failing exit status until the active lease, generation, and public session inventory are usable.
 - New normal sessions require a configured named root at every entry point, including local cwd starts. Legacy sessions retain their proven stored cwd on restart and upgrade; remapping a root cannot move an existing session. ([named roots](docs/managed-sessions.md))
-- The canonical package and executable are now `temote`, with `temote-mcp` retained as a compatibility executable. Fabric configuration and commands accept canonical names while preserving existing state and credential identities. ([naming migration](docs/naming-migration.md))
+- The crates.io package remains `temote-mcp`; `temote` is the canonical executable and `temote-mcp` remains a compatibility executable. Fabric configuration and commands accept canonical names while preserving existing state and credential identities. ([naming migration](docs/naming-migration.md))
 - Delegated task reads accept bounded `wait_ms` (default 0, maximum 30000) without a separate wait tool or a task mutation. Codex can continue a retained completed or interrupted task in a fresh turn; report views identify native structured output versus compatibility extraction. ([backend capabilities](docs/backend-capabilities.md))
 - Delegation task views (`*_task_get` / `task_list`) now report `execution`, `verification`, and `delivery` as separate states: a completed execution is not a verification PASS, a verification result applies only to the task record revision it was recorded against (older results are reported as `not_run` with `stale: true`), and delivery stays `not_started` until a delivery operation records it. Records written before these fields existed read as `not_run` / `not_started`. ([task state separation](issues/open/20260925-a4-task-state-separation.md))
 
@@ -39,7 +39,7 @@
 
 ### Fixed
 
-- Version-pinned `cargo binstall temote@<version>` now downloads the binary archive from the matching CalVer release instead of the latest release.
+- Version-pinned `cargo binstall temote-mcp@<version>` downloads the package archive from the matching CalVer release instead of the latest release.
 - A blocked normal upgrade now keeps its count summary and adds bounded per-session IDs with sanitized reasons; raw blocker errors and non-allowlisted restart-context keys are omitted.
 - Local diagnostic status, session list/info, and upgrade preflight now use a restricted supervisor request that skips query-triggered reaping and lifecycle reconciliation; older supervisors fail closed without a legacy diagnostic fallback, while normal maintenance and upgrade/apply paths retain their compatible behavior. ([read-only diagnostics](docs/usage.md#sessions), [Fabric readiness](docs/gateway.md#host-identity-and-authentication))
 - Managed source preparation now selects the visible Codex catalog default and advertised effort, rather than choosing a hidden auxiliary model by alphabetical order. Accepted receipts retain their original selection. ([managed source start](issues/doing/20261005-managed-session-source-start.md))

@@ -797,8 +797,10 @@ fn build_distinct_target(root: &Path, target_version: &str) -> (PathBuf, PathBuf
     .unwrap();
     let lock_path = source.join("Cargo.lock");
     let lock = fs::read_to_string(&lock_path).unwrap();
-    let source_entry = format!("[[package]]\nname = \"temote\"\nversion = \"{SOURCE_VERSION}\"");
-    let target_entry = format!("[[package]]\nname = \"temote\"\nversion = \"{target_version}\"");
+    let source_entry =
+        format!("[[package]]\nname = \"temote-mcp\"\nversion = \"{SOURCE_VERSION}\"");
+    let target_entry =
+        format!("[[package]]\nname = \"temote-mcp\"\nversion = \"{target_version}\"");
     fs::write(
         &lock_path,
         replace_once(

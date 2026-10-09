@@ -19,6 +19,8 @@ On Linux, build or install the sibling `temote-linux-sandbox` binary and install
 
 Keep `--locked`: the committed lockfile prevents incompatible transitive versions from being selected, and the published package is intentionally registry-only.
 
+The crates.io package name remains `temote-mcp`. Source and binary installs provide the canonical `temote` command, the compatible `temote-mcp` alias, and the `temote-linux-sandbox` helper.
+
 ## Diagnostics
 
 ```sh
@@ -181,4 +183,4 @@ git push -f origin latest
 
 `dist-workspace.toml` is the source of truth for binary distribution. `dist generate` refreshes `.github/workflows/release.yml`; do not hand-edit the generated workflow. Releases currently build `.tar.xz` archives for Apple Silicon macOS plus ARM64 and x64 GNU/Linux, then publish them to GitHub Releases. Intel macOS is not supported.
 
-The next CalVer release publishes the canonical registry package for `cargo binstall temote`; existing releases retain `cargo binstall temote-mcp`. Its `pkg-url` selects the exact prefixless CalVer release tag, so `temote@<version>` matches that release's versionless `temote-<target>.tar.xz` asset and `.sha256` sidecar instead of redirecting to `latest`. The new package contains canonical `temote`, compatible `temote-mcp`, and the `temote-linux-sandbox` sibling helper, so a crates.io install remains self-contained. Source installs use `cargo install --path . --locked` before that release.
+The existing crates.io package remains `temote-mcp`. `cargo binstall temote-mcp@<version>` uses its `pkg-url` to select the matching prefixless CalVer release tag and the `temote-mcp-<target>.tar.xz` archive with its `.sha256` sidecar, rather than redirecting to `latest`. Each archive contains the canonical `temote` CLI, the compatible `temote-mcp` executable, and the `temote-linux-sandbox` helper. Source installs use `cargo install --path . --locked`.

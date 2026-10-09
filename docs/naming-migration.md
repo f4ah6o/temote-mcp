@@ -1,6 +1,6 @@
 # Temote and Fabric naming migration
 
-The canonical CLI/package is `temote`. The `temote-mcp` executable, plugin/skill IDs, local state directories, socket locations, and persisted task ownership remain compatible. A source rebuild retains the repository's baseline version; only the CalVer release workflow allocates a release version.
+The crates.io package remains `temote-mcp`; `temote` is the canonical CLI, and `temote-mcp` remains an executable compatibility alias. Plugin/skill IDs, local state directories, socket locations, and persisted task ownership remain compatible. A source rebuild retains the repository's baseline version; only the CalVer release workflow allocates a release version.
 
 ## Host configuration
 
