@@ -6,6 +6,16 @@ on:
       - latest
     branches:
       - release
+  workflow_dispatch:
+    inputs:
+      expected_alpha_version:
+        description: Exact alpha version approved for this source (YYYY.M.P-alpha.N)
+        required: true
+        type: string
+      expected_source_sha:
+        description: Full 40-character main commit SHA approved for this alpha
+        required: true
+        type: string
 
 permissions:
   actions: write
@@ -78,10 +88,50 @@ jobs:
           legacy_prefixes: v
           create_tag: false
 
+      - name: Test alpha version allocator
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 -B scripts/test_alpha_release.py
+
+      - name: Allocate approved alpha version
+        id: alpha
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          BASE_VERSION: ${{ steps.calver.outputs.version }}
+          EXPECTED_ALPHA_VERSION: ${{ inputs.expected_alpha_version }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          python3 scripts/alpha_release.py
+
+      - name: Resolve release identity
+        id: release_identity
+        shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && 'alpha' || 'stable' }}
+          STABLE_VERSION: ${{ steps.calver.outputs.version }}
+          STABLE_TAG: ${{ steps.calver.outputs.tag }}
+          ALPHA_VERSION: ${{ steps.alpha.outputs.version }}
+          ALPHA_TAG: ${{ steps.alpha.outputs.tag }}
+        run: python3 scripts/alpha_release.py resolve-release
+
+      - name: Refuse an existing alpha GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/alpha_release.py check-release
+
       - name: Set package version
         shell: bash
         env:
-          VERSION: ${{ steps.calver.outputs.version }}
+          VERSION: ${{ steps.release_identity.outputs.version }}
         run: |
           set -euo pipefail
           python3 - "$VERSION" <<'PY'
@@ -125,7 +175,7 @@ jobs:
       - name: Create release-only commit
         shell: bash
         env:
-          VERSION: ${{ steps.calver.outputs.version }}
+          VERSION: ${{ steps.release_identity.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -136,7 +186,7 @@ jobs:
       - name: Push immutable CalVer tag
         shell: bash
         env:
-          TAG: ${{ steps.calver.outputs.tag }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
         run: |
           set -euo pipefail
           git tag "$TAG" HEAD
@@ -155,7 +205,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.calver.outputs.tag }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
         run: |
           set -euo pipefail
           gh workflow run release.yml --ref "$TAG" -f "tag=$TAG"
@@ -163,12 +213,14 @@ jobs:
       - name: Summary
         shell: bash
         env:
-          VERSION: ${{ steps.calver.outputs.version }}
-          TAG: ${{ steps.calver.outputs.tag }}
+          CHANNEL: ${{ steps.release_identity.outputs.channel }}
+          VERSION: ${{ steps.release_identity.outputs.version }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
         run: |
           {
             echo "## Temote MCP release"
             echo
+            echo "- channel: \`${CHANNEL}\`"
             echo "- version: \`${VERSION}\`"
             echo "- tag: \`${TAG}\`"
             echo "- source: \`${GITHUB_SHA}\`"
