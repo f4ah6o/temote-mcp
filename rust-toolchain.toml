@@ -4,6 +4,6 @@
 # Motivating regression: 2026.9.10 release CI floated to Clippy 1.98.0
 # while local gates ran an older stable and missed the new lint.
 [toolchain]
-channel = "1.98.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

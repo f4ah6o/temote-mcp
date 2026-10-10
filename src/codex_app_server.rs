@@ -3755,13 +3755,13 @@ fn mark_waiting_approval(session: &config::Session, task_id: Uuid, waiting: bool
 }
 
 fn increment_pending_approvals(pending_approvals: &AtomicU64) {
-    let _ = pending_approvals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+    let _ = pending_approvals.try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
         Some(pending.saturating_add(1))
     });
 }
 
 fn decrement_pending_approvals(pending_approvals: &AtomicU64) {
-    let _ = pending_approvals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+    let _ = pending_approvals.try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
         Some(pending.saturating_sub(1))
     });
 }
