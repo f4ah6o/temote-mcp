@@ -479,8 +479,8 @@ test("browser MCP and dashboard deny cloud data surfaces and client metadata can
     for (const denied of ["context_resolve", "context_status", "fabric_overview", "fabric_session_list", "fabric_session_read"]) assert.equal(names.includes(denied), false);
     assert.equal(names.includes("host_list"), true);
     for (const allowed of ["codex_status", "codex_task_start", "codex_task_get", "codex_task_control",
-      "evidence_read", "task_list", "poll_job", "job_list", "stop_job"]) assert.equal(names.includes(allowed), true);
-    for (const denied of ["opencode_task_start", "devin_cloud_task_start", "repository_clone_bare",
+      "evidence_read", "task_list", "poll_job", "job_list", "stop_job", "repository_clone_bare"]) assert.equal(names.includes(allowed), true);
+    for (const denied of ["opencode_task_start", "devin_cloud_task_start",
       "search_mentions", "fabric_interaction_read"]) assert.equal(names.includes(denied), false);
 
   });
@@ -631,6 +631,178 @@ test("every verified Access carrier stays owner-scoped and CLIENT_TOKEN cannot d
     }), env);
     assert.equal((await response.json()).error.code, -32601, "task start requires a caller operation id");
     assert.equal(dispatchCalls.length, 2, "invalid task calls are rejected before Host dispatch");
+
+    const sourceOperationId = crypto.randomUUID();
+    response = await worker.fetch(accessRequest(fixture, "/mcp", {
+      method: "POST", authorization: null,
+      body: { jsonrpc: "2.0", id: 7, method: "tools/call", params: {
+        name: "session_start", arguments: {
+          host_id: "host-a", source: { kind: "repository", repository: "owner/repo", vcs: "git" },
+          operation_id: sourceOperationId,
+        },
+      } },
+    }), env);
+    const sourceResult = await response.json();
+    assert.equal(sourceResult.result?.content?.[0]?.text, "routed", JSON.stringify(sourceResult));
+    assert.equal(dispatchCalls.length, 3, "approved browser source provisioning reaches the Host");
+    assert.equal(dispatchCalls[2].request.params.name, "session_start");
+    assert.equal(dispatchCalls[2].request.params.arguments.host_id, undefined,
+      "the Worker removes Host routing metadata from source provisioning");
+    assert.equal(dispatchCalls[2].request.params.arguments.operation_id, sourceOperationId);
+    assert.deepEqual(dispatchCalls[2]._fabric_auth.approved_roots, ["src"]);
+
+    response = await worker.fetch(accessRequest(fixture, "/mcp", {
+      method: "POST", authorization: null,
+      body: { jsonrpc: "2.0", id: 8, method: "tools/call", params: {
+        name: "session_start", arguments: {
+          host_id: "host-a", source: { kind: "repository", repository: "owner/repo" },
+          operation_id: crypto.randomUUID(), session_id: "caller-selected",
+        },
+      } },
+    }), env);
+    assert.equal((await response.json()).error.code, -32601,
+      "browser source provisioning cannot select its managed session identity");
+    assert.equal(dispatchCalls.length, 3, "invalid browser source scope is rejected before Host dispatch");
+
+    const cloneOperationId = crypto.randomUUID();
+    response = await worker.fetch(accessRequest(fixture, "/mcp", {
+      method: "POST", authorization: null,
+      body: { jsonrpc: "2.0", id: 9, method: "tools/call", params: {
+        name: "repository_clone_bare", arguments: {
+          host_id: "host-a", session_id: "session-a", operation_id: cloneOperationId,
+          root: "src", source: "src/remote.git", destination: "clone.git",
+          model: "gpt-6", effort: "high",
+        },
+      } },
+    }), env);
+    const cloneResult = await response.json();
+    assert.equal(cloneResult.result?.content?.[0]?.text, "routed", JSON.stringify(cloneResult));
+    assert.equal(dispatchCalls.length, 4, "an approved named-root clone reaches the Host");
+    assert.equal(dispatchCalls[3].request.params.name, "repository_clone_bare");
+    assert.equal(dispatchCalls[3].request.params.arguments.host_id, undefined,
+      "the Worker removes Host routing metadata from clone requests");
+    assert.equal(dispatchCalls[3].request.params.arguments.operation_id, cloneOperationId);
+    assert.deepEqual(dispatchCalls[3]._fabric_session, {
+      session_id: "session-a", session_instance: "00000000-0000-4000-8000-000000000001",
+    }, "clone is bound to the live Supervisor session instance");
+
+    response = await worker.fetch(accessRequest(fixture, "/mcp", {
+      method: "POST", authorization: null,
+      body: { jsonrpc: "2.0", id: 10, method: "tools/call", params: {
+        name: "repository_clone_bare", arguments: {
+          host_id: "host-a", session_id: "session-a", operation_id: crypto.randomUUID(),
+          root: "outside", source: "src/remote.git", destination: "clone.git",
+          model: "gpt-6", effort: "high",
+        },
+      } },
+    }), env);
+    assert.equal((await response.json()).error.code, -32601, "clone cannot target an unapproved named root");
+    assert.equal(dispatchCalls.length, 4, "out-of-scope clone is rejected before Host dispatch");
+  });
+});
+
+test("browser managed source moves from pending to an active session that stays bound for follow-up calls", async () => {
+  const fixture = await accessFixture();
+  const db = database();
+  const dispatchCalls = [];
+  const managedSession = {
+    session_id: "managed-session",
+    root_name: "src",
+    logical_path: "src/managed-repository",
+    status: "active",
+    permission_mode: "agent",
+    backend: "codex",
+    session_instance: "00000000-0000-4000-8000-0000000000ab",
+  };
+  let sourceAccepted = false;
+  const host = {
+    host_id: "host-a", instance_id: "instance-a", generation: 1, auth_mode: "browser",
+    expires_at: Date.now() + 90_000, session_availability: "ready",
+  };
+  const hostStub = {
+    async fetch(url, init = {}) {
+      const path = new URL(url).pathname;
+      if (path === "/status") return Response.json({ status: "registered" });
+      if (path !== "/dispatch") return Response.json({ status: "registered" });
+      const body = JSON.parse(init.body);
+      const name = body.request?.params?.name;
+      if (name === "session_list") {
+        return Response.json({ jsonrpc: "2.0", id: body.request.id, result: { content: [{
+          type: "text", text: JSON.stringify(sourceAccepted ? [managedSession] : []),
+        }] } });
+      }
+      dispatchCalls.push(body);
+      if (name === "session_start") {
+        sourceAccepted = true;
+        return Response.json({ jsonrpc: "2.0", id: body.request.id, result: { content: [{
+          type: "text", text: JSON.stringify({
+            status: "pending", operation_id: body.request.params.arguments.operation_id,
+            preparation_session_id: "internal-preparation-session",
+          }),
+        }] } });
+      }
+      return Response.json({ jsonrpc: "2.0", id: body.request.id,
+        result: { content: [{ type: "text", text: "routed" }] } });
+    },
+  };
+  const env = envFor(fixture, db, {
+    GATEWAY_SESSIONS: { idFromName: (name) => name, get: () => hostStub },
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => ({ fetch: async (url) => (
+      new URL(url).pathname === "/hosts" ? Response.json([host]) : Response.json([])
+    ) }) },
+  });
+
+  await withJwks(fixture, async () => {
+    const enrollment = await enrollFixture(fixture, env);
+    Object.assign(host, {
+      owner_key: enrollment.active.owner_key, grant_id: enrollment.operation.grant,
+      grant_generation: 1, approved_roots: ["src"],
+    });
+    const call = (id, name, arguments_) => worker.fetch(accessRequest(fixture, "/mcp", {
+      method: "POST", authorization: null,
+      body: { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: arguments_ } },
+    }), env);
+
+    const sourceOperationId = crypto.randomUUID();
+    const started = await call(1, "session_start", {
+      host_id: "host-a", source: { kind: "repository", repository: "owner/repo", vcs: "git" },
+      operation_id: sourceOperationId,
+    });
+    const pending = JSON.parse((await started.json()).result.content[0].text);
+    assert.equal(pending.status, "pending");
+    assert.equal(pending.operation_id, sourceOperationId);
+    assert.equal(pending.preparation_session_id, "internal-preparation-session");
+
+    const inventoryResponse = await call(2, "session_list", { host_id: "host-a" });
+    const inventory = JSON.parse((await inventoryResponse.json()).result.content[0].text);
+    assert.deepEqual(inventory.map(({ session_id, root_name, logical_path, status }) => (
+      { session_id, root_name, logical_path, status }
+    )), [{
+      session_id: "managed-session", root_name: "src", logical_path: "src/managed-repository", status: "active",
+    }]);
+    assert.equal(Object.hasOwn(inventory[0], "session_instance"), false,
+      "the Worker keeps the runtime instance only in its binding proof");
+
+    const infoResponse = await call(3, "session_info", { host_id: "host-a", session_id: "managed-session" });
+    assert.equal((await infoResponse.json()).result.content[0].text, "routed");
+    const infoDispatch = dispatchCalls.find(({ request }) => request.params.name === "session_info");
+    assert.deepEqual(infoDispatch._fabric_session, {
+      session_id: "managed-session", session_instance: managedSession.session_instance,
+    }, "session_info binds to the exact active managed instance");
+
+    const taskOperationId = crypto.randomUUID();
+    const taskResponse = await call(4, "codex_task_start", {
+      host_id: "host-a", session_id: "managed-session", operation_id: taskOperationId,
+      task: "Inspect the provisioned repository", model: "gpt-6", effort: "high",
+    });
+    assert.equal((await taskResponse.json()).result.content[0].text, "routed");
+    const taskDispatch = dispatchCalls.find(({ request }) => request.params.name === "codex_task_start");
+    assert.equal(taskDispatch.request.params.arguments.operation_id, taskOperationId);
+    assert.deepEqual(taskDispatch._fabric_session, {
+      session_id: "managed-session", session_instance: managedSession.session_instance,
+    }, "the first delegated task uses the same exact active managed instance");
+    assert.equal(dispatchCalls.some(({ request }) => request.params.arguments?.session_id === "internal-preparation-session"), false,
+      "the pending internal preparation identity cannot become a routed Worker session");
   });
 });
 
@@ -732,6 +904,65 @@ test("GatewaySession queues only the exact browser typed-task contract under the
     }));
     assert.equal(response.status, 204);
     assert.equal((await pending).status, 200);
+
+    const invalidManagedStart = await session.fetch(new Request("https://host.internal/dispatch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request: request("session_start", {
+        source: { kind: "repository", repository: "owner/repo" },
+      }), _fabric_auth: auth }),
+    }));
+    assert.equal(invalidManagedStart.status, 403, "managed source requires its caller operation id");
+    const sourceOperationId = crypto.randomUUID();
+    const sourceRpc = request("session_start", {
+      source: { kind: "repository", repository: "owner/repo", vcs: "git" },
+      operation_id: sourceOperationId,
+    });
+    const sourcePending = session.fetch(new Request("https://host.internal/dispatch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request: sourceRpc, _fabric_auth: auth }),
+    }));
+    const sourceEnvelope = await (await session.fetch(new Request("https://host.internal/poll", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...identity, generation: 1 }),
+    }))).json();
+    assert.equal(sourceEnvelope.request.params.name, "session_start");
+    assert.equal(sourceEnvelope.request.params.arguments.operation_id, sourceOperationId);
+    assert.equal(sourceEnvelope._fabric_session, undefined, "source provisioning starts before there is a session binding");
+    const sourceResponse = await session.fetch(new Request("https://host.internal/respond", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...identity, generation: 1, request_id: sourceEnvelope.request_id,
+        _fabric_auth: auth, response: { jsonrpc: "2.0", id: sourceRpc.id, result: { content: [] } } }),
+    }));
+    assert.equal(sourceResponse.status, 204);
+    assert.equal((await sourcePending).status, 200);
+
+    const cloneRpc = request("repository_clone_bare", {
+      session_id: "session-a", operation_id: crypto.randomUUID(), root: "src",
+      source: "src/remote.git", destination: "clone.git", model: "gpt-6", effort: "high",
+    });
+    const cloneMissingBinding = await session.fetch(new Request("https://host.internal/dispatch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request: cloneRpc, _fabric_auth: auth }),
+    }));
+    assert.equal(cloneMissingBinding.status, 403, "repository clone requires a live session binding");
+    const clonePending = session.fetch(new Request("https://host.internal/dispatch", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request: cloneRpc, _fabric_auth: auth, _fabric_session: sessionBinding }),
+    }));
+    const cloneEnvelope = await (await session.fetch(new Request("https://host.internal/poll", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...identity, generation: 1 }),
+    }))).json();
+    assert.equal(cloneEnvelope.request.params.name, "repository_clone_bare");
+    assert.deepEqual(cloneEnvelope._fabric_session, sessionBinding);
+    const cloneResponse = await session.fetch(new Request("https://host.internal/respond", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...identity, generation: 1, request_id: cloneEnvelope.request_id,
+        _fabric_auth: auth, _fabric_session: sessionBinding,
+        response: { jsonrpc: "2.0", id: cloneRpc.id, result: { content: [] } } }),
+    }));
+    assert.equal(cloneResponse.status, 204);
+    assert.equal((await clonePending).status, 200);
   });
 });
 

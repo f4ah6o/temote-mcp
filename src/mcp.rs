@@ -435,12 +435,18 @@ pub(crate) async fn dispatch_public(
 /// instance before calling this function; this boundary still requires the
 /// explicit session id and reuses each public tool's normal argument checks.
 #[cfg(feature = "network")]
-pub(crate) async fn dispatch_browser_scoped_tool(
+pub(crate) async fn dispatch_browser_scoped_tool<F>(
     name: &str,
     args: Value,
     session: &config::Session,
-) -> Result<Value> {
+    roots: &crate::named_roots::NamedRoots,
+    browser_admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     const ALLOWED: &[&str] = &[
+        "repository_clone_bare",
         "codex_status",
         "codex_task_start",
         "codex_task_get",
@@ -462,6 +468,30 @@ pub(crate) async fn dispatch_browser_scoped_tool(
         object.get("session_id").and_then(Value::as_str) == Some(session.id.as_str()),
         "browser-scoped tool requires the authorized session_id"
     );
+    if name == "repository_clone_bare" {
+        let prepared = crate::repository_clone::prepare_admitted(&args, session, roots)?;
+        let coverage = activity_tool_coverage(name);
+        let activity = if let Some(coverage) = coverage {
+            tool_activity_scope(
+                prepared.session(),
+                coverage.operation,
+                activity_tool_summary(&args, coverage.operation),
+            )
+            .await
+        } else {
+            None
+        };
+        let result = prepared
+            .execute(
+                &observation::ActorRef::mcp(true),
+                activity.as_ref(),
+                browser_admission,
+            )
+            .await
+            .and_then(|value| text_result(serde_json::to_string_pretty(&value)?));
+        finish_covered_tool_activity(coverage, activity.as_ref(), &result);
+        return result;
+    }
     if matches!(name, "codex_task_start" | "codex_task_control") {
         anyhow::ensure!(
             object
@@ -1228,7 +1258,9 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
     tools
 }
 
-fn parse_managed_start_source(source: &Value) -> Result<crate::repository_store::ManagedRequest> {
+pub(crate) fn parse_managed_start_source(
+    source: &Value,
+) -> Result<crate::repository_store::ManagedRequest> {
     let (repository, base, vcs) = if let Some(source) = source.as_str() {
         (source, None, crate::session_source::VcsPreference::Auto)
     } else {
@@ -1425,7 +1457,11 @@ async fn call_tool(
             None
         };
         let result = prepared
-            .execute(&observation::ActorRef::mcp(public), activity.as_ref())
+            .execute(
+                &observation::ActorRef::mcp(public),
+                activity.as_ref(),
+                || Ok(()),
+            )
             .await
             .and_then(|value| text_result(serde_json::to_string_pretty(&value)?));
         finish_covered_tool_activity(coverage, activity.as_ref(), &result);

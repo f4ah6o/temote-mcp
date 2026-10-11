@@ -26,6 +26,7 @@ import {
   withCors,
 } from "./http.js";
 import { observeHostResponse } from "./events/transitions.js";
+import { validateSessionStart } from "./session-start.js";
 
 const HOST_LEASE_MS = 90_000;
 const HOST_AGENT_PROTOCOL_VERSION = 1;
@@ -51,6 +52,7 @@ const MAX_RPC_TOOL_NAME_BYTES = 256;
 const SESSION_AVAILABILITY_VALUES = ["ready", "session_unavailable", "unavailable"];
 const BROWSER_ROUTED_TOOLS = new Set([
   "session_list", "session_start", "session_info", "session_stop", "session_restart",
+  "repository_clone_bare",
   "codex_status", "codex_task_start", "codex_task_get", "codex_task_control",
   "evidence_read", "task_list", "poll_job", "job_list", "stop_job",
 ]);
@@ -60,7 +62,12 @@ function browserDispatchAllowed(request, approvedRoots) {
   const args = request?.params?.arguments;
   if (!args || typeof args !== "object" || Array.isArray(args)) return false;
   if (request.params.name === "session_start") {
-    if (typeof args.path !== "string" || Object.hasOwn(args, "source")
+    if (validateSessionStart(args) !== null) return false;
+    if (Object.hasOwn(args, "source")) {
+      return Object.keys(args).every((key) => ["source", "operation_id"].includes(key))
+        && approvedRoots.length > 0;
+    }
+    if (typeof args.path !== "string"
         || Object.keys(args).some((key) => !["path", "session_id"].includes(key))
         || args.path.startsWith("/") || args.path.includes("\\") || args.path.includes("\0")
         || /%(?:2f|5c)/i.test(args.path)) return false;
@@ -69,6 +76,16 @@ function browserDispatchAllowed(request, approvedRoots) {
     return approvedRoots.includes(parts[0]);
   }
   if (request.params.name === "session_list") return Object.keys(args).length === 0;
+  if (request.params.name === "repository_clone_bare") {
+    const keys = ["session_id", "operation_id", "root", "source", "destination", "model", "effort"];
+    const uuid = (value) => typeof value === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    return Object.keys(args).length === keys.length && Object.keys(args).every((key) => keys.includes(key))
+      && typeof args.session_id === "string" && args.session_id.length > 0 && args.session_id.length <= 256
+      && uuid(args.operation_id) && typeof args.root === "string" && approvedRoots.includes(args.root)
+      && [args.source, args.destination].every((value) => typeof value === "string" && value.length > 0 && value.length <= 4096)
+      && [args.model, args.effort].every((value) => typeof value === "string" && value.length > 0 && value.length <= 256);
+  }
   const allowedKeys = {
     session_info: ["session_id"],
     session_stop: ["session_id"],
