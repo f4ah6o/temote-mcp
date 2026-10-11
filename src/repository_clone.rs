@@ -36,8 +36,19 @@ pub(crate) struct PreparedClone {
     task_origin: codex_app_server::TaskStartOrigin,
     source: CloneSource,
     destination: PathBuf,
+    named_root: Option<(crate::named_roots::NamedRoots, String)>,
     #[cfg(test)]
     retained_retry: bool,
+}
+
+struct CloneRequest {
+    session_id: String,
+    operation_id: String,
+    root_name: String,
+    source_input: String,
+    destination_input: String,
+    model: String,
+    effort: String,
 }
 
 impl PreparedClone {
@@ -45,30 +56,93 @@ impl PreparedClone {
         &self.session
     }
 
-    pub(crate) async fn execute(
+    pub(crate) async fn execute<F>(
         self,
         actor: &observation::ActorRef,
         activity: Option<&ActivityScope>,
-    ) -> Result<Value> {
+        browser_admission: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let root = self.session.cwd.clone();
         let source = self.source.clone();
         let destination = self.destination.clone();
+        let named_root = self.named_root.clone();
         orchestration::invoke_codex_task_start_with_admission(
             &self.task_args,
             &self.session,
             &self.task_origin,
             actor,
             activity,
-            move || validate_filesystem_admission(&root, &source, &destination),
+            move || {
+                validate_clone_admission(
+                    &root,
+                    &source,
+                    &destination,
+                    named_root.as_ref(),
+                    browser_admission,
+                )
+            },
         )
         .await
     }
+}
+
+fn validate_clone_admission<F>(
+    root: &Path,
+    source: &CloneSource,
+    destination: &Path,
+    named_root: Option<&(crate::named_roots::NamedRoots, String)>,
+    browser_admission: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    validate_filesystem_admission(root, source, destination)?;
+    if let Some((roots, name)) = named_root {
+        validate_named_root_boundaries(roots, name, root, source, destination)?;
+    }
+    browser_admission()
 }
 
 pub(crate) async fn prepare(
     args: &Value,
     sessions: Option<&SessionBackend>,
 ) -> Result<PreparedClone> {
+    let request = parse_request(args)?;
+    let owned_backend;
+    let sessions = match sessions {
+        Some(sessions) => sessions,
+        None => {
+            owned_backend = SessionBackend::local_control().await?;
+            &owned_backend
+        }
+    };
+    let session = sessions
+        .repository_clone_admission(
+            &request.session_id,
+            &request.root_name,
+            &request.destination_input,
+        )
+        .await?;
+    prepare_with_session(request, session, None)
+}
+
+/// Prepare the same typed clone operation after a caller has already admitted
+/// the exact live session under the Supervisor transition lock. Browser Host
+/// dispatch uses this seam to avoid recursively asking the Supervisor for
+/// admission while that lock is held.
+pub(crate) fn prepare_admitted(
+    args: &Value,
+    session: &config::Session,
+    roots: &crate::named_roots::NamedRoots,
+) -> Result<PreparedClone> {
+    let request = parse_request(args)?;
+    prepare_with_session(request, session.clone(), Some(roots))
+}
+
+fn parse_request(args: &Value) -> Result<CloneRequest> {
     let object = args
         .as_object()
         .context("repository_clone_bare arguments must be an object")?;
@@ -95,19 +169,24 @@ pub(crate) async fn prepare(
     validate_bounded_argument(model, "model", MAX_SELECTOR_BYTES)?;
     validate_bounded_argument(effort, "effort", MAX_SELECTOR_BYTES)?;
 
-    let owned_backend;
-    let sessions = match sessions {
-        Some(sessions) => sessions,
-        None => {
-            owned_backend = SessionBackend::local_control().await?;
-            &owned_backend
-        }
-    };
-    let session = sessions
-        .repository_clone_admission(session_id, root_name, destination_input)
-        .await?;
+    Ok(CloneRequest {
+        session_id: session_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        root_name: root_name.to_owned(),
+        source_input: source_input.to_owned(),
+        destination_input: destination_input.to_owned(),
+        model: model.to_owned(),
+        effort: effort.to_owned(),
+    })
+}
+
+fn prepare_with_session(
+    request: CloneRequest,
+    session: config::Session,
+    roots: Option<&crate::named_roots::NamedRoots>,
+) -> Result<PreparedClone> {
     anyhow::ensure!(
-        session.id == session_id,
+        session.id == request.session_id,
         "lifecycle supervisor admitted a different session"
     );
     anyhow::ensure!(
@@ -115,20 +194,20 @@ pub(crate) async fn prepare(
         "repository_clone_bare is unavailable in yolo sessions"
     );
 
-    let source = parse_source(root_name, source_input)?;
-    let destination = validate_relative_path(destination_input, "destination")?;
+    let source = parse_source(&request.root_name, &request.source_input)?;
+    let destination = validate_relative_path(&request.destination_input, "destination")?;
     let prompt = clone_prompt(&source, &destination)?;
     let task_origin = codex_app_server::TaskStartOrigin::repository_clone_bare(
-        root_name,
-        source_input,
-        destination_input,
+        &request.root_name,
+        &request.source_input,
+        &request.destination_input,
     );
     let task_args = json!({
-        "session_id": session_id,
-        "operation_id": operation_id,
+        "session_id": request.session_id,
+        "operation_id": request.operation_id,
         "task": prompt,
-        "model": model,
-        "effort": effort,
+        "model": request.model,
+        "effort": request.effort,
     });
 
     // Exact accepted retries must continue to work after the first task has
@@ -142,12 +221,27 @@ pub(crate) async fn prepare(
         validate_filesystem_admission(&session.cwd, &source, &destination)?;
     }
 
+    if let Some(roots) = roots {
+        anyhow::ensure!(
+            roots.canonical_root(&request.root_name) == Some(session.cwd.as_path()),
+            "repository clone session no longer matches its named root"
+        );
+        validate_named_root_boundaries(
+            roots,
+            &request.root_name,
+            &session.cwd,
+            &source,
+            &destination,
+        )?;
+    }
+
     Ok(PreparedClone {
         session,
         task_args,
         task_origin,
         source,
         destination,
+        named_root: roots.map(|roots| (roots.clone(), request.root_name)),
         #[cfg(test)]
         retained_retry,
     })
@@ -280,6 +374,56 @@ fn validate_filesystem_admission(
     validate_absent_destination(&canonical_root, destination)
 }
 
+fn validate_named_root_boundaries(
+    roots: &crate::named_roots::NamedRoots,
+    requested_root: &str,
+    canonical_root: &Path,
+    source: &CloneSource,
+    destination: &Path,
+) -> Result<()> {
+    let prefix_matches = |logical: &str| {
+        logical
+            .split('/')
+            .next()
+            .is_some_and(|root| root == requested_root)
+    };
+    anyhow::ensure!(
+        roots.canonical_root(requested_root) == Some(canonical_root),
+        "repository clone named root identity changed"
+    );
+    if let CloneSource::Local { relative } = source {
+        let source_path = canonical_root.join(relative);
+        let logical = roots
+            .reverse_resolve(&source_path)?
+            .context("local clone source is outside the named-root inventory")?;
+        anyhow::ensure!(
+            prefix_matches(&logical),
+            "local clone source resolves through a different, more-specific named root"
+        );
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || canonical_root.to_path_buf(),
+            |parent| canonical_root.join(parent),
+        );
+    let canonical_parent = std::fs::canonicalize(&parent).with_context(|| {
+        format!(
+            "cannot resolve clone destination parent {}",
+            parent.display()
+        )
+    })?;
+    let logical = roots
+        .reverse_resolve(&canonical_parent)?
+        .context("clone destination is outside the named-root inventory")?;
+    anyhow::ensure!(
+        prefix_matches(&logical),
+        "clone destination resolves through a different, more-specific named root"
+    );
+    Ok(())
+}
+
 fn validate_existing_local_source(root: &Path, relative: &Path) -> Result<()> {
     let mut current = root.to_path_buf();
     for component in relative.components() {
@@ -356,7 +500,7 @@ fn clone_prompt(source: &CloneSource, destination: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::sync::Arc;
 
     use super::*;
@@ -450,6 +594,49 @@ mod tests {
                 &destination
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_clone_admission_rejects_same_path_root_inode_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("src");
+        std::fs::create_dir_all(root_path.join("source")).unwrap();
+        let root = std::fs::canonicalize(&root_path).unwrap();
+        let roots = named_roots::NamedRoots::from_canonical_roots(BTreeMap::from([(
+            "src".to_owned(),
+            root.clone(),
+        )]))
+        .unwrap();
+        let source = parse_source("src", "src/source").unwrap();
+        let destination = PathBuf::from("clone.git");
+        let identity = std::fs::metadata(&root).unwrap();
+        let named_root = (roots.clone(), "src".to_owned());
+
+        let old_root = fixture.path().join("src-old");
+        std::fs::rename(&root, &old_root).unwrap();
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        let replaced = std::fs::metadata(&root).unwrap();
+        assert!(identity.dev() != replaced.dev() || identity.ino() != replaced.ino());
+
+        let mut final_admission_ran = false;
+        let result =
+            validate_clone_admission(&root, &source, &destination, Some(&named_root), || {
+                final_admission_ran = true;
+                let current = std::fs::metadata(&root)?;
+                anyhow::ensure!(
+                    current.dev() == identity.dev() && current.ino() == identity.ino(),
+                    "browser-approved root identity changed before clone delegation"
+                );
+                Ok(())
+            });
+        assert!(
+            final_admission_ran,
+            "browser proof runs after path validation"
+        );
+        assert!(
+            result.is_err(),
+            "same-path root replacement must fail admission"
         );
     }
 
@@ -587,7 +774,7 @@ mod tests {
             let retained = prepare(&args, Some(&backend)).await.unwrap();
             assert!(retained.retained_retry);
             let replay = retained
-                .execute(&observation::ActorRef::mcp(false), None)
+                .execute(&observation::ActorRef::mcp(false), None, || Ok(()))
                 .await
                 .unwrap();
             assert_eq!(replay["task_id"], task_id.to_string());

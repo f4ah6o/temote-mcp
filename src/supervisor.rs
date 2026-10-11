@@ -16,6 +16,11 @@ use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
+#[cfg(feature = "network")]
+type ManagedFabricAuthority<'a> = Option<&'a crate::fabric_browser::FabricAuthority>;
+#[cfg(not(feature = "network"))]
+type ManagedFabricAuthority<'a> = Option<&'a ()>;
+
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
@@ -673,6 +678,81 @@ fn validate_fabric_session_binding(
 }
 
 #[cfg(feature = "network")]
+fn validate_managed_browser_session_owner(
+    receipt: &crate::repository_store::ProvisioningReceipt,
+    session: &config::Session,
+    activity_instance_id: Uuid,
+) -> Result<()> {
+    anyhow::ensure!(
+        receipt.browser_scope.is_some()
+            && receipt.runtime_instance_id == activity_instance_id
+            && receipt.activated_owner.as_ref().is_some_and(|owner| {
+                owner.activity_instance_id == activity_instance_id && owner.matches(session)
+            }),
+        "managed browser session activation identity changed"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "network")]
+fn managed_browser_inventory_receipt_is_current(
+    supervisor: &SessionSupervisor,
+    authority: &crate::fabric_browser::FabricAuthority,
+    receipt: &crate::repository_store::ProvisioningReceipt,
+    session: &config::Session,
+    activity_instance_id: Uuid,
+) -> bool {
+    if receipt.browser_scope.is_none() {
+        return true;
+    }
+    supervisor
+        .validate_managed_fabric_scope(Some(authority), receipt)
+        .is_ok()
+        && validate_managed_browser_session_owner(receipt, session, activity_instance_id).is_ok()
+}
+
+#[cfg(feature = "network")]
+fn is_managed_preparation_session(
+    store: &crate::repository_store::RepositoryStore,
+    session_id: &str,
+) -> Result<bool> {
+    Ok(store.find_by_preparation_session_id(session_id)?.is_some())
+}
+
+#[cfg(feature = "network")]
+async fn update_managed_browser_receipt_after_restart(
+    store: &crate::repository_store::RepositoryStore,
+    receipt: &crate::repository_store::ProvisioningReceipt,
+    metadata: &config::Session,
+    new_instance: Uuid,
+) -> Result<crate::repository_store::ProvisioningReceipt> {
+    anyhow::ensure!(
+        receipt.browser_scope.is_some()
+            && receipt.session_id == metadata.id
+            && receipt
+                .activated_owner
+                .as_ref()
+                .is_some_and(|owner| owner.cwd == metadata.cwd),
+        "managed runtime identity changed during restart"
+    );
+    let owner =
+        crate::repository_store::ActivatedSessionInstance::from_session(metadata, new_instance);
+    store
+        .update(receipt.operation_id, |record| {
+            anyhow::ensure!(
+                record.browser_scope == receipt.browser_scope
+                    && record.runtime_instance_id == receipt.runtime_instance_id
+                    && record.activated_owner == receipt.activated_owner,
+                "managed browser receipt changed during restart"
+            );
+            record.runtime_instance_id = new_instance;
+            record.activated_owner = Some(owner);
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(feature = "network")]
 async fn run_fabric_session_operation<F, T>(
     expected: &crate::fabric_browser::BrowserSessionBinding,
     session_id: &str,
@@ -850,10 +930,83 @@ impl SessionSupervisor {
     }
 
     #[cfg(feature = "network")]
+    fn fabric_provisioning_scope(
+        &self,
+        authority: &crate::fabric_browser::FabricAuthority,
+        root_name: &str,
+    ) -> Result<crate::repository_store::BrowserProvisioningScope> {
+        self.validate_fabric_authority(authority)?;
+        let canonical_root = self
+            .roots
+            .canonical_root(root_name)
+            .context("browser-approved managed root is unavailable")?;
+        anyhow::ensure!(
+            self.authorize_fabric_root(authority, root_name, canonical_root)? == root_name,
+            "managed workspace root is not the exact browser-approved named root"
+        );
+        let root_fingerprint = authority
+            .root_fingerprints
+            .get(root_name)
+            .context("browser-approved managed root identity is missing")?
+            .clone();
+        Ok(crate::repository_store::BrowserProvisioningScope {
+            host_id: authority.host_id.clone(),
+            owner_key: authority.owner_key.clone(),
+            grant_id: authority.grant_id.clone(),
+            grant_generation: authority.grant_generation,
+            root_name: root_name.to_owned(),
+            root_fingerprint,
+            root_registry_fingerprint: authority.root_registry_fingerprint.clone(),
+            supervisor_boot_generation: authority.supervisor_boot_generation.clone(),
+        })
+    }
+
+    #[cfg(feature = "network")]
+    fn validate_managed_fabric_scope(
+        &self,
+        authority: Option<&crate::fabric_browser::FabricAuthority>,
+        receipt: &crate::repository_store::ProvisioningReceipt,
+    ) -> Result<()> {
+        match (authority, receipt.browser_scope.as_ref()) {
+            (Some(authority), Some(scope)) => {
+                anyhow::ensure!(
+                    self.fabric_provisioning_scope(authority, &receipt.root_name)? == *scope,
+                    "reconciliation_required: managed browser authorization scope changed"
+                );
+                anyhow::ensure!(
+                    receipt.canonical_root.as_deref()
+                        == self.roots.canonical_root(&receipt.root_name),
+                    "reconciliation_required: managed browser named root changed"
+                );
+                for path in crate::workspace_provisioning::managed_mutation_paths(receipt)? {
+                    self.roots
+                        .validate_mutation_path_under_root(&receipt.root_name, &path)
+                        .context(
+                            "reconciliation_required: managed output crosses a named-root boundary",
+                        )?;
+                }
+                if let Some(attempt) = &receipt.environment_attempt {
+                    for path in attempt.plan.managed_mutation_paths() {
+                        self.roots
+                            .validate_mutation_path_under_root(&receipt.root_name, &path)
+                            .context("reconciliation_required: managed environment output crosses a named-root boundary")?;
+                    }
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => anyhow::bail!(
+                "reconciliation_required: managed provisioning was accepted under a different authorization scope"
+            ),
+        }
+    }
+
+    #[cfg(feature = "network")]
     async fn authorize_fabric_session(
         &self,
         authority: &crate::fabric_browser::FabricAuthority,
         session_id: &str,
+        allow_managed_restart_recovery: bool,
     ) -> Result<(config::Session, String, Uuid)> {
         config::validate_session_id(session_id)?;
         let runtime = self.sessions.lock().await;
@@ -899,6 +1052,19 @@ impl SessionSupervisor {
                 && authority.root_fingerprints.contains_key(root),
             "session is outside the browser-approved root scope"
         );
+        let store = crate::repository_store::RepositoryStore::new()?;
+        anyhow::ensure!(
+            !is_managed_preparation_session(&store, session_id)?,
+            "managed provisioning preparation sessions are not browser-addressable"
+        );
+        if let Some(receipt) = store.find_by_session_id(session_id)?
+            && receipt.browser_scope.is_some()
+        {
+            self.validate_managed_fabric_scope(Some(authority), &receipt)?;
+            if !allow_managed_restart_recovery {
+                validate_managed_browser_session_owner(&receipt, &stored, instance)?;
+            }
+        }
         Ok((stored, logical, instance))
     }
 
@@ -919,6 +1085,7 @@ impl SessionSupervisor {
             "session_info"
                 | "session_stop"
                 | "session_restart"
+                | "repository_clone_bare"
                 | "codex_status"
                 | "codex_task_start"
                 | "codex_task_get"
@@ -955,16 +1122,27 @@ impl SessionSupervisor {
                         .is_some_and(|object| object.is_empty()),
                     "session_list accepts no local arguments"
                 );
+                let provisioning = crate::repository_store::RepositoryStore::new()?;
                 let sessions = self.sessions.lock().await;
                 let mut result = Vec::new();
                 for (session_id, handle) in sessions.iter() {
                     if handle.is_finished() {
                         continue;
                     }
+                    if is_managed_preparation_session(&provisioning, session_id)? {
+                        continue;
+                    }
                     let session = handle.session_metadata();
                     let Some(instance) = handle.activity_session_instance() else {
                         continue;
                     };
+                    if let Some(receipt) = provisioning.find_by_session_id(session_id)?
+                        && !managed_browser_inventory_receipt_is_current(
+                            self, &authority, &receipt, &session, instance,
+                        )
+                    {
+                        continue;
+                    }
                     if session.yolo()
                         || !config::session_is_active(session_id).await.unwrap_or(false)
                     {
@@ -1008,6 +1186,39 @@ impl SessionSupervisor {
                     .as_object()
                     .context("session_start arguments must be an object")?;
                 anyhow::ensure!(
+                    object.contains_key("path") != object.contains_key("source"),
+                    "browser session_start requires exactly one of path or source"
+                );
+                if let Some(source) = object.get("source") {
+                    anyhow::ensure!(
+                        object
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "source" | "operation_id")),
+                        "browser managed session_start accepts only source and operation_id"
+                    );
+                    let operation_id = object
+                        .get("operation_id")
+                        .and_then(Value::as_str)
+                        .context("browser managed session_start requires operation_id")?;
+                    let operation_id =
+                        Uuid::parse_str(operation_id).context("operation_id must be a UUID")?;
+                    let request = crate::mcp::parse_managed_start_source(source)?;
+                    let result = self
+                        .start_managed_repository_locked(
+                            operation_id,
+                            request,
+                            true,
+                            approvals::CapturedStartEnvironment::default(),
+                            Some(&authority),
+                        )
+                        .await?;
+                    let receipt = crate::repository_store::RepositoryStore::new()?
+                        .read(operation_id)?
+                        .context("managed browser provisioning receipt disappeared")?;
+                    self.validate_managed_fabric_scope(Some(&authority), &receipt)?;
+                    return Ok(result);
+                }
+                anyhow::ensure!(
                     object
                         .keys()
                         .all(|key| matches!(key.as_str(), "path" | "session_id")),
@@ -1050,7 +1261,7 @@ impl SessionSupervisor {
             "session_info" => {
                 let session_id = fabric_session_id(&arguments)?;
                 let (session, logical, instance) = self
-                    .authorize_fabric_session(&authority, session_id)
+                    .authorize_fabric_session(&authority, session_id, false)
                     .await?;
                 let expected = expected_session
                     .as_ref()
@@ -1078,7 +1289,7 @@ impl SessionSupervisor {
             "session_stop" => {
                 let session_id = fabric_session_id(&arguments)?;
                 let (_, _, instance) = self
-                    .authorize_fabric_session(&authority, session_id)
+                    .authorize_fabric_session(&authority, session_id, false)
                     .await?;
                 let expected = expected_session
                     .as_ref()
@@ -1092,7 +1303,7 @@ impl SessionSupervisor {
             "session_restart" => {
                 let session_id = fabric_session_id(&arguments)?;
                 let (session, logical, instance) = self
-                    .authorize_fabric_session(&authority, session_id)
+                    .authorize_fabric_session(&authority, session_id, true)
                     .await?;
                 let expected = expected_session
                     .as_ref()
@@ -1103,6 +1314,7 @@ impl SessionSupervisor {
                     self.authorize_fabric_root(&authority, &logical, &cwd)?;
                     begin_agent_session_shutdown(&session);
                     self.stop_owned_validated(session_id, false).await?;
+                    let replacement_instance = Uuid::new_v4();
                     let info = self
                         .start_resolved_with_authority(
                             cwd,
@@ -1111,10 +1323,38 @@ impl SessionSupervisor {
                             Some(logical.clone()),
                             approvals::CapturedStartEnvironment::default(),
                             true,
-                            Uuid::new_v4(),
+                            replacement_instance,
                             Some(&authority),
                         )
                         .await?;
+                    let store = crate::repository_store::RepositoryStore::new()?;
+                    if let Some(receipt) = store.find_by_session_id(session_id)?
+                        && receipt.browser_scope.is_some()
+                    {
+                        self.validate_managed_fabric_scope(Some(&authority), &receipt)?;
+                        let (metadata, live_instance) = {
+                            let sessions = self.sessions.lock().await;
+                            let handle = sessions
+                                .get(session_id)
+                                .context("managed runtime disappeared after restart")?;
+                            (
+                                handle.session_metadata(),
+                                handle.activity_session_instance(),
+                            )
+                        };
+                        anyhow::ensure!(
+                            live_instance == Some(replacement_instance)
+                                && metadata.id == receipt.session_id,
+                            "managed runtime identity changed during restart"
+                        );
+                        update_managed_browser_receipt_after_restart(
+                            &store,
+                            &receipt,
+                            &metadata,
+                            replacement_instance,
+                        )
+                        .await?;
+                    }
                     Ok(json!({
                         "session_id": info.session_id,
                         "status": info.status,
@@ -1126,6 +1366,72 @@ impl SessionSupervisor {
                 })
                 .await
             }
+            "repository_clone_bare" => {
+                let session_id = arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .context("browser-scoped operation requires session_id")?
+                    .to_owned();
+                let (session, logical, instance) = self
+                    .authorize_fabric_session(&authority, &session_id, false)
+                    .await?;
+                let expected = expected_session
+                    .as_ref()
+                    .context("Worker omitted the live session instance binding")?;
+                let root_name = arguments
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .context("repository clone requires a named root")?
+                    .to_owned();
+                crate::named_roots::validate_root_name(&root_name)?;
+                let canonical_root = self
+                    .roots
+                    .canonical_root(&root_name)
+                    .context("repository clone named root is unavailable")?;
+                anyhow::ensure!(
+                    logical == root_name && session.cwd == canonical_root,
+                    "repository clone requires a session at the exact requested named root"
+                );
+                anyhow::ensure!(
+                    authority
+                        .approved_roots
+                        .iter()
+                        .any(|root| root == &root_name)
+                        && authority.root_fingerprints.contains_key(&root_name),
+                    "repository clone named root is outside the browser-approved scope"
+                );
+                self.authorize_fabric_root(&authority, &root_name, canonical_root)?;
+                let destination = arguments
+                    .get("destination")
+                    .and_then(Value::as_str)
+                    .context("repository clone requires a destination")?;
+                validate_repository_clone_session(
+                    &session,
+                    canonical_root,
+                    &root_name,
+                    destination,
+                )?;
+                let mutation_path = canonical_root.join(destination);
+                run_fabric_session_operation(expected, &session_id, instance, async {
+                    self.validate_fabric_authority(&authority)?;
+                    self.authorize_fabric_root(&authority, &root_name, canonical_root)?;
+                    crate::mcp::dispatch_browser_scoped_tool(
+                        tool,
+                        arguments,
+                        &session,
+                        &self.roots,
+                        || {
+                            self.validate_fabric_authority(&authority)?;
+                            self.authorize_fabric_root(&authority, &root_name, canonical_root)?;
+                            self.roots
+                                .validate_mutation_path_under_root(&root_name, &mutation_path)?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+                .await
+            }
             "codex_status" | "codex_task_start" | "codex_task_get" | "codex_task_control"
             | "evidence_read" | "task_list" | "poll_job" | "job_list" | "stop_job" => {
                 let session_id = arguments
@@ -1133,17 +1439,31 @@ impl SessionSupervisor {
                     .and_then(Value::as_str)
                     .context("browser-scoped operation requires session_id")?
                     .to_owned();
+                let binding_session_id = session_id.clone();
                 let (session, _, instance) = self
-                    .authorize_fabric_session(&authority, &session_id)
+                    .authorize_fabric_session(&authority, &session_id, false)
                     .await?;
                 let expected = expected_session
                     .as_ref()
                     .context("Worker omitted the live session instance binding")?;
                 // Keep the Supervisor transition lock held across the exact
                 // binding check and dispatch so a reused id cannot start work.
-                run_fabric_session_operation(expected, &session_id, instance, async move {
+                run_fabric_session_operation(expected, &binding_session_id, instance, async move {
                     self.validate_fabric_authority(&authority)?;
-                    crate::mcp::dispatch_browser_scoped_tool(tool, arguments, &session).await
+                    if let Some(receipt) = crate::repository_store::RepositoryStore::new()?
+                        .find_by_session_id(&session_id)?
+                        && receipt.browser_scope.is_some()
+                    {
+                        self.validate_managed_fabric_scope(Some(&authority), &receipt)?;
+                    }
+                    crate::mcp::dispatch_browser_scoped_tool(
+                        tool,
+                        arguments,
+                        &session,
+                        &self.roots,
+                        || Ok(()),
+                    )
+                    .await
                 })
                 .await
             }
@@ -1162,7 +1482,7 @@ impl SessionSupervisor {
         self.reap_finished().await;
         self.validate_fabric_authority(&authority)?;
         let (_, _, instance) = self
-            .authorize_fabric_session(&authority, &expected.session_id)
+            .authorize_fabric_session(&authority, &expected.session_id, false)
             .await?;
         validate_fabric_session_binding(&expected, &expected.session_id, instance)?;
         Ok(())
@@ -1299,7 +1619,12 @@ impl SessionSupervisor {
         mut receipt: crate::repository_store::ProvisioningReceipt,
         public: bool,
         environment: approvals::CapturedStartEnvironment,
+        authority: ManagedFabricAuthority<'_>,
     ) -> Result<Value> {
+        #[cfg(not(feature = "network"))]
+        let _ = authority;
+        #[cfg(feature = "network")]
+        self.validate_managed_fabric_scope(authority, &receipt)?;
         if receipt.activated_owner.is_some() {
             return Ok(reconciled_managed_view(&receipt, Some(self)).await);
         }
@@ -1379,6 +1704,22 @@ impl SessionSupervisor {
                     Ok(())
                 })
                 .await?;
+            #[cfg(feature = "network")]
+            {
+                self.validate_managed_fabric_scope(authority, &receipt)?;
+                self.start_resolved_with_authority(
+                    allocation.canonical_path,
+                    receipt.session_id.clone(),
+                    config::PermissionMode::Agent,
+                    Some(allocation.logical_path),
+                    environment,
+                    public,
+                    receipt.runtime_instance_id,
+                    authority,
+                )
+                .await?;
+            }
+            #[cfg(not(feature = "network"))]
             self.start_resolved_with_instance(
                 allocation.canonical_path,
                 receipt.session_id.clone(),
@@ -1420,10 +1761,15 @@ impl SessionSupervisor {
         preparation: &config::Session,
         public: bool,
         environment: approvals::CapturedStartEnvironment,
+        authority: ManagedFabricAuthority<'_>,
     ) -> Result<Value> {
         use crate::environment_preparation::{
             DelegatedExecution, PreparationPhase, PreparationPlan, PreparationReceipt,
         };
+        #[cfg(not(feature = "network"))]
+        let _ = authority;
+        #[cfg(feature = "network")]
+        self.validate_managed_fabric_scope(authority, &receipt)?;
         let root = self
             .roots
             .canonical_root(&receipt.root_name)
@@ -1448,7 +1794,7 @@ impl SessionSupervisor {
             .is_some_and(|attempt| attempt.phase == PreparationPhase::Ready)
         {
             return self
-                .activate_managed_receipt(store, receipt, public, environment)
+                .activate_managed_receipt(store, receipt, public, environment, authority)
                 .await;
         }
 
@@ -1497,6 +1843,15 @@ impl SessionSupervisor {
                 &allocation.canonical_path,
                 adapter,
             )?;
+            #[cfg(feature = "network")]
+            if authority.is_some() {
+                self.validate_managed_fabric_scope(authority, &receipt)?;
+                for path in plan.managed_mutation_paths() {
+                    self.roots
+                        .validate_mutation_path_under_root(&receipt.root_name, &path)
+                        .context("managed environment output crosses a named-root boundary")?;
+                }
+            }
             let mut attempt = PreparationReceipt::new(plan);
             attempt.model = receipt.preparation_model.clone();
             attempt.effort = receipt.preparation_effort.clone();
@@ -1591,6 +1946,8 @@ impl SessionSupervisor {
                 None,
             )
             .await?;
+            #[cfg(feature = "network")]
+            self.validate_managed_fabric_scope(authority, &receipt)?;
             let execution = match task.get("status").and_then(Value::as_str) {
                 Some("completed") => DelegatedExecution::Completed,
                 Some("failed" | "interrupted" | "blocked") => DelegatedExecution::Failed,
@@ -1629,8 +1986,10 @@ impl SessionSupervisor {
                     Ok(())
                 })
                 .await?;
+            #[cfg(feature = "network")]
+            self.validate_managed_fabric_scope(authority, &receipt)?;
             return if phase == PreparationPhase::Ready {
-                self.activate_managed_receipt(store, receipt, public, environment)
+                self.activate_managed_receipt(store, receipt, public, environment, authority)
                     .await
             } else {
                 Ok(managed_provisioning_view(&receipt))
@@ -1640,17 +1999,24 @@ impl SessionSupervisor {
         // The attempt, complete input hash and model selection are durable
         // before crossing the coding-agent boundary.
         let plan = attempt.plan.clone();
+        let admission_authority = authority;
+        let admission_receipt = receipt.clone();
+        let admission_root = root.to_path_buf();
         let task = crate::orchestration::invoke_codex_task_start_with_admission(
             &args,
             preparation,
             &crate::codex_app_server::TaskStartOrigin::Generic,
             &crate::observation::ActorRef::mcp(public),
             None,
-            || {
+            move || {
+                #[cfg(feature = "network")]
+                self.validate_managed_fabric_scope(admission_authority, &admission_receipt)?;
                 plan.validate_scope()?;
                 anyhow::ensure!(
-                    crate::workspace_provisioning::inspect_ready(root, &receipt)?
-                        == receipt.pinned_base.as_deref().unwrap_or_default(),
+                    crate::workspace_provisioning::inspect_ready(
+                        &admission_root,
+                        &admission_receipt
+                    )? == admission_receipt.pinned_base.as_deref().unwrap_or_default(),
                     "allocation revision changed before environment delegation"
                 );
                 Ok(())
@@ -1700,19 +2066,60 @@ impl SessionSupervisor {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
+        self.start_managed_repository_locked(operation_id, request, public, environment, None)
+            .await
+    }
+
+    /// Continue a managed-source operation while the caller already owns the
+    /// Supervisor transition lock. Browser `fabric_tool` uses this seam so the
+    /// same idempotent lifecycle is reused without recursively locking.
+    async fn start_managed_repository_locked(
+        &self,
+        operation_id: Uuid,
+        request: crate::repository_store::ManagedRequest,
+        public: bool,
+        environment: approvals::CapturedStartEnvironment,
+        authority: ManagedFabricAuthority<'_>,
+    ) -> Result<Value> {
+        #[cfg(not(feature = "network"))]
+        let _ = authority;
+        #[cfg(feature = "network")]
+        if let Some(authority) = authority {
+            self.validate_fabric_authority(authority)?;
+        }
         let store = crate::repository_store::RepositoryStore::new()?;
         let root_name = match store.read(operation_id)? {
             Some(existing) => existing.root_name,
-            None => crate::workspace_provisioning::select_root(&self.roots)?,
+            None => {
+                #[cfg(feature = "network")]
+                if let Some(authority) = authority {
+                    crate::workspace_provisioning::select_approved_root(
+                        &self.roots,
+                        &authority.approved_roots,
+                    )?
+                } else {
+                    crate::workspace_provisioning::select_root(&self.roots)?
+                }
+                #[cfg(not(feature = "network"))]
+                crate::workspace_provisioning::select_root(&self.roots)?
+            }
         };
         let root = self
             .roots
             .canonical_root(&root_name)
             .context("managed workspace root is unavailable")?
             .to_path_buf();
+        #[cfg(feature = "network")]
+        let browser_scope = authority
+            .map(|authority| self.fabric_provisioning_scope(authority, &root_name))
+            .transpose()?;
+        #[cfg(not(feature = "network"))]
+        let browser_scope = None;
         let mut receipt = store
-            .accept(operation_id, request, &root_name, &root)
+            .accept_scoped(operation_id, request, &root_name, &root, browser_scope)
             .await?;
+        #[cfg(feature = "network")]
+        self.validate_managed_fabric_scope(authority, &receipt)?;
         if receipt.canonical_root.as_deref() != Some(root.as_path()) {
             receipt = store
                 .update(operation_id, |record| {
@@ -1782,6 +2189,32 @@ impl SessionSupervisor {
                     Ok(())
                 })
                 .await?;
+            #[cfg(feature = "network")]
+            if authority.is_some() {
+                self.start_resolved_with_authority(
+                    root.clone(),
+                    receipt.preparation_session_id.clone(),
+                    config::PermissionMode::Agent,
+                    Some(root_name.clone()),
+                    environment.clone(),
+                    false,
+                    receipt.task_operation_id,
+                    authority,
+                )
+                .await?;
+            } else {
+                self.start_resolved_with_instance(
+                    root.clone(),
+                    receipt.preparation_session_id.clone(),
+                    config::PermissionMode::Agent,
+                    Some(root_name.clone()),
+                    environment.clone(),
+                    false,
+                    receipt.task_operation_id,
+                )
+                .await?;
+            }
+            #[cfg(not(feature = "network"))]
             self.start_resolved_with_instance(
                 root.clone(),
                 receipt.preparation_session_id.clone(),
@@ -1830,7 +2263,14 @@ impl SessionSupervisor {
                 reconcile_pinned_repository_claim(&store, &root, &receipt, &preparation).await?;
             }
             return self
-                .prepare_managed_environment(&store, receipt, &preparation, public, environment)
+                .prepare_managed_environment(
+                    &store,
+                    receipt,
+                    &preparation,
+                    public,
+                    environment,
+                    authority,
+                )
                 .await;
         }
 
@@ -1895,6 +2335,8 @@ impl SessionSupervisor {
                 None,
             )
             .await?;
+            #[cfg(feature = "network")]
+            self.validate_managed_fabric_scope(authority, &receipt)?;
             match task.get("status").and_then(Value::as_str) {
                 Some("completed") => {
                     let base = match crate::workspace_provisioning::inspect_ready(&root, &receipt) {
@@ -1963,7 +2405,14 @@ impl SessionSupervisor {
 
         if receipt.pinned_base.is_some() {
             return self
-                .prepare_managed_environment(&store, receipt, &preparation, public, environment)
+                .prepare_managed_environment(
+                    &store,
+                    receipt,
+                    &preparation,
+                    public,
+                    environment,
+                    authority,
+                )
                 .await;
         }
 
@@ -2006,6 +2455,8 @@ impl SessionSupervisor {
             })
             .await?;
         let root_for_admission = root.clone();
+        let admission_authority = authority;
+        let admission_receipt = receipt.clone();
         let task = crate::orchestration::invoke_codex_task_start_with_admission(
             &args,
             &preparation,
@@ -2013,6 +2464,8 @@ impl SessionSupervisor {
             &crate::observation::ActorRef::mcp(public),
             None,
             move || {
+                #[cfg(feature = "network")]
+                self.validate_managed_fabric_scope(admission_authority, &admission_receipt)?;
                 anyhow::ensure!(
                     std::fs::canonicalize(&root_for_admission)? == root_for_admission,
                     "managed named root changed before delegation"
@@ -3706,6 +4159,482 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+
+    #[cfg(feature = "network")]
+    fn test_browser_provisioning_scope() -> crate::repository_store::BrowserProvisioningScope {
+        crate::repository_store::BrowserProvisioningScope {
+            host_id: "host-a".to_owned(),
+            owner_key: "a".repeat(64),
+            grant_id: "grant-a".to_owned(),
+            grant_generation: 1,
+            root_name: "src".to_owned(),
+            root_fingerprint: "b".repeat(64),
+            root_registry_fingerprint: "c".repeat(64),
+            supervisor_boot_generation: "boot-a".to_owned(),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    fn test_browser_authority(
+        supervisor: &SessionSupervisor,
+    ) -> crate::fabric_browser::FabricAuthority {
+        use base64::Engine as _;
+
+        let inventory = supervisor.fabric_inventory().unwrap();
+        let local_hmac_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        let root_fingerprints =
+            crate::fabric_browser::inventory_root_fingerprints(&inventory, &local_hmac_key)
+                .unwrap();
+        let root_registry_fingerprint =
+            crate::fabric_browser::root_registry_fingerprint(&local_hmac_key, &root_fingerprints)
+                .unwrap();
+        let owner_key = "a".repeat(64);
+        let grant_id = "grant-test".to_owned();
+        let approved_roots = vec!["src".to_owned()];
+        let record = crate::fabric_browser::CredentialRecord {
+            schema_version: 1,
+            version: 1,
+            gateway_origin: "https://fabric.example.test".to_owned(),
+            issuer: "https://login.example.test".to_owned(),
+            oauth_client_id: "synthetic-test-client".to_owned(),
+            oauth_authorization_endpoint: "https://login.example.test/authorize".to_owned(),
+            oauth_token_endpoint: "https://login.example.test/token".to_owned(),
+            owner_key: owner_key.clone(),
+            email: "owner@example.test".to_owned(),
+            host_id: inventory.host_id.clone(),
+            grant_id: grant_id.clone(),
+            grant_secret: "synthetic-test-grant".to_owned(),
+            grant_generation: 1,
+            grant_expires_at: u64::MAX,
+            attempt_id: Uuid::new_v4().to_string(),
+            reserve_operation_id: Uuid::new_v4().to_string(),
+            expected_generation: 0,
+            activation_operation_id: Uuid::new_v4().to_string(),
+            cancel_operation_id: None,
+            revoke_operation_id: None,
+            oauth_access_token: "synthetic-test-access".to_owned(),
+            oauth_refresh_token: "synthetic-test-refresh".to_owned(),
+            access_expires_at: u64::MAX,
+            refresh_in_flight: false,
+            refresh_attempt_id: None,
+            refresh_outcome_unknown: false,
+            refresh_commit_pending: false,
+            status: crate::fabric_browser::CredentialStatus::Active,
+            supervisor_boot_generation: inventory.boot_generation.clone(),
+            root_registry_fingerprint,
+            root_fingerprints,
+            approved_roots: approved_roots.clone(),
+            local_hmac_key,
+        };
+        let snapshot = crate::fabric_browser::WorkerAuthSnapshot {
+            mode: "browser".to_owned(),
+            owner_key,
+            grant_id,
+            grant_generation: 1,
+            approved_roots,
+        };
+        crate::fabric_browser::make_fabric_authority(&record, &snapshot, &inventory).unwrap()
+    }
+
+    #[cfg(feature = "network")]
+    async fn start_inventory_receipt_session(
+        supervisor: &SessionSupervisor,
+        store: &crate::repository_store::RepositoryStore,
+        relative_path: &str,
+        browser_scope: Option<crate::repository_store::BrowserProvisioningScope>,
+        stale_activity_instance: bool,
+    ) -> String {
+        use crate::repository_store::ManagedRequest;
+        use crate::session_source::{RepositoryId, VcsPreference};
+
+        let operation_id = Uuid::new_v4();
+        let request = ManagedRequest {
+            repository: RepositoryId::parse("owner/repo", "github.com").unwrap(),
+            base: None,
+            vcs: VcsPreference::Git,
+        };
+        let root = supervisor.roots.canonical_root("src").unwrap();
+        let receipt = store
+            .accept_scoped(operation_id, request, "src", root, browser_scope)
+            .await
+            .unwrap();
+        let session_id = receipt.session_id.clone();
+        supervisor
+            .start(relative_path, Some(&session_id))
+            .await
+            .unwrap();
+        let metadata = config::read_session_metadata(&session_id).await.unwrap();
+        let live_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        let receipt_instance = if stale_activity_instance {
+            Uuid::new_v4()
+        } else {
+            live_instance
+        };
+        store
+            .update(operation_id, |record| {
+                record.runtime_instance_id = receipt_instance;
+                record.activated_owner = Some(
+                    crate::repository_store::ActivatedSessionInstance::from_session(
+                        &metadata,
+                        receipt_instance,
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        session_id
+    }
+
+    #[cfg(feature = "network")]
+    async fn synthetic_inventory_receipt(
+        store: &crate::repository_store::RepositoryStore,
+        canonical_root: &Path,
+        browser_scope: Option<crate::repository_store::BrowserProvisioningScope>,
+        recorded_instance_id: Uuid,
+        process_id: u32,
+    ) -> (
+        crate::repository_store::ProvisioningReceipt,
+        config::Session,
+    ) {
+        use crate::repository_store::ManagedRequest;
+        use crate::session_source::{RepositoryId, VcsPreference};
+
+        let has_browser_scope = browser_scope.is_some();
+        let operation_id = Uuid::new_v4();
+        let receipt = store
+            .accept_scoped(
+                operation_id,
+                ManagedRequest {
+                    repository: RepositoryId::parse("owner/repo", "github.com").unwrap(),
+                    base: None,
+                    vcs: VcsPreference::Git,
+                },
+                "src",
+                canonical_root,
+                browser_scope,
+            )
+            .await
+            .unwrap();
+        let session = config::Session {
+            id: receipt.session_id.clone(),
+            cwd: canonical_root.join("repo-a"),
+            permitted_directories: vec![canonical_root.join("repo-a")],
+            started_at: 10,
+            process_id,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let updated = if has_browser_scope {
+            store
+                .update(operation_id, |record| {
+                    record.runtime_instance_id = recorded_instance_id;
+                    record.activated_owner = Some(
+                        crate::repository_store::ActivatedSessionInstance::from_session(
+                            &session,
+                            recorded_instance_id,
+                        ),
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        } else {
+            receipt
+        };
+        (updated, session)
+    }
+
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn browser_inventory_receipt_predicate_checks_scope_and_live_instance() {
+        use crate::repository_store::RepositoryStore;
+
+        let (temp, roots) = fixture();
+        let canonical_root = roots.canonical_root("src").unwrap().to_owned();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let authority = test_browser_authority(&supervisor);
+        let scope = supervisor
+            .fabric_provisioning_scope(&authority, "src")
+            .unwrap();
+        let store =
+            RepositoryStore::at(std::fs::canonicalize(temp.path()).unwrap().join("receipts"));
+        let live_instance = Uuid::new_v4();
+        let (valid, valid_session) = synthetic_inventory_receipt(
+            &store,
+            &canonical_root,
+            Some(scope.clone()),
+            live_instance,
+            101,
+        )
+        .await;
+        assert!(managed_browser_inventory_receipt_is_current(
+            &supervisor,
+            &authority,
+            &valid,
+            &valid_session,
+            live_instance,
+        ));
+
+        let (retired, retired_session) = synthetic_inventory_receipt(
+            &store,
+            &canonical_root,
+            Some(scope.clone()),
+            Uuid::new_v4(),
+            102,
+        )
+        .await;
+        assert!(!managed_browser_inventory_receipt_is_current(
+            &supervisor,
+            &authority,
+            &retired,
+            &retired_session,
+            live_instance,
+        ));
+
+        let mut foreign_scope = scope;
+        foreign_scope.grant_id.push_str("-foreign");
+        let (foreign, foreign_session) = synthetic_inventory_receipt(
+            &store,
+            &canonical_root,
+            Some(foreign_scope),
+            live_instance,
+            103,
+        )
+        .await;
+        assert!(!managed_browser_inventory_receipt_is_current(
+            &supervisor,
+            &authority,
+            &foreign,
+            &foreign_session,
+            live_instance,
+        ));
+
+        let (legacy_local, local_session) =
+            synthetic_inventory_receipt(&store, &canonical_root, None, Uuid::new_v4(), 104).await;
+        assert!(managed_browser_inventory_receipt_is_current(
+            &supervisor,
+            &authority,
+            &legacy_local,
+            &local_session,
+            live_instance,
+        ));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn restarted_managed_receipt_authorizes_only_the_new_instance_and_exact_source_retry() {
+        use crate::repository_store::{ManagedRequest, RepositoryStore};
+        use crate::session_source::{RepositoryId, VcsPreference};
+
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let store = RepositoryStore::at(canonical_root.join("receipts"));
+        let operation_id = Uuid::new_v4();
+        let request = ManagedRequest {
+            repository: RepositoryId::parse("owner/repo", "github.com").unwrap(),
+            base: Some("main".to_owned()),
+            vcs: VcsPreference::Git,
+        };
+        let scope = test_browser_provisioning_scope();
+        let mut receipt = store
+            .accept_scoped(
+                operation_id,
+                request.clone(),
+                "src",
+                &canonical_root,
+                Some(scope.clone()),
+            )
+            .await
+            .unwrap();
+        let old_instance = Uuid::new_v4();
+        let old_metadata = config::Session {
+            id: receipt.session_id.clone(),
+            cwd: canonical_root.clone(),
+            permitted_directories: vec![canonical_root.clone()],
+            started_at: 10,
+            process_id: 100,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        receipt = store
+            .update(operation_id, |record| {
+                record.runtime_instance_id = old_instance;
+                record.activated_owner = Some(
+                    crate::repository_store::ActivatedSessionInstance::from_session(
+                        &old_metadata,
+                        old_instance,
+                    ),
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        validate_managed_browser_session_owner(&receipt, &old_metadata, old_instance).unwrap();
+
+        let new_instance = Uuid::new_v4();
+        let new_metadata = config::Session {
+            started_at: 11,
+            process_id: 101,
+            ..old_metadata.clone()
+        };
+        receipt = update_managed_browser_receipt_after_restart(
+            &store,
+            &receipt,
+            &new_metadata,
+            new_instance,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.runtime_instance_id, new_instance);
+        validate_managed_browser_session_owner(&receipt, &new_metadata, new_instance).unwrap();
+        assert!(
+            validate_managed_browser_session_owner(&receipt, &old_metadata, old_instance).is_err()
+        );
+
+        let old_binding = crate::fabric_browser::BrowserSessionBinding {
+            session_id: receipt.session_id.clone(),
+            session_instance: old_instance.to_string(),
+        };
+        let new_binding = crate::fabric_browser::BrowserSessionBinding {
+            session_id: receipt.session_id.clone(),
+            session_instance: new_instance.to_string(),
+        };
+        assert!(
+            validate_fabric_session_binding(
+                &old_binding,
+                &receipt.session_id,
+                receipt.runtime_instance_id,
+            )
+            .is_err()
+        );
+        validate_fabric_session_binding(
+            &new_binding,
+            &receipt.session_id,
+            receipt.runtime_instance_id,
+        )
+        .unwrap();
+
+        let retry = store
+            .accept_scoped(operation_id, request, "src", &canonical_root, Some(scope))
+            .await
+            .unwrap();
+        assert_eq!(retry.session_id, receipt.session_id);
+        assert_eq!(retry.runtime_instance_id, new_instance);
+        assert!(
+            retry
+                .activated_owner
+                .as_ref()
+                .is_some_and(|owner| owner.matches(&new_metadata))
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn browser_inventory_and_dispatch_share_internal_preparation_session_filter() {
+        use crate::repository_store::{ManagedRequest, RepositoryStore};
+        use crate::session_source::{RepositoryId, VcsPreference};
+
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let store = RepositoryStore::at(canonical_root.join("receipts"));
+        let receipt = store
+            .accept_scoped(
+                Uuid::new_v4(),
+                ManagedRequest {
+                    repository: RepositoryId::parse("owner/repo", "github.com").unwrap(),
+                    base: None,
+                    vcs: VcsPreference::Git,
+                },
+                "src",
+                &canonical_root,
+                Some(test_browser_provisioning_scope()),
+            )
+            .await
+            .unwrap();
+
+        assert!(is_managed_preparation_session(&store, &receipt.preparation_session_id).unwrap());
+        assert!(!is_managed_preparation_session(&store, &receipt.session_id).unwrap());
+        assert!(!is_managed_preparation_session(&store, "unrelated-session").unwrap());
+    }
+
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn browser_session_inventory_omits_foreign_or_retired_managed_receipts_and_keeps_local() {
+        use crate::repository_store::RepositoryStore;
+
+        let (_temp, roots) = fixture();
+        let canonical_root = roots.canonical_root("src").unwrap().to_owned();
+        for path in ["repo-c", "repo-d"] {
+            std::fs::create_dir_all(canonical_root.join(path)).unwrap();
+        }
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let authority = test_browser_authority(&supervisor);
+        let scope = supervisor
+            .fabric_provisioning_scope(&authority, "src")
+            .unwrap();
+        let store = RepositoryStore::new().unwrap();
+        let valid_id = start_inventory_receipt_session(
+            &supervisor,
+            &store,
+            "src/repo-a",
+            Some(scope.clone()),
+            false,
+        )
+        .await;
+        let local_id =
+            start_inventory_receipt_session(&supervisor, &store, "src/repo-b", None, false).await;
+        let mut foreign_scope = scope.clone();
+        foreign_scope.grant_id = "different-grant".to_owned();
+        let foreign_id = start_inventory_receipt_session(
+            &supervisor,
+            &store,
+            "src/repo-c",
+            Some(foreign_scope),
+            false,
+        )
+        .await;
+        let retired_id =
+            start_inventory_receipt_session(&supervisor, &store, "src/repo-d", Some(scope), true)
+                .await;
+
+        let result = supervisor
+            .fabric_tool(authority, "session_list", json!({}), None)
+            .await
+            .unwrap();
+        let visible = result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&valid_id));
+        assert!(
+            visible.contains(&local_id),
+            "legacy local receipts remain visible"
+        );
+        assert!(
+            !visible.contains(&foreign_id),
+            "a receipt from another grant is omitted"
+        );
+        assert!(
+            !visible.contains(&retired_id),
+            "a receipt for a replaced runtime is omitted"
+        );
+
+        supervisor.shutdown().await.unwrap();
+        for session_id in [valid_id, local_id, foreign_id, retired_id] {
+            cleanup_session(&session_id).await;
+        }
+    }
 
     #[cfg(feature = "network")]
     #[tokio::test]

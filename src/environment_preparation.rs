@@ -387,6 +387,21 @@ impl PreparationPlan {
             .join(format!("{digest:x}"))
     }
 
+    /// All explicit outputs of supported dependency preparation. These are
+    /// checked against current named-root ownership before task admission.
+    pub(crate) fn managed_mutation_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.private_cache(),
+            self.shared_cache(),
+            self.marker_path(),
+        ];
+        match self.adapter {
+            Adapter::VpPnpm => paths.push(self.workspace.join("node_modules")),
+            Adapter::CargoSccache => paths.push(self.private_cache().join("target")),
+        }
+        paths
+    }
+
     pub(crate) fn inspect_ready(&self, session: &Session) -> Result<ReadyStamp> {
         ensure!(
             self.session.matches(session),
@@ -746,6 +761,30 @@ mod tests {
         )
         .unwrap();
         assert!(scoped.shared_cache().starts_with(&scoped.workspace));
+    }
+
+    #[test]
+    fn generated_dependency_cache_is_rejected_when_a_nested_root_owns_it() {
+        let (_root, plan) = fixture(Adapter::CargoSccache);
+        fs::create_dir_all(plan.shared_cache()).unwrap();
+        let roots = crate::named_roots::NamedRoots::from_canonical_roots(
+            std::collections::BTreeMap::from([
+                ("src".to_owned(), plan.canonical_scope.clone()),
+                (
+                    "private".to_owned(),
+                    fs::canonicalize(plan.shared_cache()).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        assert!(
+            roots
+                .validate_mutation_path_under_root("src", &plan.shared_cache())
+                .is_err(),
+            "a shared dependency cache with a more-specific named root must fail before task admission"
+        );
+        assert!(plan.managed_mutation_paths().contains(&plan.shared_cache()));
     }
 
     #[test]

@@ -449,6 +449,7 @@ async function handleToolCall(rpc, env, identity) {
 function browserToolAllowed(name) {
   return [
     "host_list", "host_info", "session_list", "session_start", "session_info", "session_stop", "session_restart",
+    "repository_clone_bare",
     "codex_status", "codex_task_start", "codex_task_get", "codex_task_control",
     "evidence_read", "task_list", "poll_job", "job_list", "stop_job",
   ].includes(name);
@@ -462,7 +463,15 @@ function browserRequestAllowed(rpc, approvedRoots, routedHostId) {
   if (!args || typeof args !== "object" || Array.isArray(args)
       || args.host_id !== routedHostId) return false;
   if (name === "session_start") {
-    if (Object.hasOwn(args, "source") || Object.keys(args).some((key) => !["host_id", "path", "session_id"].includes(key))
+    const hasPath = Object.hasOwn(args, "path");
+    const hasSource = Object.hasOwn(args, "source");
+    if (hasPath === hasSource || validateSessionStart(args) !== null) return false;
+    if (hasSource) {
+      return Object.keys(args).every((key) => ["host_id", "source", "operation_id"].includes(key))
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(args.operation_id)
+        && approvedRoots.length > 0;
+    }
+    if (Object.keys(args).some((key) => !["host_id", "path", "session_id"].includes(key))
         || typeof args.path !== "string" || args.path.startsWith("/") || args.path.includes("\\")
         || args.path.includes("\0") || /%(?:2f|5c)/i.test(args.path)) return false;
     const parts = args.path.split("/");
@@ -470,6 +479,16 @@ function browserRequestAllowed(rpc, approvedRoots, routedHostId) {
       && approvedRoots.includes(parts[0]);
   }
   if (name === "session_list") return Object.keys(args).length === 1;
+  if (name === "repository_clone_bare") {
+    const keys = ["host_id", "session_id", "operation_id", "root", "source", "destination", "model", "effort"];
+    const uuid = (value) => typeof value === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    return Object.keys(args).length === keys.length && Object.keys(args).every((key) => keys.includes(key))
+      && typeof args.session_id === "string" && args.session_id.length > 0 && args.session_id.length <= 256
+      && uuid(args.operation_id) && typeof args.root === "string" && approvedRoots.includes(args.root)
+      && [args.source, args.destination].every((value) => typeof value === "string" && value.length > 0 && value.length <= 4096)
+      && [args.model, args.effort].every((value) => typeof value === "string" && value.length > 0 && value.length <= 256);
+  }
   if (["session_info", "session_stop", "session_restart", "codex_status",
     "codex_task_start", "codex_task_get", "codex_task_control", "evidence_read",
     "task_list", "poll_job", "job_list", "stop_job"].includes(name)) {

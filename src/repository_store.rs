@@ -23,6 +23,23 @@ pub(crate) struct ManagedRequest {
     pub vcs: VcsPreference,
 }
 
+/// Non-secret authorization provenance for a browser-originated provisioning
+/// operation. The authority proof and local HMAC key stay in memory; this
+/// binding lets retries prove they are continuing under the same grant and
+/// exact named-root identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrowserProvisioningScope {
+    pub host_id: String,
+    pub owner_key: String,
+    pub grant_id: String,
+    pub grant_generation: u64,
+    pub root_name: String,
+    pub root_fingerprint: String,
+    pub root_registry_fingerprint: String,
+    pub supervisor_boot_generation: String,
+}
+
 impl ManagedRequest {
     pub(crate) fn validate(&self) -> Result<()> {
         if let Some(base) = &self.base {
@@ -112,6 +129,8 @@ pub(crate) struct ProvisioningReceipt {
     pub request: ManagedRequest,
     pub root_name: String,
     #[serde(default)]
+    pub browser_scope: Option<BrowserProvisioningScope>,
+    #[serde(default)]
     pub canonical_root: Option<PathBuf>,
     pub session_id: String,
     pub workspace_id: Uuid,
@@ -149,6 +168,7 @@ impl ProvisioningReceipt {
         request: ManagedRequest,
         root_name: &str,
         canonical_root: PathBuf,
+        browser_scope: Option<BrowserProvisioningScope>,
     ) -> Self {
         // Deterministic IDs preserve identity even if the process exits after
         // the Accepted receipt and before the next durable transition.
@@ -159,6 +179,7 @@ impl ProvisioningReceipt {
             accepted_at: crate::config::unix_time(),
             request,
             root_name: root_name.to_owned(),
+            browser_scope,
             canonical_root: Some(canonical_root),
             session_id: id("session").to_string(),
             workspace_id: id("workspace"),
@@ -187,6 +208,26 @@ impl ProvisioningReceipt {
         if let Some(root) = &self.canonical_root {
             anyhow::ensure!(root.is_absolute(), "managed root identity is not absolute");
         }
+        if let Some(scope) = &self.browser_scope {
+            let bounded = |value: &str, maximum: usize| {
+                !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+            };
+            let fingerprint = |value: &str| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            anyhow::ensure!(
+                scope.root_name == self.root_name
+                    && bounded(&scope.host_id, 256)
+                    && scope.owner_key.len() == 64
+                    && scope.owner_key.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && bounded(&scope.grant_id, 256)
+                    && scope.grant_generation > 0
+                    && fingerprint(&scope.root_fingerprint)
+                    && fingerprint(&scope.root_registry_fingerprint)
+                    && bounded(&scope.supervisor_boot_generation, 256),
+                "managed browser authorization receipt is invalid"
+            );
+        }
         let id = |label: &str| Uuid::new_v5(&self.operation_id, label.as_bytes());
         anyhow::ensure!(
             self.session_id == id("session").to_string(),
@@ -209,7 +250,7 @@ impl ProvisioningReceipt {
             "managed preparation identity mismatch"
         );
         anyhow::ensure!(
-            self.runtime_instance_id == id("runtime-instance"),
+            self.runtime_instance_id != Uuid::nil(),
             "managed runtime identity mismatch"
         );
         if let Some(owner) = &self.activated_owner {
@@ -315,16 +356,29 @@ impl RepositoryStore {
     }
 
     #[cfg(test)]
-    fn at(directory: PathBuf) -> Self {
+    pub(crate) fn at(directory: PathBuf) -> Self {
         Self { directory }
     }
 
+    #[cfg(test)]
     pub(crate) async fn accept(
         &self,
         operation_id: Uuid,
         request: ManagedRequest,
         root_name: &str,
         canonical_root: &Path,
+    ) -> Result<ProvisioningReceipt> {
+        self.accept_scoped(operation_id, request, root_name, canonical_root, None)
+            .await
+    }
+
+    pub(crate) async fn accept_scoped(
+        &self,
+        operation_id: Uuid,
+        request: ManagedRequest,
+        root_name: &str,
+        canonical_root: &Path,
+        browser_scope: Option<BrowserProvisioningScope>,
     ) -> Result<ProvisioningReceipt> {
         request.validate()?;
         crate::named_roots::validate_root_name(root_name)?;
@@ -337,7 +391,9 @@ impl RepositoryStore {
         let path = self.path(operation_id);
         if let Some(existing) = self.read_path(&path)? {
             anyhow::ensure!(
-                existing.request == request && existing.root_name == root_name,
+                existing.request == request
+                    && existing.root_name == root_name
+                    && existing.browser_scope == browser_scope,
                 "operation_conflict: managed provisioning operation_id was accepted with different inputs"
             );
             return Ok(existing);
@@ -347,6 +403,7 @@ impl RepositoryStore {
             request,
             root_name,
             canonical_root.to_path_buf(),
+            browser_scope,
         );
         let bytes = serde_json::to_vec(&receipt)?;
         anyhow::ensure!(
@@ -791,7 +848,8 @@ mod tests {
     fn preparation_authority_binds_plan_and_full_owner() -> noprop::TestResult {
         let fixture = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(fixture.path()).unwrap();
-        let mut receipt = ProvisioningReceipt::new(Uuid::new_v4(), request(), "src", root.clone());
+        let mut receipt =
+            ProvisioningReceipt::new(Uuid::new_v4(), request(), "src", root.clone(), None);
         let session = crate::config::Session {
             id: receipt.preparation_session_id.clone(),
             cwd: root.clone(),
@@ -879,6 +937,98 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("operation_conflict")
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_accept_retry_cannot_adopt_local_or_rotated_authority_receipts() {
+        let fixture = tempfile::tempdir().unwrap();
+        let store = RepositoryStore::at(
+            fs::canonicalize(fixture.path())
+                .unwrap()
+                .join("state")
+                .join("managed-provisioning"),
+        );
+        let operation_id = Uuid::new_v4();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let scope = BrowserProvisioningScope {
+            host_id: "host-a".to_owned(),
+            owner_key: "a".repeat(64),
+            grant_id: "grant-a".to_owned(),
+            grant_generation: 3,
+            root_name: "src".to_owned(),
+            root_fingerprint: "b".repeat(64),
+            root_registry_fingerprint: "c".repeat(64),
+            supervisor_boot_generation: "boot-a".to_owned(),
+        };
+        let first = store
+            .accept_scoped(operation_id, request(), "src", &root, Some(scope.clone()))
+            .await
+            .unwrap();
+        let replay = store
+            .accept_scoped(operation_id, request(), "src", &root, Some(scope.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.session_id, replay.session_id);
+        assert!(
+            store
+                .accept_scoped(operation_id, request(), "src", &root, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("operation_conflict")
+        );
+        let mut changed_scopes = Vec::new();
+        let mut changed = scope.clone();
+        changed.owner_key = "d".repeat(64);
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.host_id = "host-b".to_owned();
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.grant_id = "grant-b".to_owned();
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.grant_generation += 1;
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.root_fingerprint = "e".repeat(64);
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.root_registry_fingerprint = "f".repeat(64);
+        changed_scopes.push(changed);
+        let mut changed = scope.clone();
+        changed.supervisor_boot_generation = "boot-b".to_owned();
+        changed_scopes.push(changed);
+        for changed in changed_scopes {
+            assert!(
+                store
+                    .accept_scoped(operation_id, request(), "src", &root, Some(changed))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("operation_conflict"),
+                "a source retry with a different authority scope must conflict"
+            );
+        }
+        let saved = fs::read(store.path(operation_id)).unwrap();
+        let saved = String::from_utf8(saved).unwrap();
+        assert!(!saved.contains("local_hmac_key"));
+        assert!(!saved.contains("proof"));
+
+        let local_operation = Uuid::new_v4();
+        store
+            .accept(local_operation, request(), "src", &root)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .accept_scoped(local_operation, request(), "src", &root, Some(scope),)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("operation_conflict"),
+            "a browser source retry cannot adopt a pre-existing local receipt"
         );
     }
 

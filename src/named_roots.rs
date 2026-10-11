@@ -170,6 +170,63 @@ impl NamedRoots {
         self.roots.get(name).map(PathBuf::as_path)
     }
 
+    /// Validate a server-generated mutation path against a named root without
+    /// requiring the leaf to exist. Existing symlink components and any
+    /// nested named root inside the intended mutation tree fail closed.
+    pub(crate) fn validate_mutation_path_under_root(
+        &self,
+        requested_root: &str,
+        path: &Path,
+    ) -> Result<()> {
+        let root = self
+            .canonical_root(requested_root)
+            .context("requested named root is unavailable")?;
+        anyhow::ensure!(
+            path.is_absolute() && path.starts_with(root),
+            "generated mutation path is outside its named root"
+        );
+        let relative = path.strip_prefix(root)?;
+        let mut candidate = root.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                anyhow::bail!("generated mutation path has an unsafe component")
+            };
+            candidate.push(component);
+
+            let mut most_specific: Option<(&str, &Path, usize)> = None;
+            for (name, configured) in &self.roots {
+                if candidate != *configured && !candidate.starts_with(configured) {
+                    continue;
+                }
+                let depth = configured.components().count();
+                if most_specific.is_none_or(|(_, _, best_depth)| depth > best_depth) {
+                    most_specific = Some((name, configured, depth));
+                } else if most_specific.is_some_and(|(_, _, best_depth)| depth == best_depth) {
+                    anyhow::bail!("generated mutation path matches ambiguous named roots");
+                }
+            }
+            anyhow::ensure!(
+                most_specific.is_some_and(|(name, _, _)| name == requested_root),
+                "generated mutation path resolves through a different, more-specific named root"
+            );
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(metadata) => anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "generated mutation path contains a symbolic link"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::ensure!(
+            !self.roots.iter().any(|(name, configured)| {
+                name != requested_root && configured.starts_with(path)
+            }),
+            "generated mutation tree contains a nested named root"
+        );
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn from_canonical_roots(roots: BTreeMap<String, PathBuf>) -> Result<Self> {
         for (name, root) in &roots {
@@ -483,6 +540,77 @@ mod tests {
         assert_eq!(roots.canonical_root("work"), Some(canonical_work.as_path()));
         assert_eq!(roots.canonical_root("other"), None);
         assert_eq!(NamedRoots::default().canonical_root("src"), None);
+    }
+
+    #[test]
+    fn managed_mutation_paths_respect_target_boundaries_symlinks_and_inode_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("src");
+        let sibling_root = root.join(".temote-mcp/workspaces/other");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let sibling_root = std::fs::canonicalize(sibling_root).unwrap();
+        let other = std::fs::canonicalize(outside).unwrap();
+        let roots = NamedRoots::from_canonical_roots(BTreeMap::from([
+            ("src".to_owned(), root.clone()),
+            ("workspace".to_owned(), sibling_root),
+        ]))
+        .unwrap();
+        let repository = root.join(".temote-mcp/repositories/github.com/owner/repo.git");
+        roots
+            .validate_mutation_path_under_root("src", &repository)
+            .expect("an unrelated nested root under a sibling mutation tree is allowed");
+
+        let nested_target_root = repository.join("owned");
+        std::fs::create_dir_all(&nested_target_root).unwrap();
+        let nested_target_root = std::fs::canonicalize(nested_target_root).unwrap();
+        let roots_with_target_root = NamedRoots::from_canonical_roots(BTreeMap::from([
+            ("src".to_owned(), root.clone()),
+            ("target".to_owned(), nested_target_root),
+            (
+                "workspace".to_owned(),
+                root.join(".temote-mcp/workspaces/other"),
+            ),
+        ]))
+        .unwrap();
+        assert!(
+            roots_with_target_root
+                .validate_mutation_path_under_root("src", &repository)
+                .is_err(),
+            "a named root inside the intended mutation target remains rejected"
+        );
+
+        let ordinary_roots =
+            NamedRoots::from_canonical_roots(BTreeMap::from([("src".to_owned(), root.clone())]))
+                .unwrap();
+        let escaped = root.join(".temote-mcp/escape/repo.git");
+        std::os::unix::fs::symlink(other.join("."), root.join(".temote-mcp/escape")).unwrap();
+        assert!(
+            ordinary_roots
+                .validate_mutation_path_under_root("src", &escaped)
+                .is_err()
+        );
+
+        let replacement = fixture.path().join("replacement");
+        let old_root = fixture.path().join("src-old");
+        let old_identity = std::fs::metadata(&root).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::rename(&root, &old_root).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+        assert!(
+            ordinary_roots
+                .validate_mutation_path_under_root("src", &root.join("new-output"))
+                .is_ok(),
+            "the lexical checker is intentionally independent of identity proof"
+        );
+        use std::os::unix::fs::MetadataExt;
+        let replacement_identity = std::fs::metadata(&root).unwrap();
+        assert!(
+            old_identity.dev() != replacement_identity.dev()
+                || old_identity.ino() != replacement_identity.ino()
+        );
     }
 
     #[test]

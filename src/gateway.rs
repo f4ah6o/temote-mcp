@@ -1799,6 +1799,7 @@ async fn dispatch_browser_host_response(
                     | "session_info"
                     | "session_stop"
                     | "session_restart"
+                    | "repository_clone_bare"
                     | "codex_status"
                     | "codex_task_start"
                     | "codex_task_get"

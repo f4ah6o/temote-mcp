@@ -57,7 +57,7 @@ pub(crate) fn select_root(roots: &NamedRoots) -> Result<String> {
             roots.canonical_root(&name).is_some(),
             "configured TEMOTE_WORKSPACE_ROOT is not a named root"
         );
-        return Ok(name);
+        return Ok(name.to_owned());
     }
     let names = roots.names();
     anyhow::ensure!(
@@ -65,6 +65,52 @@ pub(crate) fn select_root(roots: &NamedRoots) -> Result<String> {
         "set TEMOTE_WORKSPACE_ROOT to select a configured named root for managed provisioning"
     );
     Ok(names[0].clone())
+}
+
+/// Select a root already authorized by the browser grant. The host's explicit
+/// managed-workspace default remains authoritative; without one, a single
+/// approved root is unambiguous and multiple approved roots fail closed.
+pub(crate) fn select_approved_root(
+    roots: &NamedRoots,
+    approved_roots: &[String],
+) -> Result<String> {
+    let configured = temote_mcp::environment::var("TEMOTE_MCP_WORKSPACE_ROOT").ok();
+    select_approved_root_from(roots, approved_roots, configured.as_deref())
+}
+
+fn select_approved_root_from(
+    roots: &NamedRoots,
+    approved_roots: &[String],
+    configured: Option<&str>,
+) -> Result<String> {
+    anyhow::ensure!(
+        !approved_roots.is_empty(),
+        "browser grant has no approved named roots"
+    );
+    if let Some(name) = configured {
+        crate::named_roots::validate_root_name(name)?;
+        anyhow::ensure!(
+            approved_roots.iter().any(|approved| approved == name),
+            "configured managed-workspace root is outside the browser-approved scope"
+        );
+        anyhow::ensure!(
+            roots.canonical_root(name).is_some(),
+            "configured TEMOTE_WORKSPACE_ROOT is not a named root"
+        );
+        return Ok(name.to_owned());
+    }
+    let mut available = approved_roots
+        .iter()
+        .filter(|name| roots.canonical_root(name).is_some())
+        .cloned();
+    let Some(name) = available.next() else {
+        anyhow::bail!("browser-approved named roots are unavailable in the local Supervisor");
+    };
+    anyhow::ensure!(
+        available.next().is_none(),
+        "set TEMOTE_WORKSPACE_ROOT to select one browser-approved named root for managed provisioning"
+    );
+    Ok(name)
 }
 
 pub(crate) fn repository_relative(request: &ManagedRequest) -> PathBuf {
@@ -78,8 +124,23 @@ pub(crate) fn workspace_relative(receipt: &ProvisioningReceipt) -> PathBuf {
     PathBuf::from(".temote-mcp/workspaces").join(receipt.workspace_id.to_string())
 }
 
-fn marker_relative(receipt: &ProvisioningReceipt) -> PathBuf {
+pub(crate) fn marker_relative(receipt: &ProvisioningReceipt) -> PathBuf {
     PathBuf::from(".temote-mcp/provisioning").join(format!("{}.json", receipt.operation_id))
+}
+
+/// Absolute, server-generated paths that the repository preparation task may
+/// create or mutate. Callers authorize each path and its named-root ancestry
+/// before admitting any delegated work.
+pub(crate) fn managed_mutation_paths(receipt: &ProvisioningReceipt) -> Result<Vec<PathBuf>> {
+    let root = receipt
+        .canonical_root
+        .as_ref()
+        .context("managed named-root identity is missing")?;
+    Ok(vec![
+        root.join(repository_relative(&receipt.request)),
+        root.join(workspace_relative(receipt)),
+        root.join(marker_relative(receipt)),
+    ])
 }
 
 /// Prompt is constructed only from checked RepositoryId, generated IDs and
@@ -266,6 +327,7 @@ mod tests {
     use super::*;
     use crate::repository_store::ProvisioningReceipt;
     use crate::session_source::RepositoryId;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     fn fixture(vcs: VcsPreference) -> (tempfile::TempDir, ProvisioningReceipt) {
@@ -280,6 +342,7 @@ mod tests {
             request,
             "src",
             fs::canonicalize(root.path()).unwrap(),
+            None,
         );
         let workspace = root.path().join(workspace_relative(&receipt));
         fs::create_dir_all(workspace.join(if vcs == VcsPreference::Git {
@@ -307,6 +370,29 @@ mod tests {
             "pinned_base": "0123456789012345678901234567890123456789",
         });
         fs::write(root.join(marker_relative(receipt)), marker.to_string()).unwrap();
+    }
+
+    #[test]
+    fn browser_root_selection_uses_only_approved_available_named_roots() {
+        let src = tempfile::tempdir().unwrap();
+        let docs = tempfile::tempdir().unwrap();
+        let roots = NamedRoots::from_canonical_roots(BTreeMap::from([
+            ("src".to_owned(), fs::canonicalize(src.path()).unwrap()),
+            ("docs".to_owned(), fs::canonicalize(docs.path()).unwrap()),
+        ]))
+        .unwrap();
+        let approved = vec!["src".to_owned(), "docs".to_owned()];
+
+        assert_eq!(
+            select_approved_root_from(&roots, &approved, Some("src")).unwrap(),
+            "src"
+        );
+        assert!(select_approved_root_from(&roots, &approved, Some("outside")).is_err());
+        assert!(select_approved_root_from(&roots, &approved, None).is_err());
+        assert_eq!(
+            select_approved_root_from(&roots, &["unavailable".into(), "src".into()], None).unwrap(),
+            "src"
+        );
     }
 
     #[test]
