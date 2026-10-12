@@ -4,6 +4,7 @@
 //! fake and never touch an operating-system credential provider.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -42,6 +43,8 @@ pub struct BrowserConnectOptions {
     pub client_id: String,
     pub permitted_origins: Vec<String>,
     pub resource: String,
+    /// Optional exact IPv4 loopback port for the one-use OAuth callback.
+    pub oauth_callback_port: Option<u16>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -832,52 +835,50 @@ impl BrowserOAuth {
     }
 
     pub async fn authorize(&self) -> Result<OAuthCredentials> {
-        let metadata = self.metadata().await?;
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let address = listener.local_addr()?;
-        let redirect_uri = format!("http://127.0.0.1:{}/callback", address.port());
-        let verifier = random_url_token(32)?;
-        let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref());
-        let state = random_url_token(32)?;
-        let mut authorize = metadata.authorization_endpoint.clone();
-        authorize
-            .query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &self.options.client_id)
-            .append_pair("redirect_uri", &redirect_uri)
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("resource", &self.options.resource)
-            .append_pair("state", &state);
-        open_authorization_url(authorize.as_str())?;
-        let code = tokio::time::timeout(LOOPBACK_TIMEOUT, wait_for_loopback_code(listener, &state))
-            .await
-            .context("OAuth browser login timed out")??;
-        let token = self
-            .post_form(
-                &metadata.token_endpoint,
-                &[
-                    ("grant_type", "authorization_code"),
-                    ("client_id", &self.options.client_id),
-                    ("redirect_uri", &redirect_uri),
-                    ("code", &code),
-                    ("code_verifier", &verifier),
-                    ("resource", &self.options.resource),
-                ],
-            )
-            .await?;
-        let refresh_token = token
-            .refresh_token
-            .context("Cloudflare did not issue a refresh token")?;
-        Ok(OAuthCredentials {
-            issuer: metadata.issuer,
-            client_id: self.options.client_id.clone(),
-            authorization_endpoint: metadata.authorization_endpoint.to_string(),
-            token_endpoint: metadata.token_endpoint.to_string(),
-            access_token: token.access_token,
-            refresh_token,
-            access_expires_at: unix_now().saturating_add(token.expires_in),
+        with_callback_listener(self.options.oauth_callback_port, |listener| async move {
+            let metadata = self.metadata().await?;
+            let address = listener.local_addr()?;
+            let redirect_uri = callback_redirect_uri(address.port());
+            let verifier = random_url_token(32)?;
+            let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref());
+            let state = random_url_token(32)?;
+            let authorize = build_authorization_url(
+                &metadata.authorization_endpoint,
+                &self.options.client_id,
+                &redirect_uri,
+                &challenge,
+                &self.options.resource,
+                &state,
+            );
+            open_authorization_url(authorize.as_str())?;
+            let code =
+                tokio::time::timeout(LOOPBACK_TIMEOUT, wait_for_loopback_code(listener, &state))
+                    .await
+                    .context("OAuth browser login timed out")??;
+            let token_form = authorization_code_form(
+                &self.options.client_id,
+                &redirect_uri,
+                &code,
+                &verifier,
+                &self.options.resource,
+            );
+            let token = self
+                .post_form(&metadata.token_endpoint, &token_form)
+                .await?;
+            let refresh_token = token
+                .refresh_token
+                .context("Cloudflare did not issue a refresh token")?;
+            Ok(OAuthCredentials {
+                issuer: metadata.issuer,
+                client_id: self.options.client_id.clone(),
+                authorization_endpoint: metadata.authorization_endpoint.to_string(),
+                token_endpoint: metadata.token_endpoint.to_string(),
+                access_token: token.access_token,
+                refresh_token,
+                access_expires_at: unix_now().saturating_add(token.expires_in),
+            })
         })
+        .await
     }
 
     pub async fn refresh(&self, credentials: &OAuthCredentials) -> Result<OAuthCredentials> {
@@ -2620,6 +2621,10 @@ pub fn select_roots(available: &[String]) -> Result<Vec<String>> {
 }
 
 pub fn validate_oauth_options(options: &BrowserConnectOptions) -> Result<()> {
+    anyhow::ensure!(
+        options.oauth_callback_port.is_none_or(|port| port > 0),
+        "OAuth callback port must be from 1 to 65535"
+    );
     let gateway = Url::parse(&options.gateway_url).context("Fabric URL is invalid")?;
     anyhow::ensure!(
         gateway.scheme() == "https"
@@ -2679,6 +2684,72 @@ pub fn validate_oauth_options(options: &BrowserConnectOptions) -> Result<()> {
         "OAuth issuer origin is not in the explicit permitted-origin set"
     );
     Ok(())
+}
+
+async fn with_callback_listener<T, F, Fut>(port: Option<u16>, continuation: F) -> Result<T>
+where
+    F: FnOnce(tokio::net::TcpListener) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let listener = bind_callback_listener(port).await?;
+    continuation(listener).await
+}
+
+async fn bind_callback_listener(port: Option<u16>) -> Result<tokio::net::TcpListener> {
+    anyhow::ensure!(
+        port.is_none_or(|port| port > 0),
+        "OAuth callback port must be from 1 to 65535"
+    );
+    let port = port.unwrap_or(0);
+    tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .context(if port == 0 {
+            "could not bind the IPv4 loopback OAuth callback"
+        } else {
+            "could not bind the requested IPv4 loopback OAuth callback port"
+        })
+}
+
+fn callback_redirect_uri(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/callback")
+}
+
+fn build_authorization_url(
+    endpoint: &Url,
+    client_id: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    resource: &str,
+    state: &str,
+) -> Url {
+    let mut authorize = endpoint.clone();
+    authorize
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("resource", resource)
+        .append_pair("state", state);
+    authorize
+}
+
+fn authorization_code_form<'a>(
+    client_id: &'a str,
+    redirect_uri: &'a str,
+    code: &'a str,
+    verifier: &'a str,
+    resource: &'a str,
+) -> [(&'static str, &'a str); 6] {
+    [
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code", code),
+        ("code_verifier", verifier),
+        ("resource", resource),
+    ]
 }
 
 fn validate_permitted_url(url: &Url, permitted_origins: &[String]) -> Result<()> {
@@ -3227,14 +3298,87 @@ pub(crate) mod tests_support {
                 "https://login.example".into(),
             ],
             resource: "https://fabric.example".into(),
+            oauth_callback_port: None,
         };
         assert!(validate_oauth_options(&valid).is_ok());
+        let mut fixed_port = valid.clone();
+        fixed_port.oauth_callback_port = Some(8400);
+        assert!(validate_oauth_options(&fixed_port).is_ok());
+        fixed_port.oauth_callback_port = Some(0);
+        assert!(validate_oauth_options(&fixed_port).is_err());
         let mut bad = valid.clone();
         bad.permitted_origins.pop();
         assert!(validate_oauth_options(&bad).is_err());
         let mut bad = valid;
         bad.gateway_url = "http://127.0.0.1:8787".into();
         assert!(validate_oauth_options(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_callback_port_binds_exact_ipv4_port_and_is_shared_by_oauth_requests() {
+        let reservation = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+
+        let listener = bind_callback_listener(Some(port)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(address.port(), port);
+
+        let redirect_uri = callback_redirect_uri(address.port());
+        assert_eq!(redirect_uri, format!("http://127.0.0.1:{port}/callback"));
+        let authorization_endpoint = Url::parse("https://login.example/authorize").unwrap();
+        let authorize = build_authorization_url(
+            &authorization_endpoint,
+            "public-client",
+            &redirect_uri,
+            "challenge",
+            "https://fabric.example",
+            "state",
+        );
+        let authorization_redirect = authorize
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .unwrap()
+            .1
+            .into_owned();
+        let token_form = authorization_code_form(
+            "public-client",
+            &redirect_uri,
+            "one-use-code",
+            "verifier",
+            "https://fabric.example",
+        );
+        let token_redirect = token_form
+            .iter()
+            .find(|(key, _)| *key == "redirect_uri")
+            .unwrap()
+            .1;
+        assert_eq!(authorization_redirect, redirect_uri);
+        assert_eq!(token_redirect, redirect_uri);
+    }
+
+    #[tokio::test]
+    async fn occupied_fixed_callback_port_stops_before_browser_or_token_exchange() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let occupied = bind_callback_listener(None).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let browser_calls = AtomicUsize::new(0);
+        let token_calls = AtomicUsize::new(0);
+
+        let result = with_callback_listener(Some(port), |_listener| async {
+            browser_calls.fetch_add(1, Ordering::SeqCst);
+            token_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(browser_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3928,6 +4072,7 @@ pub(crate) mod tests_support {
                 "https://login.example".to_owned(),
             ],
             resource: "https://fabric.example".to_owned(),
+            oauth_callback_port: None,
         }
     }
 

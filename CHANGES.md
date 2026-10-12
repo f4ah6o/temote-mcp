@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `temote fabric connect --oauth-callback-port` for an exact IPv4 loopback OAuth callback port; the default remains dynamic and an occupied requested port fails before browser launch. ([Fabric browser enrollment](docs/designs/fabric-browser-enrollment.md))
 - Added `temote task start|list|get|control --local`, using the same typed task admission, session ownership, operation receipts and scoped evidence as MCP. Modern MCP calls and evidence reads route through the runtime-owning supervisor; a relay failure never falls back to a second owner. ([development workflow](docs/development-workstream-20261005.md))
 - Added managed repository-source sessions with durable provisioning receipts, a shared bare store and independent workspace metadata; jj remains the default and explicit Git compatibility does not grant writes to shared metadata. ([session-first provisioning](issues/open/20260929-session-first-managed-provisioning.md))
 - Added local prompt observation and friction workflows, Change correlation and verification-bound delivery planning. Each workflow retains explicit capability and authorization boundaries. ([prompt observation](docs/prompt-observation.md), [friction](docs/friction.md), [Change delivery](docs/change-delivery.md))

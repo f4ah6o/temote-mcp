@@ -682,6 +682,23 @@ fn parse_fabric_browser(args: &mut noargs::RawArgs, logout: bool) -> noargs::Res
         Some("TEMOTE_MCP_GATEWAY_HOST_ID"),
         "Optional expected local Host identity; the running Supervisor remains authoritative",
     )?;
+    let oauth_callback_port = if logout {
+        None
+    } else {
+        let value = string_opt_env(
+            args,
+            "oauth-callback-port",
+            Some("TEMOTE_FABRIC_OAUTH_CALLBACK_PORT"),
+            "Bind the OAuth callback to this exact IPv4 loopback port (default: dynamic)",
+        )?;
+        value
+            .as_deref()
+            .map(|value| {
+                parse_oauth_callback_port(value)
+                    .map_err(|message| noargs::Error::other(args, message))
+            })
+            .transpose()?
+    };
     let gateway_origin = url::Url::parse(&gateway_url)
         .map_err(|_| noargs::Error::other(args, "Fabric gateway URL is invalid"))?
         .origin()
@@ -704,12 +721,27 @@ fn parse_fabric_browser(args: &mut noargs::RawArgs, logout: bool) -> noargs::Res
         client_id,
         permitted_origins: vec![gateway_origin, issuer_origin],
         resource,
+        oauth_callback_port,
     };
     Ok(if logout {
         Command::FabricLogout { options }
     } else {
         Command::FabricConnect { options }
     })
+}
+
+#[cfg(feature = "network")]
+fn parse_oauth_callback_port(value: &str) -> Result<u16, &'static str> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("OAuth callback port must be a decimal integer from 1 to 65535");
+    }
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "OAuth callback port must be a decimal integer from 1 to 65535")?;
+    if port == 0 {
+        return Err("OAuth callback port must be a decimal integer from 1 to 65535");
+    }
+    Ok(port)
 }
 
 fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
@@ -1954,8 +1986,52 @@ mod tests {
                 Command::FabricConnect { options }
                     if options.host_id.as_deref() == Some("test-host")
                         && options.resource == "https://fabric.example"
+                        && options.oauth_callback_port.is_none()
             ));
         }
+        assert!(matches!(
+            command(&[
+                "temote",
+                "fabric",
+                "connect",
+                "--gateway-url",
+                "https://fabric.example",
+                "--oauth-issuer",
+                "https://login.example",
+                "--oauth-client-id",
+                "public-client",
+                "--oauth-callback-port",
+                "8400",
+            ]),
+            Command::FabricConnect { options } if options.oauth_callback_port == Some(8400)
+        ));
+        for invalid in ["", "0", "-1", "+8400", "65536", "999999999999999999", "abc"] {
+            assert!(
+                parse_oauth_callback_port(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        for valid in ["1", "8400", "65535", "008400"] {
+            assert!(
+                parse_oauth_callback_port(valid).is_ok(),
+                "rejected {valid:?}"
+            );
+        }
+        assert!(
+            parse(argv(&[
+                "temote",
+                "fabric",
+                "connect",
+                "--gateway-url",
+                "https://fabric.example",
+                "--oauth-issuer",
+                "https://login.example",
+                "--oauth-client-id",
+                "public-client",
+                "--oauth-callback-port",
+            ]))
+            .is_err()
+        );
         assert!(
             parse(argv(&[
                 "temote",
