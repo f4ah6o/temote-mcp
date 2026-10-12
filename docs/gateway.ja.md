@@ -242,6 +242,10 @@ gateway の rollback で無関係な route、DNS record、Access policy を削�
 
 supervisor を動かすマシンごとに named root を設定します。gateway に広告するのは root 名だけで、physical path は host 内に残ります。
 
+browser OAuthで接続する場合はstatic Host tokenとAccess service-tokenを設定せず、`temote fabric connect` を使います。callback は通常 IPv4 loopback の空きportを動的に選びます。事前登録済み redirect URI が必要なら `--oauth-callback-port 8400`（または `TEMOTE_FABRIC_OAUTH_CALLBACK_PORT=8400`）を指定し、`http://127.0.0.1:8400/callback` を登録します。指定portを bind できない場合は browser 起動前に失敗し、別portへ fallback しません。認可と token 交換には同じ redirect URI を使います。この option は browser の `connect` / `link` 用で、logout と static Host-token mode では使いません。
+
+次の例はstatic Host-token modeです。
+
 macOS 例:
 
 ```sh

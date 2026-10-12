@@ -199,6 +199,8 @@ temote fabric connect \
   --host-id mac-main
 ```
 
+The callback normally binds an available IPv4 loopback port dynamically. If the OAuth client requires a pre-registered redirect URI, pass `--oauth-callback-port 8400` (or set `TEMOTE_FABRIC_OAUTH_CALLBACK_PORT=8400`) and register `http://127.0.0.1:8400/callback`. The selected port must be available; a bind conflict stops before the browser opens, with no fallback port. The same redirect URI is used for authorization and token exchange. The option applies to browser `connect`/`link`; logout and static Host-token mode do not use it.
+
 The RFC 8707 resource defaults to the Fabric origin; set `--oauth-resource` only when the Access configuration requires another explicitly reviewed resource value. The CLI uses macOS Keychain or an available Linux Secret Service to persist one atomic credential record. Linux and Windows 11 under WSL2 require an already available Secret Service; other or unavailable secure stores fail closed. Browser mode uses the opaque OAuth bearer for Access and a separate Host-grant header for Worker authorization. It does not use the static host-token or Access Service Token variables below.
 
 Run `temote fabric logout` with the same gateway, issuer, client, and Host settings to revoke the remote Host grant before removing the secure credential record. If revocation cannot be confirmed, credentials stay stored so the operation can be retried. The browser enrollment grant expires after 90 days; reconnect verifies an existing saved profile and refreshes OAuth without another browser login when the grant remains valid. Reauthorization or root changes require explicit confirmation.
