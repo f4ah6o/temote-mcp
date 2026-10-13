@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -837,8 +837,13 @@ async fn run_host_agent(
                     .join(",")
             }
         );
+        let browser_binding = worker_auth.as_ref().map(|auth| BrowserConnectionBinding {
+            gateway_origin: gateway.base_url.clone(),
+            grant_id: auth.grant_id.clone(),
+            grant_generation: auth.grant_generation,
+        });
         let connection_record =
-            HostAgentConnectionRecordFile::create(&host_id, connection.generation);
+            HostAgentConnectionRecordFile::create(&host_id, connection.generation, browser_binding);
         if let Err(error) = &connection_record {
             if browser_mode {
                 eprintln!("{}", BrowserFailureDiagnostic::ConnectionRecord.message());
@@ -941,6 +946,32 @@ struct HostAgentConnectionRecord {
     host_id: String,
     generation: u64,
     updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser: Option<BrowserConnectionBinding>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BrowserConnectionBinding {
+    gateway_origin: String,
+    grant_id: String,
+    grant_generation: u64,
+}
+
+/// Public identities binding a transport generation to its browser enrollment.
+#[derive(Clone)]
+pub(crate) struct BrowserLinkReceipt {
+    pub generation: u64,
+    pub gateway_origin: String,
+    pub grant_id: String,
+    pub grant_generation: u64,
+}
+
+impl BrowserLinkReceipt {
+    pub(crate) fn matches(&self, record: &crate::fabric_browser::CredentialRecord) -> bool {
+        self.gateway_origin == record.gateway_origin
+            && self.grant_id == record.grant_id
+            && self.grant_generation == record.grant_generation
+    }
 }
 
 fn host_agent_record_directory() -> Result<PathBuf> {
@@ -961,11 +992,25 @@ struct HostAgentConnectionRecordFile {
 }
 
 impl HostAgentConnectionRecordFile {
-    fn create(host_id: &str, generation: u64) -> Result<Self> {
-        Self::create_in(&host_agent_record_directory()?, host_id, generation)
+    fn create(
+        host_id: &str,
+        generation: u64,
+        browser: Option<BrowserConnectionBinding>,
+    ) -> Result<Self> {
+        Self::create_in(
+            &host_agent_record_directory()?,
+            host_id,
+            generation,
+            browser,
+        )
     }
 
-    fn create_in(directory: &Path, host_id: &str, generation: u64) -> Result<Self> {
+    fn create_in(
+        directory: &Path,
+        host_id: &str,
+        generation: u64,
+        browser: Option<BrowserConnectionBinding>,
+    ) -> Result<Self> {
         let path = host_agent_record_path_in(directory, host_id)?;
         std::fs::create_dir_all(directory).with_context(|| {
             format!(
@@ -979,6 +1024,7 @@ impl HostAgentConnectionRecordFile {
             host_id: host_id.to_owned(),
             generation,
             updated_at: config::unix_time(),
+            browser,
         };
         let bytes = serde_json::to_vec(&record)?;
         anyhow::ensure!(
@@ -1028,6 +1074,28 @@ pub fn read_host_agent_generation(host_id: &str) -> Option<u64> {
 }
 
 fn read_host_agent_generation_in(directory: &Path, host_id: &str) -> Option<u64> {
+    Some(read_host_agent_record_in(directory, host_id)?.generation)
+}
+
+pub(crate) fn read_browser_host_agent_receipt(host_id: &str) -> Option<BrowserLinkReceipt> {
+    read_browser_host_agent_receipt_in(&host_agent_record_directory().ok()?, host_id)
+}
+
+fn read_browser_host_agent_receipt_in(
+    directory: &Path,
+    host_id: &str,
+) -> Option<BrowserLinkReceipt> {
+    let record = read_host_agent_record_in(directory, host_id)?;
+    let binding = record.browser?;
+    Some(BrowserLinkReceipt {
+        generation: record.generation,
+        gateway_origin: binding.gateway_origin,
+        grant_id: binding.grant_id,
+        grant_generation: binding.grant_generation,
+    })
+}
+
+fn read_host_agent_record_in(directory: &Path, host_id: &str) -> Option<HostAgentConnectionRecord> {
     let path = host_agent_record_path_in(directory, host_id).ok()?;
     let file = OpenOptions::new()
         .read(true)
@@ -1041,7 +1109,7 @@ fn read_host_agent_generation_in(directory: &Path, host_id: &str) -> Option<u64>
     if metadata.len() > MAX_HOST_AGENT_RECORD_BYTES as u64 {
         return None;
     }
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
         return None;
     }
     let mut bytes = Vec::new();
@@ -1059,7 +1127,7 @@ fn read_host_agent_generation_in(directory: &Path, host_id: &str) -> Option<u64>
     {
         return None;
     }
-    Some(record.generation)
+    Some(record)
 }
 
 async fn connect_legacy(
@@ -3051,7 +3119,8 @@ mod tests {
         let host_id = format!("record-{}", Uuid::new_v4().simple());
         assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
 
-        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 7).unwrap();
+        let record =
+            HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 7, None).unwrap();
         assert_eq!(
             read_host_agent_generation_in(state.path(), &host_id),
             Some(7)
@@ -3062,6 +3131,41 @@ mod tests {
         drop(record);
         assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn browser_connection_receipt_binds_transport_to_public_grant_identity() {
+        let state = tempfile::tempdir().unwrap();
+        let host_id = "browser-record";
+        let old = HostAgentConnectionRecordFile::create_in(state.path(), host_id, 7, None).unwrap();
+        assert!(read_browser_host_agent_receipt_in(state.path(), host_id).is_none());
+        drop(old);
+        let binding = BrowserConnectionBinding {
+            gateway_origin: "https://fabric.example".into(),
+            grant_id: "00000000-0000-4000-8000-000000000001".into(),
+            grant_generation: 3,
+        };
+        let file =
+            HostAgentConnectionRecordFile::create_in(state.path(), host_id, 8, Some(binding))
+                .unwrap();
+        let receipt = read_browser_host_agent_receipt_in(state.path(), host_id).unwrap();
+        assert_eq!(receipt.generation, 8);
+        assert_eq!(receipt.gateway_origin, "https://fabric.example");
+        assert_eq!(receipt.grant_id, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(receipt.grant_generation, 3);
+        assert_eq!(
+            read_host_agent_generation_in(state.path(), host_id),
+            Some(8)
+        );
+        let path = host_agent_record_path_in(state.path(), host_id).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["browser"].as_object().unwrap().len(), 3);
+        assert!(value["browser"].get("grant_secret").is_none());
+        assert!(value["browser"].get("oauth_access_token").is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_browser_host_agent_receipt_in(state.path(), host_id).is_none());
+        drop(file);
+        assert!(read_browser_host_agent_receipt_in(state.path(), host_id).is_none());
     }
 
     #[cfg(unix)]
@@ -3076,7 +3180,8 @@ mod tests {
 
         let state = tempfile::tempdir().unwrap();
         let host_id = format!("record-{}", Uuid::new_v4().simple());
-        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 3).unwrap();
+        let record =
+            HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 3, None).unwrap();
         let path = host_agent_record_path_in(state.path(), &host_id).unwrap();
 
         set_mode(&path, 0o644);

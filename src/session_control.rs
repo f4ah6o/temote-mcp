@@ -233,6 +233,8 @@ enum ControlRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum ReadOnlyDiagnosticRequest {
     Ping,
+    #[cfg(feature = "network")]
+    FabricInventory,
     List,
     Info {
         session_id: String,
@@ -682,6 +684,14 @@ impl SessionBackend {
 
 pub(crate) async fn read_only_local_status() -> Result<Value> {
     read_only_request(ReadOnlyDiagnosticRequest::Ping).await
+}
+
+#[cfg(feature = "network")]
+pub(crate) async fn read_only_fabric_inventory()
+-> Result<crate::fabric_browser::LocalSupervisorInventory> {
+    let value = read_only_request(ReadOnlyDiagnosticRequest::FabricInventory).await?;
+    serde_json::from_value(value)
+        .map_err(|_| anyhow::anyhow!("read-only Fabric inventory is unavailable"))
 }
 
 fn require_repository_clone_admission_capability(status: &Value) -> Result<()> {
@@ -1530,6 +1540,10 @@ async fn dispatch_read_only_diagnostic(
 ) -> Result<Value> {
     match request {
         ReadOnlyDiagnosticRequest::Ping => Ok(supervisor_status(supervisor)?),
+        #[cfg(feature = "network")]
+        ReadOnlyDiagnosticRequest::FabricInventory => {
+            Ok(serde_json::to_value(supervisor.fabric_inventory()?)?)
+        }
         ReadOnlyDiagnosticRequest::List => {
             Ok(serde_json::to_value(list_session_views(supervisor).await?)?)
         }
@@ -6224,6 +6238,8 @@ mod tests {
         assert!(supervisor.is_managed_for_test(&id).await);
 
         request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::Ping).await;
+        #[cfg(feature = "network")]
+        request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::FabricInventory).await;
         request_read_only_test(&supervisor, ReadOnlyDiagnosticRequest::List).await;
         request_read_only_test(
             &supervisor,

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added `temote fabric configure` and `check` for saved public browser connection settings and authentication-free preflight, plus browser-aware `status` with independent account, grant, Link and root identity diagnostics. ([Fabric CLI](docs/gateway.md#browser-enrolled-host))
+
 - Added `temote fabric connect --oauth-callback-port` for an exact IPv4 loopback OAuth callback port; the default remains dynamic and an occupied requested port fails before browser launch. ([Fabric browser enrollment](docs/designs/fabric-browser-enrollment.md))
 - Added `temote task start|list|get|control --local`, using the same typed task admission, session ownership, operation receipts and scoped evidence as MCP. Modern MCP calls and evidence reads route through the runtime-owning supervisor; a relay failure never falls back to a second owner. ([development workflow](docs/development-workstream-20261005.md))
 - Added managed repository-source sessions with durable provisioning receipts, a shared bare store and independent workspace metadata; jj remains the default and explicit Git compatibility does not grant writes to shared metadata. ([session-first provisioning](issues/open/20260929-session-first-managed-provisioning.md))
@@ -26,6 +28,8 @@
 - Added opt-in `opencode_status`, `opencode_task_start`, `opencode_task_get`, and `opencode_task_control` tools that drive a per-task `opencode serve` child over the `unofficial-opencode-sdk` client with the same ownership, lease, receipt, retention, and scoped-evidence contract as the Codex task tools. Each serve child runs on loopback with a dynamic port, an instance-scoped Basic-auth password, an isolated data directory, and a bounded permission configuration. ([server-primary agent backends](issues/open/20260922-agent-server-backends-cli-deprecation.md))
 
 ### Changed
+
+- Browser enrollment now uses explicit terminal selections for the verified account/Host and configured roots instead of typing Host IDs, root names or `yes`; pasted codes are discarded without echo and cancellation stops before new grant persistence. ([Fabric CLI](docs/gateway.md#browser-enrolled-host))
 
 - Fabric host links negotiate bounded concurrent RPC handling while preserving serial compatibility with older Workers; accepted RPCs survive reconnects, response uploads retry only the same envelope, and `temote fabric status` reports staged readiness with a failing exit status until the active lease, generation, and public session inventory are usable.
 - New normal sessions require a configured named root at every entry point, including local cwd starts. Legacy sessions retain their proven stored cwd on restart and upgrade; remapping a root cannot move an existing session. ([named roots](docs/managed-sessions.md))

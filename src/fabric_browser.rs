@@ -436,6 +436,10 @@ pub enum CredentialStatus {
 /// complete replacement atomic and read it back before reporting success.
 pub trait CredentialStore: Send + Sync {
     fn load(&self) -> Result<Option<CredentialRecord>>;
+    /// Status must never unlock a secure store or display an authentication UI.
+    fn load_for_status(&self) -> Result<Option<CredentialRecord>> {
+        anyhow::bail!("noninteractive credential lookup is unavailable")
+    }
     fn replace(&self, record: &CredentialRecord) -> Result<()>;
     fn delete(&self) -> Result<()>;
 }
@@ -447,6 +451,17 @@ pub struct OsCredentialStore {
 }
 
 impl OsCredentialStore {
+    pub(crate) fn open_profile_for_status(profile: &str) -> Result<Self> {
+        anyhow::ensure!(
+            profile.len() == 64 && profile.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "credential profile key is invalid"
+        );
+        Ok(Self {
+            profile: profile.to_owned(),
+            #[cfg(target_os = "linux")]
+            pointer_path: browser_state_path()?.join(format!("{profile}.pointer")),
+        })
+    }
     pub fn open_profile(profile: &str) -> Result<Self> {
         anyhow::ensure!(
             profile.len() == 64 && profile.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -474,6 +489,86 @@ impl CredentialStoreFactory for OsCredentialStoreFactory {
 }
 
 impl CredentialStore for OsCredentialStore {
+    fn load_for_status(&self) -> Result<Option<CredentialRecord>> {
+        #[cfg(target_os = "macos")]
+        {
+            use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
+            let results = ItemSearchOptions::new()
+                .class(ItemClass::generic_password())
+                .service(STORE_SERVICE)
+                .account(&self.profile)
+                .load_data(true)
+                .limit(Limit::Max(1))
+                .skip_authenticated_items(true)
+                .search();
+            let items = match results {
+                Ok(items) => items,
+                // A locked or inaccessible item can also be skipped. Do not
+                // describe this as proof that the user has never signed in.
+                Err(_) => {
+                    anyhow::bail!("saved browser credential is unavailable without interaction")
+                }
+            };
+            let Some(SearchResult::Data(bytes)) = items.into_iter().next() else {
+                anyhow::bail!("saved browser credential is unavailable without interaction");
+            };
+            anyhow::ensure!(
+                bytes.len() <= MAX_RECORD_BYTES,
+                "secure credential record is oversized"
+            );
+            let record: CredentialRecord =
+                parse_untrusted_json(&bytes, "secure credential record is malformed")?;
+            anyhow::ensure!(
+                record.schema_version == RECORD_VERSION,
+                "secure credential schema is unsupported"
+            );
+            Ok(Some(record))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(version) = read_pointer(&self.pointer_path)? else {
+                return Ok(None);
+            };
+            let output = Command::new("secret-tool")
+                .args([
+                    "search",
+                    "--all",
+                    "service",
+                    STORE_SERVICE,
+                    "profile",
+                    &secret_tool_profile_key(&self.profile, version),
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .context("noninteractive Secret Service search is unavailable")?;
+            anyhow::ensure!(
+                output.status.success() && output.stdout.len() <= MAX_RECORD_BYTES + 8192,
+                "saved browser credential is unavailable without interaction"
+            );
+            let text = std::str::from_utf8(&output.stdout)
+                .map_err(|_| anyhow::anyhow!("secure credential record is malformed"))?;
+            let mut secrets = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("secret = "));
+            let bytes = secrets
+                .next()
+                .context("saved browser credential is unavailable without interaction")?;
+            anyhow::ensure!(
+                secrets.next().is_none(),
+                "secure credential lookup is ambiguous"
+            );
+            let record: CredentialRecord =
+                parse_untrusted_json(bytes.as_bytes(), "secure credential record is malformed")?;
+            anyhow::ensure!(
+                record.schema_version == RECORD_VERSION,
+                "secure credential schema is unsupported"
+            );
+            Ok(Some(record))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        anyhow::bail!("noninteractive credential lookup is unavailable")
+    }
     fn load(&self) -> Result<Option<CredentialRecord>> {
         #[cfg(target_os = "macos")]
         let bytes =
@@ -706,6 +801,50 @@ struct TokenResponse {
 }
 
 impl BrowserOAuth {
+    pub(crate) async fn check_metadata(&self) -> Result<()> {
+        self.metadata().await.map(|_| ())
+    }
+
+    pub(crate) async fn link_generation(&self, record: &CredentialRecord) -> Result<Option<u64>> {
+        let url = Url::parse(&self.options.gateway_url)?.join("/v1/hosts/status")?;
+        validate_permitted_url(&url, &self.options.permitted_origins)?;
+        let host = url
+            .host_str()
+            .context("Fabric status endpoint has no host")?;
+        let addresses = resolve_public_addresses(
+            host,
+            url.port_or_known_default()
+                .context("Fabric status endpoint has no port")?,
+        )
+        .await?;
+        let response =
+            browser_link_status_request(&pinned_http_client(host, &addresses)?, url, record)
+                .send()
+                .await
+                .context("Fabric Link status request failed")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Fabric Link status could not be verified"
+        );
+        let body: Value = parse_untrusted_json(
+            &read_bounded_response(response).await?,
+            "Fabric Link status is malformed",
+        )?;
+        anyhow::ensure!(
+            body["status"] == "registered"
+                && body["host_id"] == record.host_id
+                && body["lease"] == "active",
+            "Fabric Link lease could not be verified"
+        );
+        let generation = body["generation"]
+            .as_u64()
+            .filter(|generation| *generation > 0)
+            .context("Fabric Link generation is unavailable")?;
+        Ok(Some(generation))
+    }
     pub fn new(options: BrowserConnectOptions) -> Result<Self> {
         validate_oauth_options(&options)?;
         Ok(Self { options })
@@ -835,6 +974,13 @@ impl BrowserOAuth {
     }
 
     pub async fn authorize(&self) -> Result<OAuthCredentials> {
+        use std::io::IsTerminal;
+        anyhow::ensure!(
+            std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal(),
+            "browser authentication requires an interactive terminal; run `temote fabric connect` there"
+        );
         with_callback_listener(self.options.oauth_callback_port, |listener| async move {
             let metadata = self.metadata().await?;
             let address = listener.local_addr()?;
@@ -850,11 +996,13 @@ impl BrowserOAuth {
                 &self.options.resource,
                 &state,
             );
+            eprintln!("[Browser login] Complete login, MFA and consent in your browser. The callback is received automatically; do not paste a code into this terminal. Ctrl-C cancels.");
             open_authorization_url(authorize.as_str())?;
             let code =
                 tokio::time::timeout(LOOPBACK_TIMEOUT, wait_for_loopback_code(listener, &state))
                     .await
                     .context("OAuth browser login timed out")??;
+            eprintln!("[Account verification] Browser callback received. Verifying the signed-in account.");
             let token_form = authorization_code_form(
                 &self.options.client_id,
                 &redirect_uri,
@@ -965,6 +1113,19 @@ impl BrowserOAuth {
             email: email.to_owned(),
         })
     }
+}
+
+fn browser_link_status_request(
+    client: &reqwest::Client,
+    endpoint: Url,
+    record: &CredentialRecord,
+) -> reqwest::RequestBuilder {
+    client
+        .post(endpoint)
+        .bearer_auth(&record.oauth_access_token)
+        .header("X-Temote-Host-Id", &record.host_id)
+        .header("X-Temote-Fabric-Host-Grant", &record.grant_secret)
+        .json(&json!({"host_id":record.host_id}))
 }
 
 pub struct OAuthCredentials {
@@ -1439,6 +1600,9 @@ where
             .collect::<Vec<_>>();
         let approved_roots = confirmation.approve_roots(&available)?;
         validate_approved_roots(&approved_roots, &available)?;
+        eprintln!(
+            "[Host registration] Account, Host and root scope confirmed. Registering the approved Host."
+        );
 
         // Browser interaction and terminal prompts run before the finite
         // transition lock. Recheck the atomic profile after acquiring it so a
@@ -1891,7 +2055,7 @@ fn validate_cancelled_pending(status: &EnrollmentStatus, record: &CredentialReco
     Ok(())
 }
 
-fn validate_remote_scope(
+pub(crate) fn validate_remote_scope(
     status: &EnrollmentStatus,
     record: &CredentialRecord,
     expected_status: &str,
@@ -1908,7 +2072,7 @@ fn validate_remote_scope(
     Ok(())
 }
 
-fn validate_verified_identity(identity: &VerifiedIdentity) -> Result<()> {
+pub(crate) fn validate_verified_identity(identity: &VerifiedIdentity) -> Result<()> {
     anyhow::ensure!(
         identity.owner_key.len() == 64
             && identity
@@ -1959,6 +2123,10 @@ impl EnrollmentConfirmation for TerminalEnrollmentConfirmation {
 }
 
 pub async fn run_connect(options: BrowserConnectOptions) -> Result<()> {
+    crate::fabric_cli::check_options(&options).await?;
+    eprintln!(
+        "[Preflight] Public settings, Supervisor, configured roots and callback port are ready."
+    );
     let backend = crate::session_control::SessionBackend::local_control().await?;
     let inventory = backend.fabric_inventory().await?;
     let protocol = BrowserOAuth::new(options.clone())?;
@@ -2542,13 +2710,7 @@ pub fn require_confirmed_identity(identity: &VerifiedIdentity, host_id: &str) ->
     let mut stderr = std::io::stderr();
     prompt.write_to(&mut stderr)?;
     stderr.flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    anyhow::ensure!(
-        answer.trim() == host_id,
-        "browser enrollment was not confirmed"
-    );
-    Ok(())
+    crate::fabric_prompt::confirm_host()
 }
 
 /// A prompt projection containing only validated display fields. Secret-bearing
@@ -2573,9 +2735,9 @@ impl OwnerConfirmationPrompt {
             "Cloudflare verified this account as: {}",
             self.email
         )?;
-        write!(
+        writeln!(
             writer,
-            "To claim Fabric Host {}, type its id: ",
+            "[Host approval] Approve the verified account for Fabric Host {} using the selection below.",
             self.host_id
         )?;
         Ok(())
@@ -2583,41 +2745,10 @@ impl OwnerConfirmationPrompt {
 }
 
 pub fn select_roots(available: &[String]) -> Result<Vec<String>> {
-    use std::io::{IsTerminal, Write as _};
-    anyhow::ensure!(
-        !available.is_empty(),
-        "the running Supervisor has no configured named roots; configure roots and restart Supervisor before reconnecting"
+    eprintln!(
+        "[Root approval] Select only the configured roots to expose, then choose Approve. No root is selected automatically."
     );
-    anyhow::ensure!(
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-        "browser enrollment requires an interactive terminal to approve named roots"
-    );
-    eprintln!("Configured named roots:");
-    for name in available {
-        eprintln!("  {name}");
-    }
-    eprint!("Enter root names to authorize, separated by commas: ");
-    std::io::stderr().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let selected = input
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    anyhow::ensure!(
-        !selected.is_empty() && selected.iter().all(|name| available.contains(name)),
-        "root selection must contain only configured root names"
-    );
-    let selected = selected.into_iter().collect::<Vec<_>>();
-    eprintln!("Fabric access will be limited to: {}", selected.join(", "));
-    eprint!("Approve this root scope? Type yes: ");
-    std::io::stderr().flush()?;
-    input.clear();
-    std::io::stdin().read_line(&mut input)?;
-    anyhow::ensure!(input.trim() == "yes", "root scope was not approved");
-    Ok(selected)
+    crate::fabric_prompt::select_roots(available)
 }
 
 pub fn validate_oauth_options(options: &BrowserConnectOptions) -> Result<()> {
@@ -2640,6 +2771,9 @@ pub fn validate_oauth_options(options: &BrowserConnectOptions) -> Result<()> {
     let issuer = Url::parse(&options.issuer).context("OAuth issuer pin is invalid")?;
     anyhow::ensure!(
         issuer.scheme() == "https"
+            && issuer.host_str().is_some()
+            && issuer.username().is_empty()
+            && issuer.password().is_none()
             && issuer.path() == "/"
             && issuer.query().is_none()
             && issuer.fragment().is_none(),
@@ -2665,6 +2799,9 @@ pub fn validate_oauth_options(options: &BrowserConnectOptions) -> Result<()> {
         let parsed = Url::parse(origin).context("permitted OAuth origin is invalid")?;
         anyhow::ensure!(
             parsed.scheme() == "https"
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
                 && parsed.path() == "/"
                 && parsed.query().is_none()
                 && parsed.fragment().is_none(),
@@ -2695,7 +2832,7 @@ where
     continuation(listener).await
 }
 
-async fn bind_callback_listener(port: Option<u16>) -> Result<tokio::net::TcpListener> {
+pub(crate) async fn bind_callback_listener(port: Option<u16>) -> Result<tokio::net::TcpListener> {
     anyhow::ensure!(
         port.is_none_or(|port| port > 0),
         "OAuth callback port must be from 1 to 65535"
@@ -3031,10 +3168,7 @@ pub fn unix_now() -> u64 {
 }
 
 fn state_directory() -> Result<PathBuf> {
-    let base = crate::platform_paths::state_dir()
-        .or_else(crate::platform_paths::data_local_dir)
-        .context("no private state directory is available")?;
-    let path = base.join("temote-mcp").join("fabric-browser");
+    let path = browser_state_path()?;
     std::fs::create_dir_all(&path).context("cannot create private browser-auth state directory")?;
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
@@ -3044,6 +3178,13 @@ fn state_directory() -> Result<PathBuf> {
         "browser-auth state directory must be a real directory"
     );
     Ok(path)
+}
+
+fn browser_state_path() -> Result<PathBuf> {
+    let base = crate::platform_paths::state_dir()
+        .or_else(crate::platform_paths::data_local_dir)
+        .context("no private state directory is available")?;
+    Ok(base.join("temote-mcp").join("fabric-browser"))
 }
 
 #[cfg(target_os = "linux")]
@@ -3609,6 +3750,7 @@ pub(crate) mod tests_support {
 
     #[derive(Default)]
     struct FakeWorkerState {
+        authorize_error: bool,
         status: Option<EnrollmentStatus>,
         revoked_operation: Option<String>,
         oauth_issuer: String,
@@ -3664,6 +3806,7 @@ pub(crate) mod tests_support {
             self.log.lock().unwrap().push("authorize");
             let mut state = self.inner.lock().unwrap();
             state.authorize_calls += 1;
+            anyhow::ensure!(!state.authorize_error, "browser authentication failed");
             let suffix = if state.authorize_calls == 1 {
                 "initial"
             } else {
@@ -4103,6 +4246,92 @@ pub(crate) mod tests_support {
         .unwrap();
         assert_eq!(prepared.record.status, CredentialStatus::Active);
         (temporary, store, log, protocol, confirmation)
+    }
+
+    #[tokio::test]
+    async fn browser_status_request_obeys_worker_host_authorization_contract() {
+        let (_temporary, store, _log, _protocol, _confirmation) = active_fake_profile().await;
+        let record = store.0.lock().unwrap().record.clone().unwrap();
+        let request = browser_link_status_request(
+            &reqwest::Client::new(),
+            Url::parse("https://fabric.example/v1/hosts/status").unwrap(),
+            &record,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.headers()["x-temote-host-id"], "host-a");
+        assert!(request.headers().contains_key("x-temote-fabric-host-grant"));
+        assert!(request.headers().contains_key("authorization"));
+        assert!(!request.headers().contains_key("cf-access-client-secret"));
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body, json!({"host_id":"host-a"}));
+    }
+    #[tokio::test]
+    async fn failed_browser_authorization_never_confirms_saves_or_registers() {
+        let temporary = fake_inventory();
+        let store = FakeStoreFactory::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let protocol = FakeProtocol::new(store.clone(), Arc::clone(&log));
+        protocol.inner.lock().unwrap().authorize_error = true;
+        let mut confirmation = FakeConfirmation {
+            log: Arc::clone(&log),
+            confirmed: 0,
+            approved: 0,
+        };
+        let result = prepare_browser_link(
+            &options(),
+            temporary.inventory.clone(),
+            &protocol,
+            &store,
+            &mut confirmation,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.0.lock().unwrap().record.is_none());
+        assert_eq!(confirmation.confirmed, 0);
+        assert_eq!(confirmation.approved, 0);
+        assert_eq!(protocol.inner.lock().unwrap().reserve_calls, 0);
+        assert_eq!(protocol.inner.lock().unwrap().activate_calls, 0);
+    }
+
+    struct CancelConfirmation(bool);
+    impl EnrollmentConfirmation for CancelConfirmation {
+        fn confirm_owner(&mut self, _: &VerifiedIdentity, _: &str) -> Result<()> {
+            if self.0 {
+                Ok(())
+            } else {
+                anyhow::bail!("Fabric approval cancelled")
+            }
+        }
+        fn approve_roots(&mut self, _: &[String]) -> Result<Vec<String>> {
+            anyhow::bail!("Fabric root approval cancelled")
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_selection_never_saves_or_reserves_a_grant() {
+        for cancel_at_roots in [false, true] {
+            let temporary = fake_inventory();
+            let store = FakeStoreFactory::default();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let protocol = FakeProtocol::new(store.clone(), Arc::clone(&log));
+            let mut confirmation = CancelConfirmation(cancel_at_roots);
+            assert!(
+                prepare_browser_link(
+                    &options(),
+                    temporary.inventory.clone(),
+                    &protocol,
+                    &store,
+                    &mut confirmation
+                )
+                .await
+                .is_err()
+            );
+            assert!(store.0.lock().unwrap().record.is_none());
+            assert_eq!(protocol.inner.lock().unwrap().reserve_calls, 0);
+            assert_eq!(protocol.inner.lock().unwrap().activate_calls, 0);
+        }
     }
 
     #[tokio::test]

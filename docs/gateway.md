@@ -184,20 +184,27 @@ Configure named roots on the machine running the supervisor. Only root names are
 
 ### Browser-enrolled Host
 
-The browser flow uses the running Supervisor's configured roots and never adds or remaps a root. Start the Supervisor with the intended named roots in one terminal, then run one `temote fabric connect` command in another. It opens the system browser, verifies the signed-in owner with the Worker, asks you to confirm the Host identity and selected root names, then starts the existing outbound HTTPS Link. If the current Supervisor cannot provide the private root inventory/admission protocol, connect fails closed and explains that the Supervisor must be upgraded and restarted; it does not stop or reconfigure it.
+The browser flow uses the running Supervisor's configured roots and never adds or remaps a root. Save the public connection settings once, then use the CLI directly:
 
 ```sh
-# Supervisor terminal. The paths remain local to this machine.
-export TEMOTE_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
-temote-mcp supervisor
-
-# Link terminal. These are public endpoint/client settings, not credentials.
-temote fabric connect \
+temote fabric configure \
   --gateway-url https://<gateway-host> \
   --oauth-issuer https://<configured-access-issuer> \
-  --oauth-client-id <public-client-id> \
-  --host-id mac-main
+  --oauth-client-id <registered-public-client-id> \
+  --oauth-callback-port 8400
+temote fabric check
+temote fabric connect
+# In a separate terminal:
+temote fabric status
 ```
+
+`configure` saves only public settings in the owner-only platform config directory, under `temote-mcp/fabric/public.json`. It never logs in, registers a client, changes Supervisor roots, or saves credentials. Explicit CLI options take precedence over canonical/legacy environment settings, which take precedence over the saved public profile. A saved profile selects browser mode; `connect --browser` explicitly selects it and ignores static credential environment variables. An explicit `--host-token` or `--static` retains the static Link workflow; `status --static` retains its diagnostics. `configure` with complete settings can replace malformed contents if the existing file metadata is safe.
+
+`check` reads restricted Supervisor diagnostics, validates the expected Host and configured root names, briefly binds and releases the callback port, and checks public OAuth discovery. It does not start authentication or read/write secure credentials. It does not prove filesystem root identity; the existing admission protocol verifies that identity during connect.
+
+`connect` opens the system browser and receives the callback automatically. Complete login, MFA and consent in the browser. Never copy an OAuth code into Terminal. The CLI displays the verified account and the Host obtained from the running Supervisor. Use arrow keys and Enter to choose **Approve** or **Cancel**; Cancel is initially selected. Then use arrows and Space to select the existing roots and choose **Approve selected root scope**. No root is selected automatically, and Host IDs, root names and `yes` are never typed. Escape, Ctrl-C or EOF cancels; pasted/text input is discarded without echo and requires a new selection. Only after both approvals does the CLI save the enrollment recovery record, reserve/activate the Host grant and start the outbound Link. Keep the connect terminal open.
+
+Browser `status` uses a noninteractive secure-store read and read-only account, enrollment and Link queries. It never logs in, refreshes credentials, alters grants, takes enrollment locks or reconnects. It separately reports authentication, enrollment, Link state and approved roots; an empty session inventory does not make an online Link offline. Full readiness also requires read-only root identity verification. On an older Supervisor, restricted Ping still permits account/grant/Link confirmation, while `root_identity` is `unverified` and `ready` remains false. Browser Link confirmation also requires a local connection receipt bound to the current gateway and grant ID/generation; an older receipt without that binding reports `generation_unverified` until a successful interactive reconnect. These commands never automatically upgrade or restart a Supervisor.
 
 The callback normally binds an available IPv4 loopback port dynamically. If the OAuth client requires a pre-registered redirect URI, pass `--oauth-callback-port 8400` (or set `TEMOTE_FABRIC_OAUTH_CALLBACK_PORT=8400`) and register `http://127.0.0.1:8400/callback`. The selected port must be available; a bind conflict stops before the browser opens, with no fallback port. The same redirect URI is used for authorization and token exchange. The option applies to browser `connect`/`link`; logout and static Host-token mode do not use it.
 
