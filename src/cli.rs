@@ -121,6 +121,18 @@ pub enum Command {
     #[cfg(feature = "network")]
     FabricStatus,
     #[cfg(feature = "network")]
+    FabricConfigure {
+        options: fabric_browser::BrowserConnectOptions,
+    },
+    #[cfg(feature = "network")]
+    FabricCheck {
+        options: fabric_browser::BrowserConnectOptions,
+    },
+    #[cfg(feature = "network")]
+    FabricBrowserStatus {
+        options: fabric_browser::BrowserConnectOptions,
+    },
+    #[cfg(feature = "network")]
     FabricConnect {
         options: fabric_browser::BrowserConnectOptions,
     },
@@ -554,11 +566,50 @@ where
 
 #[cfg(feature = "network")]
 fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    if noargs::cmd("configure")
+        .doc("Save public browser connection settings; never save credentials or start authentication")
+        .take(args).is_present()
+    {
+        let Command::FabricConnect { options } = parse_fabric_browser(args, false, false)? else { unreachable!() };
+        return Ok(Command::FabricConfigure { options });
+    }
+    if noargs::cmd("check")
+        .doc("Check public settings, the existing Supervisor, roots and callback port without authentication")
+        .take(args).is_present()
+    {
+        let Command::FabricConnect { options } = parse_fabric_browser(args, false, true)? else { unreachable!() };
+        return Ok(Command::FabricCheck { options });
+    }
     if noargs::cmd("status")
         .doc("Show bounded local Link and remote Fabric health")
         .take(args)
         .is_present()
     {
+        let browser = noargs::flag("browser")
+            .doc("Inspect saved browser credentials and the existing Link without login or refresh")
+            .take(args)
+            .is_present();
+        let static_mode = noargs::flag("static")
+            .doc("Use the existing static-token diagnostics")
+            .take(args)
+            .is_present();
+        if browser && static_mode {
+            return Err(noargs::Error::other(
+                args,
+                "choose either browser or static diagnostics",
+            ));
+        }
+        if static_mode {
+            return Ok(Command::FabricStatus);
+        }
+        let saved = saved_fabric_settings(args)?;
+        if browser || (!static_mode && saved.is_some()) {
+            let Command::FabricConnect { options } = parse_fabric_browser(args, false, true)?
+            else {
+                unreachable!()
+            };
+            return Ok(Command::FabricBrowserStatus { options });
+        }
         return Ok(Command::FabricStatus);
     }
     if noargs::cmd("connect")
@@ -573,7 +624,7 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         .take(args)
         .is_present()
     {
-        return parse_fabric_browser(args, true);
+        return parse_fabric_browser(args, true, true);
     }
     if noargs::cmd("link")
         .doc("Alias for connect: use a configured static Host token or browser enrollment")
@@ -606,30 +657,68 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
     }
     Err(noargs::Error::other(
         args,
-        "Fabric command is not specified (expected 'connect', 'link', 'status' or 'events-sender')",
+        "Fabric command is not specified (expected configure, check, connect, link, status, logout or events-sender)",
     ))
 }
 
 #[cfg(feature = "network")]
 fn parse_fabric_link(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
-    let host_token = string_opt_env(
+    let force_browser = noargs::flag("browser")
+        .doc("Use browser OAuth even when static-token environment settings exist")
+        .take(args)
+        .is_present();
+    let force_static = noargs::flag("static")
+        .doc("Use the existing static-token Link mode")
+        .take(args)
+        .is_present();
+    if force_browser && force_static {
+        return Err(noargs::Error::other(
+            args,
+            "choose either browser or static mode",
+        ));
+    }
+    let explicit_host_token = string_opt(
         args,
         "host-token",
-        Some("TEMOTE_MCP_GATEWAY_HOST_TOKEN"),
-        "Static Host token; when configured, connect/link use the existing static Link mode",
+        "Static Host token; never used in browser mode",
     )?;
+    let saved_browser =
+        !force_static && explicit_host_token.is_none() && saved_fabric_settings(args)?.is_some();
+    let host_token = explicit_host_token.or_else(|| {
+        if force_browser || saved_browser || args.metadata().help_mode {
+            None
+        } else {
+            temote_mcp::environment::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").ok()
+        }
+    });
     let access_client_id = string_opt_env(
         args,
         "access-client-id",
-        Some("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID"),
+        if force_browser || (saved_browser && host_token.is_none()) {
+            None
+        } else {
+            Some("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")
+        },
         "Optional Cloudflare Access service-token client ID",
     )?;
     let access_client_secret = string_opt_env(
         args,
         "access-client-secret",
-        Some("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET"),
+        if force_browser || (saved_browser && host_token.is_none()) {
+            None
+        } else {
+            Some("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET")
+        },
         "Optional Cloudflare Access service-token client secret",
     )?;
+    if force_browser
+        && (host_token.is_some() || access_client_id.is_some() || access_client_secret.is_some())
+    {
+        return Err(noargs::Error::other(
+            args,
+            "browser mode does not accept static credentials",
+        ));
+    }
     if let Some(host_token) = host_token {
         if host_token.trim().is_empty() {
             return Err(noargs::Error::other(
@@ -650,38 +739,82 @@ fn parse_fabric_link(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
             "Cloudflare Access service-token credentials require a static Host token",
         ));
     }
-    parse_fabric_browser(args, false)
+    if force_static {
+        return Err(noargs::Error::other(
+            args,
+            "static mode requires a configured Host token",
+        ));
+    }
+    parse_fabric_browser(args, false, true)
 }
 
 #[cfg(feature = "network")]
-fn parse_fabric_browser(args: &mut noargs::RawArgs, logout: bool) -> noargs::Result<Command> {
-    let gateway_url = required_string_opt(
+fn parse_fabric_browser(
+    args: &mut noargs::RawArgs,
+    logout: bool,
+    load_saved: bool,
+) -> noargs::Result<Command> {
+    let saved = if load_saved {
+        saved_fabric_settings(args)?
+    } else {
+        None
+    };
+    let saved = saved
+        .as_ref()
+        .map(crate::fabric_config::PublicSettings::options)
+        .transpose()
+        .map_err(|_| noargs::Error::other(args, "saved public Fabric settings are invalid"))?;
+    let gateway_url = string_opt_env(
         args,
         "gateway-url",
         Some("TEMOTE_MCP_GATEWAY_URL"),
         "Temote Fabric Worker HTTPS origin",
-        "https://fabric.example.com",
-    )?;
-    let issuer = required_string_opt(
+    )?
+    .or_else(|| saved.as_ref().map(|settings| settings.gateway_url.clone()))
+    .or_else(|| {
+        args.metadata()
+            .help_mode
+            .then(|| "https://fabric.example".to_owned())
+    })
+    .ok_or_else(|| {
+        noargs::Error::other(
+            args,
+            "gateway URL is required; run `temote fabric configure` or pass --gateway-url",
+        )
+    })?;
+    let issuer = string_opt_env(
         args,
         "oauth-issuer",
         Some("TEMOTE_MCP_FABRIC_OAUTH_ISSUER"),
         "Pinned Cloudflare Managed OAuth issuer origin",
-        "https://login.example.com",
-    )?;
-    let client_id = required_string_opt(
+    )?
+    .or_else(|| saved.as_ref().map(|settings| settings.issuer.clone()))
+    .or_else(|| {
+        args.metadata()
+            .help_mode
+            .then(|| "https://login.example".to_owned())
+    })
+    .ok_or_else(|| {
+        noargs::Error::other(
+            args,
+            "OAuth issuer is required; run `temote fabric configure` or pass --oauth-issuer",
+        )
+    })?;
+    let client_id = string_opt_env(
         args,
         "oauth-client-id",
         Some("TEMOTE_MCP_FABRIC_OAUTH_CLIENT_ID"),
         "Public OAuth client id registered for the Fabric resource",
-        "<client-id>",
-    )?;
+    )?.or_else(|| saved.as_ref().map(|settings| settings.client_id.clone()))
+        .or_else(|| args.metadata().help_mode.then(|| "public-client".to_owned()))
+        .ok_or_else(|| noargs::Error::other(args, "public OAuth client ID is required; run `temote fabric configure` or pass --oauth-client-id"))?;
     let host_id = string_opt_env(
         args,
         "host-id",
         Some("TEMOTE_MCP_GATEWAY_HOST_ID"),
         "Optional expected local Host identity; the running Supervisor remains authoritative",
-    )?;
+    )?
+    .or_else(|| saved.as_ref().and_then(|settings| settings.host_id.clone()));
     let oauth_callback_port = if logout {
         None
     } else {
@@ -698,6 +831,11 @@ fn parse_fabric_browser(args: &mut noargs::RawArgs, logout: bool) -> noargs::Res
                     .map_err(|message| noargs::Error::other(args, message))
             })
             .transpose()?
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .and_then(|settings| settings.oauth_callback_port)
+            })
     };
     let gateway_origin = url::Url::parse(&gateway_url)
         .map_err(|_| noargs::Error::other(args, "Fabric gateway URL is invalid"))?
@@ -713,20 +851,36 @@ fn parse_fabric_browser(args: &mut noargs::RawArgs, logout: bool) -> noargs::Res
         Some("TEMOTE_MCP_FABRIC_OAUTH_RESOURCE"),
         "RFC 8707 resource indicator (defaults to the configured Fabric origin)",
     )?
+    .or_else(|| saved.as_ref().map(|settings| settings.resource.clone()))
     .unwrap_or_else(|| gateway_origin.clone());
-    let options = fabric_browser::BrowserConnectOptions {
+    let mut options = fabric_browser::BrowserConnectOptions {
         gateway_url,
         host_id,
         issuer,
         client_id,
-        permitted_origins: vec![gateway_origin, issuer_origin],
+        permitted_origins: vec![gateway_origin.clone(), issuer_origin.clone()],
         resource,
         oauth_callback_port,
     };
+    fabric_browser::validate_oauth_options(&options).map_err(|_| noargs::Error::other(args, "public Fabric browser settings are invalid; use HTTPS origins without credentials or query data"))?;
+    options.gateway_url = gateway_origin;
+    options.issuer = issuer_origin;
     Ok(if logout {
         Command::FabricLogout { options }
     } else {
         Command::FabricConnect { options }
+    })
+}
+
+#[cfg(feature = "network")]
+fn saved_fabric_settings(
+    args: &noargs::RawArgs,
+) -> noargs::Result<Option<crate::fabric_config::PublicSettings>> {
+    if args.metadata().help_mode {
+        return Ok(None);
+    }
+    crate::fabric_config::load_default().map_err(|_| {
+        noargs::Error::other(args, "saved public Fabric settings cannot be read safely")
     })
 }
 
@@ -2093,6 +2247,73 @@ mod tests {
             parse(argv(&["temote", "fabric", "--help"])).unwrap(),
             ParseOutcome::Print(_)
         ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn fabric_onboarding_commands_and_help_do_not_start_authentication() {
+        for action in ["configure", "check", "connect", "status"] {
+            let mut args = vec!["temote", "fabric", action];
+            if matches!(action, "connect" | "status") {
+                args.push("--browser");
+            }
+            args.extend([
+                "--gateway-url",
+                "https://fabric.example",
+                "--oauth-issuer",
+                "https://login.example",
+                "--oauth-client-id",
+                "public-client",
+                "--oauth-callback-port",
+                "8400",
+            ]);
+            match command(&args) {
+                Command::FabricConfigure { options }
+                | Command::FabricCheck { options }
+                | Command::FabricConnect { options }
+                | Command::FabricBrowserStatus { options } => {
+                    assert_eq!(options.oauth_callback_port, Some(8400))
+                }
+                _ => panic!("wrong browser command"),
+            }
+            assert!(matches!(
+                parse(argv(&["temote", "fabric", action, "--help"])).unwrap(),
+                ParseOutcome::Print(_)
+            ));
+        }
+        assert!(matches!(
+            command(&["temote", "fabric", "status", "--static"]),
+            Command::FabricStatus
+        ));
+        assert!(
+            parse(argv(&[
+                "temote",
+                "fabric",
+                "connect",
+                "--static",
+                "--gateway-url",
+                "https://fabric.example",
+                "--oauth-issuer",
+                "https://login.example",
+                "--oauth-client-id",
+                "public-client"
+            ]))
+            .is_err()
+        );
+        let error = parse(argv(&[
+            "temote",
+            "fabric",
+            "configure",
+            "--gateway-url",
+            "https://fabric.example",
+            "--oauth-issuer",
+            "https://user:SECRET_SENTINEL@login.example/",
+            "--oauth-client-id",
+            "public-client",
+        ]))
+        .err()
+        .unwrap();
+        assert!(!error.contains("SECRET_SENTINEL"));
     }
 
     #[test]

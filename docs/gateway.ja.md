@@ -244,6 +244,16 @@ supervisor を動かすマシンごとに named root を設定します。gatewa
 
 browser OAuthで接続する場合はstatic Host tokenとAccess service-tokenを設定せず、`temote fabric connect` を使います。callback は通常 IPv4 loopback の空きportを動的に選びます。事前登録済み redirect URI が必要なら `--oauth-callback-port 8400`（または `TEMOTE_FABRIC_OAUTH_CALLBACK_PORT=8400`）を指定し、`http://127.0.0.1:8400/callback` を登録します。指定portを bind できない場合は browser 起動前に失敗し、別portへ fallback しません。認可と token 交換には同じ redirect URI を使います。この option は browser の `connect` / `link` 用で、logout と static Host-token mode では使いません。
 
+公開設定は `temote fabric configure --gateway-url <Fabric origin> --oauth-issuer <issuer origin> --oauth-client-id <登録済みpublic client ID> --oauth-callback-port 8400` で一度保存できます。続いて `temote fabric check` → `temote fabric connect`、別端末で `temote fabric status` を使います。保存先は platform config 配下の owner-only `temote-mcp/fabric/public.json` で、credential は含みません。CLI option → canonical/legacy environment → 保存済み公開設定の順に優先します。保存済み設定は browser mode を選び、`--browser` で明示もできます。静的接続を選ぶ場合は `connect --static` または明示的な `--host-token`、診断は `status --static` を使います。完全な設定を渡した `configure` は安全なファイル metadata の範囲で壊れた内容を修復できます。
+
+`check` は既存 Supervisor の read-only 診断、Host・設定済み root 名・callback port・公開 OAuth metadata を確認します。認証開始、credential 参照/変更、root追加や再起動は行いません。root の filesystem identity は connect の既存 admission protocol で検証します。
+
+callback は自動受信するため、コードを端末へ貼り付ける必要はありません。ブラウザで本人がログイン・MFA・同意した後、CLI に表示された account と既存 Host を確認し、矢印キーと Enter で Approve/Cancel を選びます。初期選択は Cancel です。root は矢印と Space で設定済みの項目だけを選択し、Approve selected root scope で承認します。root の初期選択は空で、Host ID・root 名・yes を文字入力させません。Escape/Ctrl-C/EOF は中断し、貼付け・文字入力は再表示せず破棄します。明示承認後だけ Host の reserve/activate と Link 接続へ進みます。接続端末は開いたままにします。
+
+browser の `status` は対話なしの credential 読み取りと、account・grant・Link の read-only 確認だけを行います。ログイン、refresh、grant変更、再接続、Supervisor再起動は行いません。authentication/enrollment/link と承認 root を分けて表示し、セッションが0件でも Link online を確認できます。古い Supervisor は restricted Ping により account/grant/Link を確認できますが、read-only root identity の検証ができない場合は `root_identity=unverified`、`ready=false` と表示します。
+
+Link の確認には、現在の gateway と grant ID・世代に結び付いたローカル接続記録も必要です。結び付けのない旧記録は、対話での再接続が成功するまで `link=generation_unverified` と表示します。
+
 次の例はstatic Host-token modeです。
 
 macOS 例:

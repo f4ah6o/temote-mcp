@@ -25,6 +25,12 @@ mod events_host;
 mod evidence;
 #[cfg(feature = "network")]
 mod fabric_browser;
+#[cfg(feature = "network")]
+mod fabric_cli;
+#[cfg(feature = "network")]
+mod fabric_config;
+#[cfg(feature = "network")]
+mod fabric_prompt;
 mod friction;
 #[cfg(feature = "network")]
 mod gateway;
@@ -361,6 +367,19 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "network")]
+        cli::Command::FabricConfigure { options } => {
+            let settings = fabric_config::PublicSettings::from_options(&options)?;
+            fabric_config::save(&fabric_config::default_path()?, &settings)?;
+            println!(
+                "Public Fabric settings saved. Run `temote fabric check`, then `temote fabric connect` in an interactive terminal."
+            );
+            Ok(())
+        }
+        #[cfg(feature = "network")]
+        cli::Command::FabricCheck { options } => fabric_cli::run_check(options).await,
+        #[cfg(feature = "network")]
+        cli::Command::FabricBrowserStatus { options } => fabric_cli::run_status(options).await,
         #[cfg(feature = "network")]
         cli::Command::FabricConnect { options } => fabric_browser::run_connect(options).await,
         #[cfg(feature = "network")]
