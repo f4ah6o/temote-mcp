@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added owner-managed browser `fabric connect --background`, local lifecycle status and `fabric disconnect`, with resume-only grants, no-interaction Keychain refresh, bounded startup/stop and scope-change halts. Older Supervisor readiness guidance and multi-machine enrollment instructions are included. ([Fabric CLI](docs/gateway.md#browser-enrolled-host))
+
 - Added `temote fabric configure` and `check` for saved public browser connection settings and authentication-free preflight, plus browser-aware `status` with independent account, grant, Link and root identity diagnostics. ([Fabric CLI](docs/gateway.md#browser-enrolled-host))
 
 - Added `temote fabric connect --oauth-callback-port` for an exact IPv4 loopback OAuth callback port; the default remains dynamic and an occupied requested port fails before browser launch. ([Fabric browser enrollment](docs/designs/fabric-browser-enrollment.md))

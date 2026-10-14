@@ -1573,6 +1573,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "core-foundation 0.10.1",
  "dotenvy",
  "http-body-util",
  "hyper",

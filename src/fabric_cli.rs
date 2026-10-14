@@ -248,6 +248,7 @@ pub(crate) async fn status_projection<P: StatusProtocol>(
 
 pub async fn run_status(options: BrowserConnectOptions) -> Result<()> {
     fabric_browser::validate_oauth_options(&options)?;
+    let background = crate::fabric_background::projection(&options).await;
     let (inventory, verify_local_identity) =
         match crate::session_control::read_only_fabric_inventory().await {
             Ok(inventory) => (inventory, true),
@@ -259,7 +260,7 @@ pub async fn run_status(options: BrowserConnectOptions) -> Result<()> {
                 Err(_) => {
                     println!(
                         "{}",
-                        json!({"mode":"browser","ready":false,"supervisor":"unavailable", "authentication":"not_checked", "link":"not_checked", "next":"Read-only Supervisor diagnostics are unavailable; status will not restart it."})
+                        json!({"mode":"browser","ready":false,"supervisor":"unavailable", "background":background, "authentication":"not_checked", "link":"not_checked", "next":"Read-only Supervisor diagnostics are unavailable; status will not restart it."})
                     );
                     anyhow::bail!("Fabric status is incomplete; review the diagnostics above");
                 }
@@ -275,7 +276,7 @@ pub async fn run_status(options: BrowserConnectOptions) -> Result<()> {
             &inventory.host_id,
         ))?;
     let protocol = BrowserOAuth::new(options.clone())?;
-    let result = status_projection(
+    let mut result = status_projection(
         &options,
         &inventory,
         &store,
@@ -284,6 +285,12 @@ pub async fn run_status(options: BrowserConnectOptions) -> Result<()> {
         verify_local_identity,
     )
     .await;
+    result["background"] = background;
+    if !verify_local_identity {
+        result["next"] = json!(
+            "Link connectivity is available, but read-only root identity needs a newer Supervisor. Review `temote upgrade --dry-run`, then upgrade/restart locally and reconnect."
+        );
+    }
     println!("{}", serde_json::to_string_pretty(&result)?);
     anyhow::ensure!(
         result["ready"] == true,
@@ -357,7 +364,7 @@ mod tests {
                 cancel_operation_id: None,
                 operation_id: None,
                 operation_generation: None,
-                expires_at: Some(record.grant_expires_at),
+                expires_at: Some(record.grant_expires_at + u64::from(self.fault == 10)),
                 pending_expires_at: None,
             }))
         }
@@ -410,6 +417,75 @@ mod tests {
         let record = serde_json::from_value(json!({"schema_version":1,"version":1,"gateway_origin":"https://fabric.example","issuer":"https://login.example","oauth_client_id":"public-client","oauth_authorization_endpoint":"https://login.example/authorize","oauth_token_endpoint":"https://login.example/token","owner_key":"a".repeat(64),"email":"owner@example.test","host_id":"host-a","grant_id":"00000000-0000-4000-8000-000000000001","grant_secret":"GRANT_SECRET_SENTINEL","grant_generation":7,"grant_expires_at":9999999999u64,"attempt_id":"attempt","reserve_operation_id":"reserve","expected_generation":6,"activation_operation_id":"activate","cancel_operation_id":null,"revoke_operation_id":null,"oauth_access_token":"oauth:ACCESS_SECRET_SENTINEL","oauth_refresh_token":"REFRESH_SECRET_SENTINEL","access_expires_at":9999999999u64,"refresh_in_flight":false,"refresh_attempt_id":null,"refresh_outcome_unknown":false,"refresh_commit_pending":false,"status":"active","supervisor_boot_generation":"original-boot","root_registry_fingerprint":registry,"root_fingerprints":fingerprints,"approved_roots":["src"],"local_hmac_key":key})).unwrap();
         (root, options, inventory, record)
     }
+    #[tokio::test]
+    async fn resume_only_checks_never_use_interactive_store_or_mutating_protocol() {
+        let (_root, options, inventory, record) = fixture();
+        let peer = Peer {
+            fault: 0,
+            calls: RefCell::new(vec![]),
+        };
+        let ready = fabric_browser::resume_browser_link(
+            &options,
+            &inventory,
+            &Store(Some(record.clone())),
+            &peer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ready.authority.supervisor_boot_generation,
+            inventory.boot_generation
+        );
+        assert_eq!(*peer.calls.borrow(), ["identity", "enrollment"]);
+        for fault in [1, 2, 3, 5, 8, 9, 10] {
+            let peer = Peer {
+                fault,
+                calls: RefCell::new(vec![]),
+            };
+            assert!(
+                fabric_browser::resume_browser_link(
+                    &options,
+                    &inventory,
+                    &Store(Some(record.clone())),
+                    &peer
+                )
+                .await
+                .is_err(),
+                "fault {fault}"
+            );
+        }
+        for fault in 0..12 {
+            let mut changed = record.clone();
+            let mut pinned = options.clone();
+            let mut local = inventory.clone();
+            match fault {
+                0 => changed.status = fabric_browser::CredentialStatus::Pending,
+                1 => changed.status = fabric_browser::CredentialStatus::Revoking,
+                2 => changed.grant_expires_at = 0,
+                3 => changed.access_expires_at = 0,
+                4 => changed.refresh_in_flight = true,
+                5 => changed.refresh_commit_pending = true,
+                6 => changed.refresh_outcome_unknown = true,
+                7 => pinned.client_id = "different-public-client".into(),
+                8 => pinned.issuer = "https://other.example".into(),
+                9 => local.roots[0].inode += 1,
+                10 => changed.root_registry_fingerprint = "changed".into(),
+                _ => pinned.host_id = Some("other-host".into()),
+            }
+            assert!(
+                fabric_browser::resume_browser_link(&pinned, &local, &Store(Some(changed)), &peer)
+                    .await
+                    .is_err(),
+                "fault {fault}"
+            );
+        }
+        assert!(
+            fabric_browser::resume_browser_link(&options, &inventory, &Store(None), &peer)
+                .await
+                .is_err()
+        );
+    }
+
     fn receipt(record: &CredentialRecord) -> crate::gateway::BrowserLinkReceipt {
         crate::gateway::BrowserLinkReceipt {
             generation: 8,

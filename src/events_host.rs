@@ -590,6 +590,7 @@ mod tests {
             access_client_secret: None,
             browser_auth: None,
             browser_auth_blocked: None,
+            managed: None,
         };
         deliver_pending_in(&store, &gateway, &host, "current-instance", 17)
             .await

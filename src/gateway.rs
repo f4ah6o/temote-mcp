@@ -201,6 +201,7 @@ pub(crate) struct GatewayClient {
     pub(crate) access_client_secret: Option<String>,
     pub(crate) browser_auth: Option<Arc<RwLock<BrowserWireAuth>>>,
     pub(crate) browser_auth_blocked: Option<Arc<AtomicBool>>,
+    pub(crate) managed: Option<Arc<crate::fabric_background::ManagedControl>>,
 }
 
 #[derive(Clone)]
@@ -373,7 +374,7 @@ struct HostResponseRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerationExit {
+pub(crate) enum GenerationExit {
     Replaced,
     Disconnected,
     SupervisorChanged,
@@ -409,6 +410,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
         access_client_secret: options.access_client_secret,
         browser_auth: None,
         browser_auth_blocked: None,
+        managed: None,
     };
     let reconnect_delay = if options.reconnect_delay.is_zero() {
         DEFAULT_RECONNECT_DELAY
@@ -455,6 +457,33 @@ pub(crate) async fn run_browser_link_with_lease(
     display_host_id: String,
     display_gateway_origin: String,
 ) -> Result<()> {
+    run_browser_link(
+        protocol,
+        prepared,
+        display_host_id,
+        display_gateway_origin,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_managed_browser_link(
+    protocol: crate::fabric_browser::BrowserOAuth,
+    prepared: crate::fabric_browser::PreparedBrowserLink,
+    control: Arc<crate::fabric_background::ManagedControl>,
+) -> Result<()> {
+    let host = prepared.record.host_id.clone();
+    let origin = prepared.record.gateway_origin.clone();
+    run_browser_link(protocol, prepared, host, origin, Some(control)).await
+}
+
+async fn run_browser_link(
+    protocol: crate::fabric_browser::BrowserOAuth,
+    prepared: crate::fabric_browser::PreparedBrowserLink,
+    display_host_id: String,
+    display_gateway_origin: String,
+    managed: Option<Arc<crate::fabric_background::ManagedControl>>,
+) -> Result<()> {
     prepared
         .record
         .validate_for_link(&prepared.record.gateway_origin)?;
@@ -492,17 +521,30 @@ pub(crate) async fn run_browser_link_with_lease(
         access_client_secret: None,
         browser_auth: Some(browser_auth.clone()),
         browser_auth_blocked: Some(blocked.clone()),
+        managed: managed.clone(),
     };
-    let refresh_task = tokio::spawn(run_browser_refresh_manager(
-        protocol,
-        prepared.profile.clone(),
-        prepared.record.owner_key.clone(),
-        prepared.record.host_id.clone(),
-        prepared.record.grant_id.clone(),
-        prepared.authority.grant_generation,
-        browser_auth,
-        blocked,
-    ));
+    let refresh_task = if let Some(control) = managed {
+        tokio::spawn(run_managed_refresh_manager(
+            protocol,
+            prepared.record.clone(),
+            prepared.authority.clone(),
+            prepared.profile.clone(),
+            browser_auth,
+            blocked,
+            control,
+        ))
+    } else {
+        tokio::spawn(run_browser_refresh_manager(
+            protocol,
+            prepared.profile.clone(),
+            prepared.record.owner_key.clone(),
+            prepared.record.host_id.clone(),
+            prepared.record.grant_id.clone(),
+            prepared.authority.grant_generation,
+            browser_auth,
+            blocked,
+        ))
+    };
     let result = run_host_agent(
         &gateway,
         &prepared.record.host_id,
@@ -519,6 +561,136 @@ pub(crate) async fn run_browser_link_with_lease(
     refresh_task.abort();
     let _ = refresh_task.await;
     result
+}
+
+// Detached refresh has a periodic scope guard even while the access token is
+// fresh. Every write uses the closed no-UI store and lock acquisition is bounded.
+#[allow(clippy::too_many_arguments)]
+async fn run_managed_refresh_manager(
+    protocol: crate::fabric_browser::BrowserOAuth,
+    initial: crate::fabric_browser::CredentialRecord,
+    authority: crate::fabric_browser::FabricAuthority,
+    profile: String,
+    browser_auth: Arc<RwLock<BrowserWireAuth>>,
+    blocked: Arc<AtomicBool>,
+    control: Arc<crate::fabric_background::ManagedControl>,
+) {
+    #[cfg(unix)]
+    let mut outage_since = None;
+    #[cfg(unix)]
+    loop {
+        tokio::select! { _ = control.shutdown() => return, _ = tokio::time::sleep(Duration::from_secs(15)) => {} }
+        control.pause_verification();
+        let mut rotation_attempted = false;
+        let check = async {
+            use crate::fabric_browser::CredentialStore;
+            let _transition = crate::fabric_browser::ProfileLock::try_transition(&profile)?;
+            let store = crate::fabric_browser::NoninteractiveStore(
+                crate::fabric_browser::OsCredentialStore::open_profile_for_status(&profile)?,
+            );
+            let mut record = store
+                .load_for_status()?
+                .context("background credential unavailable")?;
+            record.validate_for_link(&initial.gateway_origin)?;
+            anyhow::ensure!(
+                record.owner_key == initial.owner_key
+                    && record.host_id == initial.host_id
+                    && record.grant_id == initial.grant_id
+                    && record.grant_generation == initial.grant_generation
+                    && record.issuer == initial.issuer
+                    && record.oauth_client_id == initial.oauth_client_id
+                    && record.grant_expires_at == initial.grant_expires_at,
+                "background grant changed"
+            );
+            let inventory = crate::session_control::read_only_fabric_inventory().await?;
+            anyhow::ensure!(
+                inventory.boot_generation == authority.supervisor_boot_generation,
+                "background Supervisor epoch changed"
+            );
+            let snapshot = crate::fabric_browser::WorkerAuthSnapshot {
+                mode: "browser".into(),
+                owner_key: initial.owner_key.clone(),
+                grant_id: initial.grant_id.clone(),
+                grant_generation: initial.grant_generation,
+                approved_roots: initial.approved_roots.clone(),
+            };
+            let current =
+                crate::fabric_browser::make_fabric_authority(&record, &snapshot, &inventory)?;
+            anyhow::ensure!(
+                current.local_hmac_key == authority.local_hmac_key
+                    && current.root_registry_fingerprint == authority.root_registry_fingerprint
+                    && current.root_fingerprints == authority.root_fingerprints,
+                "background root authority changed"
+            );
+            // Verify remote scope before attempting any rotation. A temporary
+            // read outage cannot start an uncertain refresh transaction.
+            crate::fabric_browser::resume_browser_link(
+                &protocol.options,
+                &inventory,
+                &store,
+                &protocol,
+            )
+            .await?;
+            if record.access_expires_at <= crate::fabric_browser::unix_now().saturating_add(90) {
+                rotation_attempted = true;
+                crate::fabric_browser::refresh_record_for_link(&mut record, &store, &protocol)
+                    .await?;
+            }
+            crate::fabric_browser::resume_browser_link(
+                &protocol.options,
+                &inventory,
+                &store,
+                &protocol,
+            )
+            .await?;
+            let mut auth = browser_auth
+                .write()
+                .map_err(|_| anyhow::anyhow!("background auth unavailable"))?;
+            auth.access_token = record.oauth_access_token;
+            auth.host_grant = record.grant_secret;
+            auth.access_expires_at = record.access_expires_at;
+            Ok::<_, anyhow::Error>(())
+        };
+        let result = tokio::select! { _ = control.shutdown() => return, result = check => result };
+        match result {
+            Ok(()) => {
+                outage_since = None;
+                control.resume_verification();
+            }
+            Err(error)
+                if crate::fabric_background::retry_guard_read(
+                    &error,
+                    rotation_attempted,
+                    crate::fabric_browser::unix_now(),
+                    &mut outage_since,
+                ) =>
+            {
+                control.pause_verification()
+            }
+            Err(error) => {
+                blocked.store(true, Ordering::SeqCst);
+                let reason = if error.downcast_ref::<crate::fabric_browser::BrowserReadFailure>()
+                    == Some(&crate::fabric_browser::BrowserReadFailure::Authentication)
+                {
+                    crate::fabric_background::StopReason::AuthenticationRejected
+                } else {
+                    crate::fabric_background::StopReason::RecoveryRequired
+                };
+                control.stop(reason);
+                return;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (
+        protocol,
+        initial,
+        authority,
+        profile,
+        browser_auth,
+        blocked,
+        control,
+    );
 }
 
 // Keep each refresh authority and lifecycle signal explicit in this security boundary.
@@ -751,7 +923,7 @@ async fn run_host_agent(
             .unwrap_or(&gateway.base_url),
     );
 
-    let ctrl_c = tokio::signal::ctrl_c();
+    let ctrl_c = gateway.stop_signal();
     tokio::pin!(ctrl_c);
     let mut requests = GatewayRequests::new();
     loop {
@@ -808,6 +980,12 @@ async fn run_host_agent(
         let connection = match connected {
             Ok(connection) => connection,
             Err(error) => {
+                if let Some(control) = &gateway.managed
+                    && error.downcast_ref::<AuthenticationRejected>().is_some()
+                {
+                    control.stop(crate::fabric_background::StopReason::AuthenticationRejected);
+                    return Err(error);
+                }
                 if browser_mode {
                     eprintln!("{}", BrowserFailureDiagnostic::Connect.message());
                 } else {
@@ -851,7 +1029,31 @@ async fn run_host_agent(
                 eprintln!("gateway agent connection record unavailable: {error:#}");
             }
         }
+        if gateway.managed.is_some() && connection_record.is_err() {
+            disconnect_host(
+                gateway,
+                &host_id,
+                instance_id,
+                connection.generation,
+                worker_auth.as_ref(),
+            )
+            .await;
+            anyhow::bail!("managed connection receipt unavailable");
+        }
         let _connection_record = connection_record.ok();
+        if let Some(control) = &gateway.managed
+            && control.connected(connection.generation).await.is_err()
+        {
+            disconnect_host(
+                gateway,
+                &host_id,
+                instance_id,
+                connection.generation,
+                worker_auth.as_ref(),
+            )
+            .await;
+            return Ok(());
+        }
 
         let outcome = tokio::select! {
             result = run_host_generation(
@@ -885,6 +1087,17 @@ async fn run_host_agent(
             }
         };
 
+        if let Some(control) = &gateway.managed {
+            match &outcome {
+                Err(error) if error.downcast_ref::<AuthenticationRejected>().is_some() => {
+                    control.stop(crate::fabric_background::StopReason::AuthenticationRejected)
+                }
+                Ok(GenerationExit::Replaced | GenerationExit::SupervisorChanged) => {
+                    control.stop(crate::fabric_background::StopReason::ScopeChanged)
+                }
+                _ => control.reconnecting(),
+            }
+        }
         log_generation_outcome(outcome, connection.generation, browser_mode);
         if gateway
             .browser_auth_blocked
@@ -1404,6 +1617,7 @@ fn completed_request(
             );
             Ok(None)
         }
+        Err(error) if error.downcast_ref::<AuthenticationRejected>().is_some() => Err(error),
         Err(error) if gateway_transport_error(&error) => {
             // Delivery uncertainty says nothing about execution. Keep the
             // generation connected and let the caller reconcile the operation.
@@ -1424,6 +1638,27 @@ fn completed_request(
             ))
         }
     }
+}
+
+/// Recheck immediately after asynchronous Supervisor verification and before
+/// local dispatch, since background scope may pause while that RPC is pending.
+pub(crate) async fn verify_managed_admission<F>(
+    control: Option<&crate::fabric_background::ManagedControl>,
+    verification: F,
+) -> Result<Option<GenerationExit>>
+where
+    F: std::future::Future<Output = Result<Option<GenerationExit>>>,
+{
+    if let Some(control) = control {
+        control.admission_verified().await?;
+    }
+    let result = verification.await?;
+    if result.is_none()
+        && let Some(control) = control
+    {
+        control.admission_verified().await?;
+    }
+    Ok(result)
 }
 
 impl AgentGeneration {
@@ -1478,6 +1713,9 @@ impl AgentGeneration {
     }
 
     async fn poll(&self, accept_requests: bool) -> Result<PollOutcome> {
+        if let Some(control) = &self.gateway.managed {
+            control.admission_verified().await?;
+        }
         if self
             .gateway
             .browser_auth_blocked
@@ -1570,7 +1808,9 @@ impl AgentGeneration {
     async fn dispatch(&self, envelope: PollEnvelope) -> Result<Option<GenerationExit>> {
         // Revalidate after the long poll and immediately before local admission.
         // Session ownership and full-instance fencing remain in public dispatch.
-        if let Some(exit) = self.verify().await? {
+        if let Some(exit) =
+            verify_managed_admission(self.gateway.managed.as_deref(), self.verify()).await?
+        {
             return Ok(Some(exit));
         }
         if !self.admission.load(Ordering::SeqCst) {
@@ -2084,6 +2324,15 @@ fn status_named_roots(status: &Value) -> Result<Vec<String>> {
 }
 
 impl GatewayClient {
+    async fn stop_signal(&self) -> std::io::Result<()> {
+        if let Some(control) = &self.managed {
+            control.shutdown().await;
+            Ok(())
+        } else {
+            tokio::signal::ctrl_c().await
+        }
+    }
+
     pub(crate) fn request(
         &self,
         method: Method,
@@ -2171,11 +2420,30 @@ impl GatewayClient {
     }
 }
 
+#[derive(Debug)]
+struct AuthenticationRejected {
+    operation: String,
+    status: StatusCode,
+}
+impl std::fmt::Display for AuthenticationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&gateway_failure_message(&self.operation, self.status))
+    }
+}
+impl std::error::Error for AuthenticationRejected {}
+
 async fn require_success(response: Response, operation: &str) -> Result<Response> {
     if response.status().is_success() {
         return Ok(response);
     }
     let status = response.status();
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(AuthenticationRejected {
+            operation: operation.to_owned(),
+            status,
+        }
+        .into());
+    }
     anyhow::bail!("{}", gateway_failure_message(operation, status))
 }
 
@@ -2332,6 +2600,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn response_upload_auth_rejection_reaches_the_managed_generation() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let response: Response = axum::http::Response::builder()
+                .status(status)
+                .body("TOKEN_SECRET_SENTINEL")
+                .unwrap()
+                .into();
+            let outcome = require_success(response, "gateway response upload")
+                .await
+                .map(|_| None);
+            let completed = Some(Ok((17, outcome)));
+            let error = completed_request(completed, 17).unwrap_err();
+            assert!(error.downcast_ref::<AuthenticationRejected>().is_some());
+            assert!(!error.to_string().contains("TOKEN_SECRET_SENTINEL"));
+        }
+    }
+
     #[test]
     fn browser_failure_categories_cannot_format_secret_sentinels() {
         let fake_anyhow_error = anyhow::anyhow!(
@@ -2374,6 +2660,7 @@ mod tests {
                 access_expires_at: 1,
             }))),
             browser_auth_blocked: Some(Arc::new(AtomicBool::new(false))),
+            managed: None,
         };
         let request = gateway
             .request(Method::POST, "/v1/hosts/poll", Some("host-a"))
@@ -2814,6 +3101,7 @@ mod tests {
                 access_client_secret: None,
                 browser_auth: None,
                 browser_auth_blocked: None,
+                managed: None,
             },
             route: AgentRoute::Legacy {
                 session_id: "upload-fixture".to_owned(),
