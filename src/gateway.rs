@@ -471,10 +471,17 @@ pub(crate) async fn run_managed_browser_link(
     protocol: crate::fabric_browser::BrowserOAuth,
     prepared: crate::fabric_browser::PreparedBrowserLink,
     control: Arc<crate::fabric_background::ManagedControl>,
+    display_host_id: String,
+    display_gateway_origin: String,
 ) -> Result<()> {
-    let host = prepared.record.host_id.clone();
-    let origin = prepared.record.gateway_origin.clone();
-    run_browser_link(protocol, prepared, host, origin, Some(control)).await
+    run_browser_link(
+        protocol,
+        prepared,
+        display_host_id,
+        display_gateway_origin,
+        Some(control),
+    )
+    .await
 }
 
 async fn run_browser_link(

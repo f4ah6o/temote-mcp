@@ -628,6 +628,7 @@ mod process {
         let origin = url::Url::parse(&options.gateway_url)?
             .origin()
             .ascii_serialization();
+        let display_host_id = crate::host_identity::validate(&inventory.host_id)?;
         let profile = fabric_browser::profile_key(&origin, "", &inventory.host_id);
         let mut lease = ProfileLock::link_lifetime(&profile)?;
         let protocol = fabric_browser::BrowserOAuth::new(options.clone())?;
@@ -701,11 +702,7 @@ mod process {
         }
         println!(
             "Background Link ready for Host {}. Use `temote fabric status` or `temote fabric disconnect`.",
-            startup
-                .options
-                .host_id
-                .as_deref()
-                .unwrap_or(&prepared.authority.host_id)
+            display_host_id
         );
         Ok(())
     }
@@ -747,6 +744,12 @@ mod process {
             &startup.profile,
         )?);
         let inventory = crate::session_control::read_only_fabric_inventory().await?;
+        // Display identity comes only from public inventory/settings. Keep it
+        // independent of the secret-bearing saved credential record.
+        let display_host_id = crate::host_identity::validate(&inventory.host_id)?;
+        let display_gateway_origin = url::Url::parse(&startup.options.gateway_url)?
+            .origin()
+            .ascii_serialization();
         let prepared =
             fabric_browser::resume_browser_link(&startup.options, &inventory, &store, &protocol)
                 .await?;
@@ -760,16 +763,22 @@ mod process {
             profile: startup.profile.clone(),
             instance: startup.instance.clone(),
             pid: std::process::id(),
-            gateway_origin: prepared.record.gateway_origin.clone(),
+            gateway_origin: display_gateway_origin.clone(),
             issuer: startup.options.issuer.clone(),
             client_id: startup.options.client_id.clone(),
-            host_id: prepared.record.host_id.clone(),
+            host_id: display_host_id.clone(),
             approved_roots: prepared.record.approved_roots.clone(),
             phase: Phase::Starting,
             reason: None,
             generation: None,
         });
-        let link = crate::gateway::run_managed_browser_link(protocol, prepared, control.clone());
+        let link = crate::gateway::run_managed_browser_link(
+            protocol,
+            prepared,
+            control.clone(),
+            display_host_id,
+            display_gateway_origin,
+        );
         run_instance(startup, lease, channel, control, link).await
     }
 
