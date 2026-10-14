@@ -24,6 +24,8 @@ mod environment_prepare_cli;
 mod events_host;
 mod evidence;
 #[cfg(feature = "network")]
+mod fabric_background;
+#[cfg(feature = "network")]
 mod fabric_browser;
 #[cfg(feature = "network")]
 mod fabric_cli;
@@ -109,6 +111,14 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    #[cfg(feature = "network")]
+    if let Some(cli::Command::FabricBackgroundChild {
+        channel_fd,
+        lease_fd,
+    }) = cli.command.as_ref()
+    {
+        return fabric_background::run_child(*channel_fd, *lease_fd).await;
+    }
     if let Some(cli::Command::UpgradeCoordinator {
         installed_locator, ..
     }) = cli.command.as_ref()
@@ -381,7 +391,24 @@ async fn main() -> Result<()> {
         #[cfg(feature = "network")]
         cli::Command::FabricBrowserStatus { options } => fabric_cli::run_status(options).await,
         #[cfg(feature = "network")]
-        cli::Command::FabricConnect { options } => fabric_browser::run_connect(options).await,
+        cli::Command::FabricConnect {
+            options,
+            background,
+        } => {
+            if background {
+                fabric_background::run_start(options).await
+            } else {
+                fabric_browser::run_connect(options).await
+            }
+        }
+        #[cfg(feature = "network")]
+        cli::Command::FabricDisconnect { options } => {
+            fabric_background::run_disconnect(options).await
+        }
+        #[cfg(feature = "network")]
+        cli::Command::FabricBackgroundChild { .. } => {
+            unreachable!("handled before runtime initialization")
+        }
         #[cfg(feature = "network")]
         cli::Command::FabricLogout { options } => fabric_browser::run_logout(options).await,
         #[cfg(feature = "network")]

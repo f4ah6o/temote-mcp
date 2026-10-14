@@ -535,7 +535,7 @@ mod tests {
         .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let mut server = tokio::spawn(async move {
             for accepted in [false, true] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
@@ -570,7 +570,7 @@ mod tests {
                                 b"{\"accepted\":false}".as_slice()
                             };
                             let header = format!(
-                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n",
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
                                 payload.len()
                             );
                             socket.write_all(header.as_bytes()).await.unwrap();
@@ -590,6 +590,7 @@ mod tests {
             access_client_secret: None,
             browser_auth: None,
             browser_auth_blocked: None,
+            managed: None,
         };
         deliver_pending_in(&store, &gateway, &host, "current-instance", 17)
             .await
@@ -603,7 +604,14 @@ mod tests {
         deliver_pending_in(&store, &gateway, &host, "current-instance", 17)
             .await
             .unwrap();
-        server.await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(15), &mut server).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("event fixture did not receive both transition requests within 15 seconds");
+            }
+        }
         assert!(
             pending_paths(&store.host_dir(&host).unwrap())
                 .unwrap()

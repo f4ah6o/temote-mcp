@@ -248,11 +248,19 @@ browser OAuthで接続する場合はstatic Host tokenとAccess service-tokenを
 
 `check` は既存 Supervisor の read-only 診断、Host・設定済み root 名・callback port・公開 OAuth metadata を確認します。認証開始、credential 参照/変更、root追加や再起動は行いません。root の filesystem identity は connect の既存 admission protocol で検証します。
 
-callback は自動受信するため、コードを端末へ貼り付ける必要はありません。ブラウザで本人がログイン・MFA・同意した後、CLI に表示された account と既存 Host を確認し、矢印キーと Enter で Approve/Cancel を選びます。初期選択は Cancel です。root は矢印と Space で設定済みの項目だけを選択し、Approve selected root scope で承認します。root の初期選択は空で、Host ID・root 名・yes を文字入力させません。Escape/Ctrl-C/EOF は中断し、貼付け・文字入力は再表示せず破棄します。明示承認後だけ Host の reserve/activate と Link 接続へ進みます。接続端末は開いたままにします。
+callback は自動受信するため、コードを端末へ貼り付ける必要はありません。ブラウザで本人がログイン・MFA・同意した後、CLI に表示された account と既存 Host を確認し、矢印キーと Enter で Approve/Cancel を選びます。初期選択は Cancel です。root は矢印と Space で設定済みの項目だけを選択し、Approve selected root scope で承認します。root の初期選択は空で、Host ID・root 名・yes を文字入力させません。Escape/Ctrl-C/EOF は中断し、貼付け・文字入力は再表示せず破棄します。明示承認後だけ Host の reserve/activate と Link 接続へ進みます。foreground 接続では端末を開いたままにします。端末を閉じたい場合は以下の background を使います。
 
 browser の `status` は対話なしの credential 読み取りと、account・grant・Link の read-only 確認だけを行います。ログイン、refresh、grant変更、再接続、Supervisor再起動は行いません。authentication/enrollment/link と承認 root を分けて表示し、セッションが0件でも Link online を確認できます。古い Supervisor は restricted Ping により account/grant/Link を確認できますが、read-only root identity の検証ができない場合は `root_identity=unverified`、`ready=false` と表示します。
 
 Link の確認には、現在の gateway と grant ID・世代に結び付いたローカル接続記録も必要です。結び付けのない旧記録は、対話での再接続が成功するまで `link=generation_unverified` と表示します。
+
+Terminal を閉じても Link を維持するには `temote fabric connect --background` を実行します。初回のブラウザ認証と account/root 承認はこの端末で行い、子プロセスが保存済み grant・現在の root identity・最初の接続を検証した後にコマンドが戻ります。`temote fabric status` の `background` で状態を確認し、`temote fabric disconnect` でこの managed Link を止めます。停止応答の `stopping` と停止完了を区別します。Supervisor・session・保存済み grant は保持します。foreground/background は同じ profile lock を使うため、切り替える前に foreground Link を Ctrl-C で終了してください。static token の background は未対応です。
+
+子プロセスはログインや承認画面を開きません。grant・owner・root identity・Supervisor epoch の変更や、認証/refresh の検証失敗で停止します。一時的な検証 read の通信障害は新規受付を止め、同じ grant で60秒まで再検証します。認証拒否と結果不明の refresh は即時停止します。macOS の refresh は既存 Keychain item のみを UI 禁止で更新し、read-back を確認します。Linux では安全な非対話更新が使えない場合、refresh 前に停止するため foreground `connect` で復旧してください。launchd/systemd 登録やログイン時の自動起動は設定しません。[lifecycle 設計](designs/fabric-background-link.md)も参照してください。
+
+古い Supervisor では Link が online でも `root_identity: unverified`、`ready: false` になります。通信は確認できていますが、完全な準備状態には新しい Supervisor の root identity 診断が必要です。`temote upgrade --dry-run` で確認し、本人が upgrade/restart 後に再接続してください。background は新しい read-only root inventory を必須とし、未対応ならログイン前に止まります。
+
+複数マシンでは Fabric URL・issuer・登録済み public client を共通にできます。各マシンは実際に異なる Host ID の Supervisor とローカル named root を用意し、public settings 保存・ログイン・各 Host/root の承認を個別に行います。`--host-id` は既存 Supervisor の期待値を固定する指定で、Host を改名しません。`fabric check` に表示される Host を確認してください。同じ Host ID を複数マシンで使うと generation が置き換わります。`host_list` で各 Host を確認した後、client で明示的な `host_id` を選択します。固定 callback port は別マシン間で共通にできます。
 
 次の例はstatic Host-token modeです。
 

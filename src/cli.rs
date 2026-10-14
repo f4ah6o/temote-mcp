@@ -135,6 +135,16 @@ pub enum Command {
     #[cfg(feature = "network")]
     FabricConnect {
         options: fabric_browser::BrowserConnectOptions,
+        background: bool,
+    },
+    #[cfg(feature = "network")]
+    FabricDisconnect {
+        options: fabric_browser::BrowserConnectOptions,
+    },
+    #[cfg(feature = "network")]
+    FabricBackgroundChild {
+        channel_fd: i32,
+        lease_fd: i32,
     },
     #[cfg(feature = "network")]
     FabricLogout {
@@ -263,6 +273,24 @@ impl ParseOutcome {
 
 pub fn parse_env() -> Result<ParseOutcome, String> {
     let raw = std::env::args().collect::<Vec<_>>();
+    #[cfg(feature = "network")]
+    if raw.get(1).map(String::as_str) == Some("__fabric-background-child") {
+        if raw.len() != 4 {
+            return Err("invalid managed child arguments".into());
+        }
+        let channel_fd = raw[2]
+            .parse::<i32>()
+            .map_err(|_| "invalid managed descriptor")?;
+        let lease_fd = raw[3]
+            .parse::<i32>()
+            .map_err(|_| "invalid managed descriptor")?;
+        return Ok(ParseOutcome::run(Cli {
+            command: Some(Command::FabricBackgroundChild {
+                channel_fd,
+                lease_fd,
+            }),
+        }));
+    }
     if raw.get(1).map(String::as_str) == Some("codex") {
         return codex::run(&raw[2..]).map(ParseOutcome::Print);
     }
@@ -570,14 +598,14 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         .doc("Save public browser connection settings; never save credentials or start authentication")
         .take(args).is_present()
     {
-        let Command::FabricConnect { options } = parse_fabric_browser(args, false, false)? else { unreachable!() };
+        let Command::FabricConnect { options, .. } = parse_fabric_browser(args, false, false)? else { unreachable!() };
         return Ok(Command::FabricConfigure { options });
     }
     if noargs::cmd("check")
         .doc("Check public settings, the existing Supervisor, roots and callback port without authentication")
         .take(args).is_present()
     {
-        let Command::FabricConnect { options } = parse_fabric_browser(args, false, true)? else { unreachable!() };
+        let Command::FabricConnect { options, .. } = parse_fabric_browser(args, false, true)? else { unreachable!() };
         return Ok(Command::FabricCheck { options });
     }
     if noargs::cmd("status")
@@ -604,7 +632,7 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         }
         let saved = saved_fabric_settings(args)?;
         if browser || (!static_mode && saved.is_some()) {
-            let Command::FabricConnect { options } = parse_fabric_browser(args, false, true)?
+            let Command::FabricConnect { options, .. } = parse_fabric_browser(args, false, true)?
             else {
                 unreachable!()
             };
@@ -618,6 +646,17 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         .is_present()
     {
         return parse_fabric_link(args);
+    }
+    if noargs::cmd("disconnect")
+        .doc("Stop this owner's managed background Link without revoking its grant")
+        .take(args)
+        .is_present()
+    {
+        let Command::FabricConnect { options, .. } = parse_fabric_browser(args, false, true)?
+        else {
+            unreachable!()
+        };
+        return Ok(Command::FabricDisconnect { options });
     }
     if noargs::cmd("logout")
         .doc("Revoke this Host's browser grant and remove its secure credentials")
@@ -663,6 +702,10 @@ fn parse_fabric(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
 
 #[cfg(feature = "network")]
 fn parse_fabric_link(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    let background = noargs::flag("background")
+        .doc("Return after an owner-managed browser Link is ready; no login/service registration")
+        .take(args)
+        .is_present();
     let force_browser = noargs::flag("browser")
         .doc("Use browser OAuth even when static-token environment settings exist")
         .take(args)
@@ -720,6 +763,12 @@ fn parse_fabric_link(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         ));
     }
     if let Some(host_token) = host_token {
+        if background {
+            return Err(noargs::Error::other(
+                args,
+                "background Link requires browser mode",
+            ));
+        }
         if host_token.trim().is_empty() {
             return Err(noargs::Error::other(
                 args,
@@ -745,7 +794,13 @@ fn parse_fabric_link(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
             "static mode requires a configured Host token",
         ));
     }
-    parse_fabric_browser(args, false, true)
+    let Command::FabricConnect { options, .. } = parse_fabric_browser(args, false, true)? else {
+        unreachable!()
+    };
+    Ok(Command::FabricConnect {
+        options,
+        background,
+    })
 }
 
 #[cfg(feature = "network")]
@@ -868,7 +923,10 @@ fn parse_fabric_browser(
     Ok(if logout {
         Command::FabricLogout { options }
     } else {
-        Command::FabricConnect { options }
+        Command::FabricConnect {
+            options,
+            background: false,
+        }
     })
 }
 
@@ -2089,6 +2147,47 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "network")]
+    #[test]
+    fn managed_browser_commands_are_explicit_and_static_background_is_rejected() {
+        let settings = [
+            "--gateway-url",
+            "https://fabric.example",
+            "--oauth-issuer",
+            "https://login.example",
+            "--oauth-client-id",
+            "public-client",
+            "--host-id",
+            "test-host",
+        ];
+        for verb in ["connect", "link"] {
+            let mut args = vec!["temote", "fabric", verb, "--background", "--browser"];
+            args.extend(settings);
+            assert!(matches!(
+                command(&args),
+                Command::FabricConnect {
+                    background: true,
+                    ..
+                }
+            ));
+        }
+        let mut args = vec!["temote", "fabric", "disconnect"];
+        args.extend(settings);
+        assert!(matches!(command(&args), Command::FabricDisconnect { .. }));
+        assert!(
+            parse(argv(&[
+                "temote",
+                "fabric",
+                "connect",
+                "--background",
+                "--static",
+                "--host-token",
+                "TOKEN_SECRET_SENTINEL"
+            ]))
+            .is_err()
+        );
+    }
+
     #[test]
     fn no_command_keeps_start_as_default() {
         assert!(matches!(
@@ -2137,7 +2236,7 @@ mod tests {
             ]);
             assert!(matches!(
                 command(&args),
-                Command::FabricConnect { options }
+                Command::FabricConnect { options, .. }
                     if options.host_id.as_deref() == Some("test-host")
                         && options.resource == "https://fabric.example"
                         && options.oauth_callback_port.is_none()
@@ -2157,7 +2256,7 @@ mod tests {
                 "--oauth-callback-port",
                 "8400",
             ]),
-            Command::FabricConnect { options } if options.oauth_callback_port == Some(8400)
+            Command::FabricConnect { options, .. } if options.oauth_callback_port == Some(8400)
         ));
         for invalid in ["", "0", "-1", "+8400", "65536", "999999999999999999", "abc"] {
             assert!(
@@ -2270,7 +2369,7 @@ mod tests {
             match command(&args) {
                 Command::FabricConfigure { options }
                 | Command::FabricCheck { options }
-                | Command::FabricConnect { options }
+                | Command::FabricConnect { options, .. }
                 | Command::FabricBrowserStatus { options } => {
                     assert_eq!(options.oauth_callback_port, Some(8400))
                 }

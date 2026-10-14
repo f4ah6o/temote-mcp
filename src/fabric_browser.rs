@@ -35,7 +35,130 @@ const MAX_HTTP_BYTES: usize = 64 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const LOOPBACK_TIMEOUT: Duration = Duration::from_secs(600);
 
-#[derive(Clone, Debug)]
+#[cfg(target_os = "macos")]
+use core_foundation::{
+    base::{CFType, TCFType},
+    data::CFData,
+    dictionary::{CFDictionary, CFDictionaryRef},
+    string::{CFString, CFStringRef},
+};
+
+#[cfg(target_os = "macos")]
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecClass: CFStringRef;
+    static kSecClassGenericPassword: CFStringRef;
+    static kSecAttrService: CFStringRef;
+    static kSecAttrAccount: CFStringRef;
+    static kSecUseAuthenticationUI: CFStringRef;
+    static kSecUseAuthenticationUIFail: CFStringRef;
+    static kSecValueData: CFStringRef;
+    fn SecItemUpdate(query: CFDictionaryRef, attributes: CFDictionaryRef) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn noninteractive_keychain_update(
+    profile: &str,
+    bytes: &[u8],
+) -> (
+    CFDictionary<CFString, CFType>,
+    CFDictionary<CFString, CFType>,
+) {
+    let key = |value| unsafe { CFString::wrap_under_get_rule(value) };
+    let query = CFDictionary::from_CFType_pairs(&[
+        (
+            key(unsafe { kSecClass }),
+            key(unsafe { kSecClassGenericPassword }).as_CFType(),
+        ),
+        (
+            key(unsafe { kSecAttrService }),
+            CFString::new(STORE_SERVICE).as_CFType(),
+        ),
+        (
+            key(unsafe { kSecAttrAccount }),
+            CFString::new(profile).as_CFType(),
+        ),
+        (
+            key(unsafe { kSecUseAuthenticationUI }),
+            key(unsafe { kSecUseAuthenticationUIFail }).as_CFType(),
+        ),
+    ]);
+    let update = CFDictionary::from_CFType_pairs(&[(
+        key(unsafe { kSecValueData }),
+        CFData::from_buffer(bytes).as_CFType(),
+    )]);
+    (query, update)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserReadFailure {
+    Transient,
+    Authentication,
+    Rejected,
+}
+impl std::fmt::Display for BrowserReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Transient => "browser verification temporarily unavailable",
+            Self::Authentication => "browser authentication rejected",
+            Self::Rejected => "browser verification rejected",
+        })
+    }
+}
+impl std::error::Error for BrowserReadFailure {}
+fn require_read_success(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            BrowserReadFailure::Authentication
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => BrowserReadFailure::Transient,
+        status if status.is_server_error() => BrowserReadFailure::Transient,
+        _ => BrowserReadFailure::Rejected,
+    }
+    .into())
+}
+fn read_transport_error(error: anyhow::Error) -> anyhow::Error {
+    let transient = error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.is_timeout() || e.is_connect() || e.is_request() || e.is_body())
+        || error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Other
+            )
+        });
+    if transient {
+        BrowserReadFailure::Transient.into()
+    } else {
+        error
+    }
+}
+
+pub(crate) struct NoninteractiveStore(pub OsCredentialStore);
+impl CredentialStore for NoninteractiveStore {
+    fn load(&self) -> Result<Option<CredentialRecord>> {
+        self.0.load_for_status()
+    }
+    fn load_for_status(&self) -> Result<Option<CredentialRecord>> {
+        self.0.load_for_status()
+    }
+    fn replace(&self, record: &CredentialRecord) -> Result<()> {
+        self.0.replace_noninteractive(record)
+    }
+    fn delete(&self) -> Result<()> {
+        anyhow::bail!("background Link cannot remove credentials")
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserConnectOptions {
     pub gateway_url: String,
     pub host_id: Option<String>,
@@ -441,6 +564,10 @@ pub trait CredentialStore: Send + Sync {
         anyhow::bail!("noninteractive credential lookup is unavailable")
     }
     fn replace(&self, record: &CredentialRecord) -> Result<()>;
+    /// Background rotation must fail before its POST if persistence needs UI.
+    fn replace_noninteractive(&self, _: &CredentialRecord) -> Result<()> {
+        anyhow::bail!("noninteractive credential update is unavailable")
+    }
     fn delete(&self) -> Result<()>;
 }
 
@@ -489,6 +616,37 @@ impl CredentialStoreFactory for OsCredentialStoreFactory {
 }
 
 impl CredentialStore for OsCredentialStore {
+    fn replace_noninteractive(&self, record: &CredentialRecord) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let bytes = serde_json::to_vec(record)?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_RECORD_BYTES,
+                "secure credential record is oversized"
+            );
+            let (query, update) = noninteractive_keychain_update(&self.profile, &bytes);
+            // Update an existing item only. In particular, never fall back to
+            // SecItemAdd or create new access controls in a detached process.
+            let status =
+                unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+            anyhow::ensure!(status == 0, "noninteractive Keychain update is unavailable");
+            let readback = self
+                .load_for_status()?
+                .context("noninteractive Keychain read-back is unavailable")?;
+            anyhow::ensure!(
+                serde_json::to_vec(&readback)? == bytes,
+                "noninteractive Keychain read-back mismatch"
+            );
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = record;
+            anyhow::bail!(
+                "noninteractive credential update is unavailable; reconnect in the foreground"
+            )
+        }
+    }
     fn load_for_status(&self) -> Result<Option<CredentialRecord>> {
         #[cfg(target_os = "macos")]
         {
@@ -678,18 +836,25 @@ impl CredentialStore for OsCredentialStore {
 
 /// A finite state transition lock. It is intentionally separate from the
 /// process-owned Link lease, so a running Link never blocks logout/revoke.
-pub struct ProfileLock(std::fs::File);
+pub struct ProfileLock {
+    file: std::fs::File,
+    unlock_on_drop: bool,
+}
 
 impl ProfileLock {
     pub fn transition(profile: &str) -> Result<Self> {
-        Self::acquire(profile, "transition")
+        Self::acquire(profile, "transition", false)
+    }
+
+    pub(crate) fn try_transition(profile: &str) -> Result<Self> {
+        Self::acquire(profile, "transition", true)
     }
 
     pub fn link_lifetime(profile: &str) -> Result<Self> {
-        Self::acquire(profile, "link")
+        Self::acquire(profile, "link", true)
     }
 
-    fn acquire(profile: &str, kind: &str) -> Result<Self> {
+    fn acquire(profile: &str, kind: &str, nonblocking: bool) -> Result<Self> {
         #[cfg(unix)]
         {
             let path = state_directory()?.join(format!("{profile}.{kind}.lock"));
@@ -700,7 +865,15 @@ impl ProfileLock {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(path)?;
-            let operation = if kind == "link" {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o777 == 0o600,
+                "credential lock ownership or permissions invalid"
+            );
+            let operation = if nonblocking {
                 libc::LOCK_EX | libc::LOCK_NB
             } else {
                 libc::LOCK_EX
@@ -712,13 +885,61 @@ impl ProfileLock {
                 }
                 anyhow::bail!("browser credential transition lock is unavailable");
             }
-            Ok(Self(file))
+            Ok(Self {
+                file,
+                unlock_on_drop: true,
+            })
         }
         #[cfg(not(unix))]
         {
-            let _ = (profile, kind);
+            let _ = (profile, kind, nonblocking);
             anyhow::bail!("browser credential locking is unavailable on this operating system")
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn disarm_unlock(&mut self) {
+        self.unlock_on_drop = false;
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn commit_handoff(&mut self) {
+        self.unlock_on_drop = true;
+    }
+
+    /// Only the hidden re-exec entry uses this. Validate the descriptor against
+    /// the owner-only canonical profile lock before adopting shared ownership.
+    #[cfg(unix)]
+    pub(crate) unsafe fn from_inherited(profile: &str, fd: std::os::fd::RawFd) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(fd > 2, "inherited Link lease is invalid");
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let actual = file.metadata()?;
+        let expected =
+            std::fs::symlink_metadata(browser_state_path()?.join(format!("{profile}.link.lock")))?;
+        anyhow::ensure!(
+            actual.is_file()
+                && expected.is_file()
+                && actual.uid() == unsafe { libc::geteuid() }
+                && actual.mode() & 0o777 == 0o600
+                && actual.dev() == expected.dev()
+                && actual.ino() == expected.ino(),
+            "inherited Link lease does not match this profile"
+        );
+        anyhow::ensure!(
+            unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "inherited Link lease is unavailable"
+        );
+        Ok(Self {
+            file,
+            unlock_on_drop: false,
+        })
     }
 }
 
@@ -726,7 +947,9 @@ impl Drop for ProfileLock {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
-            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.0), libc::LOCK_UN);
+            if self.unlock_on_drop {
+                libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+            }
         }
     }
 }
@@ -1074,23 +1297,23 @@ impl BrowserOAuth {
                 .port_or_known_default()
                 .context("identity endpoint has no port")?,
         )
-        .await?;
+        .await
+        .map_err(read_transport_error)?;
         let client = pinned_http_client(host, &addrs)?;
         let response = client
             .get(endpoint)
             .bearer_auth(access_token)
             .send()
             .await
-            .context("verified Fabric identity request failed")?;
+            .map_err(|error| read_transport_error(error.into()))?;
         anyhow::ensure!(
             !response.status().is_redirection(),
             "identity endpoint redirects are disabled"
         );
-        anyhow::ensure!(
-            response.status().is_success(),
-            "verified Fabric identity was rejected"
-        );
-        let bytes = read_bounded_response(response).await?;
+        require_read_success(response.status())?;
+        let bytes = read_bounded_response(response)
+            .await
+            .map_err(read_transport_error)?;
         let value: Value = parse_untrusted_json(&bytes, "Worker identity response is malformed")?;
         let owner_key = value
             .get("owner_key")
@@ -1277,6 +1500,83 @@ pub struct PreparedBrowserLink {
     pub record: CredentialRecord,
     pub authority: FabricAuthority,
     pub profile: String,
+}
+
+/// Closed resume boundary: it cannot authorize, enroll, refresh or write.
+pub(crate) async fn resume_browser_link<P: crate::fabric_cli::StatusProtocol>(
+    options: &BrowserConnectOptions,
+    inventory: &LocalSupervisorInventory,
+    store: &dyn CredentialStore,
+    protocol: &P,
+) -> Result<PreparedBrowserLink> {
+    validate_oauth_options(options)?;
+    let origin = Url::parse(&options.gateway_url)?
+        .origin()
+        .ascii_serialization();
+    let record = store
+        .load_for_status()?
+        .context("saved grant is unavailable without interaction")?;
+    record.validate_for_link(&origin)?;
+    anyhow::ensure!(
+        record.issuer == options.issuer
+            && record.oauth_client_id == options.client_id
+            && record.host_id == inventory.host_id
+            && options
+                .host_id
+                .as_ref()
+                .is_none_or(|host| host == &inventory.host_id)
+            && record.access_expires_at > unix_now(),
+        "saved browser configuration or access lifetime changed"
+    );
+    let identity = protocol.identity(&record).await?;
+    validate_verified_identity(&identity)?;
+    anyhow::ensure!(
+        identity.owner_key == record.owner_key,
+        "saved browser owner changed"
+    );
+    let remote = protocol
+        .enrollment(&record)
+        .await?
+        .context("saved Host grant is unavailable")?;
+    validate_remote_scope(&remote, &record, "active")?;
+    anyhow::ensure!(
+        remote.expires_at == Some(record.grant_expires_at) && record.grant_expires_at > unix_now(),
+        "saved Host grant expiry changed"
+    );
+    let authority = make_fabric_authority(
+        &record,
+        &WorkerAuthSnapshot {
+            mode: "browser".into(),
+            owner_key: record.owner_key.clone(),
+            grant_id: record.grant_id.clone(),
+            grant_generation: record.grant_generation,
+            approved_roots: record.approved_roots.clone(),
+        },
+        inventory,
+    )?;
+    let profile = profile_key(&origin, "", &record.host_id);
+    Ok(PreparedBrowserLink {
+        record,
+        authority,
+        profile,
+    })
+}
+
+pub(crate) async fn prepare_interactive_link(
+    options: &BrowserConnectOptions,
+    inventory: LocalSupervisorInventory,
+    protocol: &BrowserOAuth,
+    profile: &str,
+) -> Result<PreparedBrowserLink> {
+    prepare_browser_link_with_transition(
+        options,
+        inventory,
+        protocol,
+        &OsCredentialStoreFactory,
+        &mut TerminalEnrollmentConfirmation,
+        || Ok(Box::new(ProfileLock::transition(profile)?)),
+    )
+    .await
 }
 
 impl EnrollmentProtocol for BrowserOAuth {
@@ -2637,14 +2937,16 @@ impl<'a> BrowserApi<'a> {
         let port = url
             .port_or_known_default()
             .context("enrollment endpoint has no port")?;
-        let addrs = resolve_public_addresses(host, port).await?;
+        let addrs = resolve_public_addresses(host, port)
+            .await
+            .map_err(read_transport_error)?;
         let client = pinned_http_client(host, &addrs)?;
         let response = client
             .get(url)
             .bearer_auth(self.access_token)
             .send()
             .await
-            .context("Fabric enrollment status request failed")?;
+            .map_err(|error| read_transport_error(error.into()))?;
         anyhow::ensure!(
             !response.status().is_redirection(),
             "Fabric enrollment redirects are disabled"
@@ -2652,11 +2954,10 @@ impl<'a> BrowserApi<'a> {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        anyhow::ensure!(
-            response.status().is_success(),
-            "Fabric enrollment status was rejected"
-        );
-        let bytes = read_bounded_response(response).await?;
+        require_read_success(response.status())?;
+        let bytes = read_bounded_response(response)
+            .await
+            .map_err(read_transport_error)?;
         let value: Value = parse_untrusted_json(&bytes, "Fabric enrollment status is malformed")?;
         parse_enrollment_status(value, host_id).map(Some)
     }
@@ -3169,6 +3470,20 @@ pub fn unix_now() -> u64 {
 
 fn state_directory() -> Result<PathBuf> {
     let path = browser_state_path()?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "browser-auth state directory must be a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "browser-auth state directory owner is invalid"
+            );
+        }
+    }
     std::fs::create_dir_all(&path).context("cannot create private browser-auth state directory")?;
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
@@ -3180,7 +3495,7 @@ fn state_directory() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn browser_state_path() -> Result<PathBuf> {
+pub(crate) fn browser_state_path() -> Result<PathBuf> {
     let base = crate::platform_paths::state_dir()
         .or_else(crate::platform_paths::data_local_dir)
         .context("no private state directory is available")?;
@@ -4842,6 +5157,102 @@ pub(crate) mod tests_support {
         assert!(!prepared.record.refresh_commit_pending);
         assert_eq!(protocol.inner.lock().unwrap().refresh_calls, 0);
         assert_eq!(protocol.inner.lock().unwrap().authorize_calls, 2);
+    }
+
+    #[test]
+    fn remote_verification_distinguishes_retryable_http_from_auth_rejection() {
+        use reqwest::StatusCode;
+        for status in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                require_read_success(status)
+                    .unwrap_err()
+                    .downcast_ref::<BrowserReadFailure>(),
+                Some(&BrowserReadFailure::Transient)
+            );
+        }
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert_eq!(
+                require_read_success(status)
+                    .unwrap_err()
+                    .downcast_ref::<BrowserReadFailure>(),
+                Some(&BrowserReadFailure::Authentication)
+            );
+        }
+        assert!(require_read_success(StatusCode::OK).is_ok());
+        assert_eq!(
+            require_read_success(StatusCode::FOUND)
+                .unwrap_err()
+                .downcast_ref::<BrowserReadFailure>(),
+            Some(&BrowserReadFailure::Rejected)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_update_query_forbids_ui_and_only_changes_existing_data() {
+        let (query, update) =
+            noninteractive_keychain_update("fake-profile", b"FAKE_SECRET_SENTINEL");
+        let key = |value| unsafe { CFString::wrap_under_get_rule(value) };
+        assert_eq!(query.len(), 4);
+        assert_eq!(
+            query
+                .find(key(unsafe { kSecUseAuthenticationUI }))
+                .unwrap()
+                .clone(),
+            key(unsafe { kSecUseAuthenticationUIFail }).as_CFType()
+        );
+        assert_eq!(
+            query.find(key(unsafe { kSecAttrAccount })).unwrap().clone(),
+            CFString::new("fake-profile").as_CFType()
+        );
+        assert_eq!(update.len(), 1);
+        assert!(update.contains_key(&key(unsafe { kSecValueData })));
+        assert!(!query.contains_key(&key(unsafe { kSecValueData })));
+    }
+
+    #[tokio::test]
+    async fn unavailable_noninteractive_persistence_stops_before_rotation_post() {
+        struct NoUiStore(SharedFakeStore);
+        impl CredentialStore for NoUiStore {
+            fn load(&self) -> Result<Option<CredentialRecord>> {
+                panic!("interactive load forbidden")
+            }
+            fn load_for_status(&self) -> Result<Option<CredentialRecord>> {
+                self.0.load()
+            }
+            fn replace(&self, record: &CredentialRecord) -> Result<()> {
+                self.0.replace_noninteractive(record)
+            }
+            fn delete(&self) -> Result<()> {
+                panic!("background delete forbidden")
+            }
+        }
+        let (_temporary, store, _log, protocol, _confirmation) = active_fake_profile().await;
+        let mut saved = store.0.lock().unwrap().record.clone().unwrap();
+        saved.access_expires_at = unix_now();
+        let result = refresh_record_for_link(
+            &mut saved,
+            &NoUiStore(SharedFakeStore(Arc::clone(&store.0))),
+            &protocol,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(protocol.inner.lock().unwrap().refresh_calls, 0);
+        assert_eq!(protocol.inner.lock().unwrap().authorize_calls, 1);
+        assert!(
+            !store
+                .0
+                .lock()
+                .unwrap()
+                .record
+                .as_ref()
+                .unwrap()
+                .refresh_in_flight
+        );
     }
 
     #[tokio::test]
