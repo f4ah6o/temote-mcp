@@ -54,6 +54,9 @@ const SERVE_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVE_HEALTH_POLL: Duration = Duration::from_millis(150);
 const SERVE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// A task read must return before the transport's request deadline even when a
+// serve endpoint stalls. This budget covers only observations, never mutations.
+const RECONCILIATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVE_TAIL_BYTES: usize = 8 * 1024;
 const SERVE_SPAWN_ATTEMPTS: usize = 2;
 const SERVE_CONTRACT_ENV: &str = "TEMOTE_OPENCODE_SERVE_CONTRACT";
@@ -136,6 +139,59 @@ struct SessionInstance {
     id: String,
     started_at: u64,
     process_id: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ActiveControlKey {
+    owner: SessionInstance,
+    task_id: Uuid,
+    scope: PathBuf,
+}
+
+fn active_controls() -> &'static Mutex<HashMap<ActiveControlKey, usize>> {
+    static CONTROLS: OnceLock<Mutex<HashMap<ActiveControlKey, usize>>> = OnceLock::new();
+    CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ActiveControlGuard(ActiveControlKey);
+
+impl ActiveControlGuard {
+    fn enter(session: &config::Session, task_id: Uuid) -> Result<Self> {
+        let key = ActiveControlKey {
+            owner: SessionInstance::from_session(session),
+            task_id,
+            scope: config::canonical_directory(&session.cwd)?,
+        };
+        *active_controls()
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default() += 1;
+        Ok(Self(key))
+    }
+}
+
+impl Drop for ActiveControlGuard {
+    fn drop(&mut self) {
+        let mut controls = active_controls().lock().unwrap();
+        if let Some(count) = controls.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                controls.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn control_is_active(record: &TaskRecord) -> bool {
+    active_controls()
+        .lock()
+        .unwrap()
+        .contains_key(&ActiveControlKey {
+            owner: record.owner.clone(),
+            task_id: record.task_id,
+            scope: record.scope_cwd.clone(),
+        })
 }
 
 struct LifecycleEntry {
@@ -492,6 +548,14 @@ struct TaskRecord {
     raw_result_truncated: bool,
     #[serde(default)]
     pending_interaction_summary: Option<pending_interaction::PendingInteractionSummary>,
+    // Fixed-size identity of the bounded interaction view; no prompt or answer
+    // text is retained. It keeps after_revision sensitive to changed questions.
+    #[serde(default)]
+    pending_interaction_fingerprint: Option<Uuid>,
+    // The current prompt's admission time is independent of observation and
+    // diagnostic updates. Older records retain their previous grace fallback.
+    #[serde(default)]
+    prompt_admitted_at: Option<u64>,
     created_at: u64,
     updated_at: u64,
     #[serde(default)]
@@ -2253,6 +2317,14 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
     })
 }
 
+fn not_modified_view(record: &TaskRecord) -> Value {
+    json!({
+        "task_id": record.task_id,
+        "status": "not_modified",
+        "revision": record.revision,
+    })
+}
+
 fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Value {
     if after_revision == Some(record.revision) {
         return json!({
@@ -2575,6 +2647,27 @@ where
     }
 }
 
+fn v2_session_status(body: &Value) -> Result<Value> {
+    let active = body
+        .get("data")
+        .unwrap_or(body)
+        .as_object()
+        .context("opencode session status response is not an object")?;
+    Ok(active
+        .keys()
+        .map(|session_id| (session_id.clone(), json!({"type": "busy"})))
+        .collect())
+}
+
+fn v2_messages(body: &Value) -> Result<Vec<Value>> {
+    let messages = body
+        .get("data")
+        .unwrap_or(body)
+        .as_array()
+        .context("opencode messages response is not an array")?;
+    Ok(messages.iter().rev().cloned().collect())
+}
+
 impl ServeClient {
     fn private_runtime_instance_id(&self) -> Option<Uuid> {
         match self {
@@ -2885,19 +2978,16 @@ impl ServeClient {
                 )
                 .await
                 .context("opencode session status failed")?;
-                let active = body.get("data").unwrap_or(&body);
-                Ok(active
-                    .as_object()
-                    .map(|entries| {
-                        entries
-                            .keys()
-                            .map(|session_id| (session_id.clone(), json!({"type": "busy"})))
-                            .collect()
-                    })
-                    .unwrap_or_default())
+                v2_session_status(&body)
             }
             #[cfg(test)]
-            Self::Fake(inner) => inner.lock().unwrap().session_status(),
+            Self::Fake(inner) => {
+                let delay = inner.lock().unwrap().session_status_delay;
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                inner.lock().unwrap().session_status()
+            }
         }
     }
 
@@ -2924,9 +3014,7 @@ impl ServeClient {
                 )
                 .await
                 .context("opencode messages failed")?;
-                let mut data = body.get("data").unwrap_or(&body).clone();
-                let messages = data.as_array_mut().map(std::mem::take).unwrap_or_default();
-                Ok(messages.into_iter().rev().collect())
+                v2_messages(&body)
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().messages(session_id, limit),
@@ -4385,7 +4473,8 @@ fn derive_serve_state(
         // Prompt admitted but no assistant turn exists yet. Give the server a
         // short grace window before treating the turn as dropped.
         let now = config::unix_time();
-        let status = if now.saturating_sub(record.updated_at) < PROMPT_ADMISSION_GRACE_SECONDS {
+        let admitted_at = record.prompt_admitted_at.unwrap_or(record.updated_at);
+        let status = if now.saturating_sub(admitted_at) < PROMPT_ADMISSION_GRACE_SECONDS {
             TaskStatus::Running
         } else {
             TaskStatus::RetryableFailed
@@ -4578,56 +4667,198 @@ fn report_shape_valid(report: &Value) -> bool {
     report_contract::validate(report, ReportProfile::TaskReport)
 }
 
+#[derive(Debug)]
+struct ServeObservation {
+    status: Value,
+    messages: Vec<Value>,
+    session_ids: BTreeSet<String>,
+    permissions: Vec<Value>,
+    questions: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct ReconciledRecord {
+    record: TaskRecord,
+    deferred: bool,
+}
+
+fn reconcile_snapshot<F>(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    expected: &TaskRecord,
+    apply: F,
+) -> Result<ReconciledRecord>
+where
+    F: FnOnce(&mut TaskRecord) -> Result<()>,
+{
+    let mut deferred = false;
+    let record = store.update_if_instance_live(session, expected.task_id, owner, |record| {
+        // A delayed observation belongs to the exact task version it read.
+        // Controls and other readers may have advanced it while HTTP was in
+        // flight; never apply old success or failure to that newer execution.
+        if record.revision != expected.revision
+            || record.generation != expected.generation
+            || record.opencode_session_id != expected.opencode_session_id
+        {
+            deferred = true;
+            return Ok(());
+        }
+        apply(record)
+    })?;
+    Ok(ReconciledRecord { record, deferred })
+}
+
+async fn read_serve_observation(
+    client: &ServeClient,
+    opencode_session_id: &str,
+    timeout: Duration,
+) -> Result<ServeObservation> {
+    // These independent reads share one deadline. Missing observations cannot
+    // be replaced with empty collections: an absent busy/approval entry would
+    // otherwise look like a completed or orphaned execution.
+    let observation = async {
+        let (status, messages, sessions, permissions, questions) = tokio::try_join!(
+            async {
+                client
+                    .session_status()
+                    .await
+                    .context("cannot read OpenCode session status")
+            },
+            async {
+                client
+                    .messages(opencode_session_id, MAX_MESSAGES_SCAN)
+                    .await
+                    .context("cannot read OpenCode task messages")
+            },
+            async {
+                client
+                    .session_list()
+                    .await
+                    .context("cannot read OpenCode session scope")
+            },
+            async {
+                client
+                    .permission_list()
+                    .await
+                    .context("cannot read OpenCode permissions")
+            },
+            async {
+                client
+                    .question_list()
+                    .await
+                    .context("cannot read OpenCode questions")
+            },
+        )?;
+        let (_, session_ids) = complete_descendant_session_ids(opencode_session_id, &sessions)?;
+        Ok(ServeObservation {
+            status,
+            messages,
+            session_ids,
+            permissions,
+            questions,
+        })
+    };
+    tokio::time::timeout(timeout, observation)
+        .await
+        .context("OpenCode task observation timed out; execution state is unknown")?
+}
+
+fn reconcile_unadmitted_start(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    expected: &TaskRecord,
+) -> Result<ReconciledRecord> {
+    reconcile_snapshot(session, owner, store, expected, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        let start = record
+            .operations
+            .iter()
+            .find(|receipt| receipt.action == "start");
+        let changed = record.status != TaskStatus::ReconciliationRequired
+            || start.is_some_and(|receipt| {
+                receipt.phase != OperationPhase::Accepted
+                    || receipt.outcome.status != TaskStatus::ReconciliationRequired
+                    || receipt.outcome.generation != record.generation
+                    || receipt.outcome.opencode_session_id != record.opencode_session_id
+            });
+        if changed {
+            let operation_id = start.map(|receipt| receipt.operation_id);
+            record.status = TaskStatus::ReconciliationRequired;
+            record.revision = record.revision.saturating_add(1);
+            if let Some(operation_id) = operation_id {
+                update_operation_receipt(record, operation_id, OperationPhase::Accepted);
+            }
+        }
+        Ok(())
+    })
+}
+
+fn reconcile_read_failure(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    expected: &TaskRecord,
+    error: &anyhow::Error,
+) -> Result<ReconciledRecord> {
+    let last_error = Some(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
+    reconcile_snapshot(session, owner, store, expected, |record| {
+        if !record.status.is_terminal()
+            && (record.status != TaskStatus::Unknown || record.last_error != last_error)
+        {
+            record.status = TaskStatus::Unknown;
+            record.last_error = last_error;
+            record.revision = record.revision.saturating_add(1);
+        }
+        Ok(())
+    })
+}
+
 async fn reconcile_task(
     session: &config::Session,
     owner: &SessionInstance,
     store: &TaskStore,
     record: TaskRecord,
     client: &ServeClient,
-) -> Result<TaskRecord> {
+) -> Result<(ReconciledRecord, Vec<PendingInteraction>)> {
     let Some(opencode_session_id) = record.opencode_session_id.clone() else {
         // Accepted but never bound to an opencode session: the spawn failed
         // before session create, or the crash landed in that window. The task
         // text is never persisted, so this cannot be re-driven safely.
-        return store.update_if_instance_live(session, record.task_id, owner, |record| {
-            if record.status.is_terminal() {
-                return Ok(());
-            }
-            if record.status != TaskStatus::ReconciliationRequired {
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
-            }
-            let outcome = record.outcome();
-            if let Some(receipt) = record
-                .operations
-                .iter_mut()
-                .find(|receipt| receipt.action == "start")
-            {
-                receipt.phase = OperationPhase::Accepted;
-                receipt.outcome = outcome;
-            }
-            Ok(())
-        });
+        let record = reconcile_unadmitted_start(session, owner, store, &record)?;
+        return Ok((record, Vec::new()));
     };
 
-    let status = client.session_status().await.unwrap_or_else(|_| json!({}));
-    let messages = client
-        .messages(&opencode_session_id, MAX_MESSAGES_SCAN)
-        .await
-        .unwrap_or_default();
-    let sessions = client.session_list().await.unwrap_or_default();
-    let session_ids = descendant_session_ids(&opencode_session_id, &sessions);
-    let permissions = client.permission_list().await.unwrap_or_default();
-    let questions = client.question_list().await.unwrap_or_default();
+    let observation =
+        read_serve_observation(client, &opencode_session_id, RECONCILIATION_READ_TIMEOUT).await?;
+    let interactions = pending_interactions_from(
+        record.task_id,
+        &observation.session_ids,
+        &observation.permissions,
+        &observation.questions,
+    )?;
+    let interaction_fingerprint = if interactions.is_empty() {
+        None
+    } else {
+        Some(fingerprint(&json!(
+            interactions
+                .iter()
+                .map(|interaction| interaction.interaction_id)
+                .collect::<Vec<_>>()
+        ))?)
+    };
 
     let derived = derive_serve_state(
         &record,
         &opencode_session_id,
-        &session_ids,
-        &status,
-        &messages,
-        &permissions,
-        &questions,
+        &observation.session_ids,
+        &observation.status,
+        &observation.messages,
+        &observation.permissions,
+        &observation.questions,
     );
 
     // Accepted-start admission check: the deterministic prompt message id
@@ -4646,26 +4877,26 @@ async fn reconcile_task(
         .map(|receipt| receipt.operation_id)
     {
         let message_id = prompt_message_id(start_operation_id);
-        let admitted = messages.iter().any(|message| {
+        let admitted = observation.messages.iter().any(|message| {
             let info = message.get("info").unwrap_or(message);
             info.get("id").and_then(Value::as_str) == Some(message_id.as_str())
         });
         if !admitted {
-            return store.update_if_instance_live(session, record.task_id, owner, |record| {
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                if record.status != TaskStatus::ReconciliationRequired {
-                    record.status = TaskStatus::ReconciliationRequired;
-                    record.revision = record.revision.saturating_add(1);
-                }
-                update_operation_receipt(record, start_operation_id, OperationPhase::Accepted);
-                Ok(())
-            });
+            let record = reconcile_unadmitted_start(session, owner, store, &record)?;
+            return Ok((record, interactions));
         }
     }
 
-    apply_derived(session, owner, store, record, derived).await
+    let record = apply_derived(
+        session,
+        owner,
+        store,
+        record,
+        derived,
+        interaction_fingerprint,
+    )
+    .await?;
+    Ok((record, interactions))
 }
 
 fn fit_raw_result_to_record_limit(record: &mut TaskRecord) -> Result<()> {
@@ -4692,15 +4923,14 @@ async fn apply_derived(
     store: &TaskStore,
     record: TaskRecord,
     derived: DerivedServeState,
-) -> Result<TaskRecord> {
-    store.update_if_instance_live(session, record.task_id, owner, |record| {
+    interaction_fingerprint: Option<Uuid>,
+) -> Result<ReconciledRecord> {
+    reconcile_snapshot(session, owner, store, &record, |record| {
         if record.status.is_terminal() {
             return Ok(());
         }
         let previous = record.clone();
-        if record.status != derived.status {
-            record.status = derived.status;
-        }
+        record.status = derived.status;
         if derived.usage.is_some() {
             record.usage = derived.usage.clone();
         }
@@ -4717,28 +4947,23 @@ async fn apply_derived(
             record.raw_result = derived.raw_result.clone();
             record.raw_result_truncated = derived.raw_result_truncated;
         }
-        if derived.last_error.is_some() {
-            record.last_error = derived.last_error.clone();
-        }
-        if record.status != previous.status
-            || record.usage != previous.usage
-            || record.observed_model != previous.observed_model
-            || record.report != previous.report
-            || record.report_status != previous.report_status
-            || record.raw_result != previous.raw_result
-            || record.raw_result_truncated != previous.raw_result_truncated
-            || record.last_error != previous.last_error
-        {
-            record.revision = record.revision.saturating_add(1);
-        }
-        let outcome = record.outcome();
-        if derived.status.is_terminal()
-            && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
+        record.last_error = derived.last_error.clone();
+        record.pending_interaction_fingerprint = interaction_fingerprint;
+        let completing_start = derived.status.is_terminal()
+            && record.operations.iter().any(|receipt| {
                 receipt.action == "start" && receipt.phase == OperationPhase::Accepted
-            })
-        {
-            receipt.phase = OperationPhase::Applied;
-            receipt.outcome = outcome;
+            });
+        if *record != previous || completing_start {
+            record.revision = record.revision.saturating_add(1);
+            let outcome = record.outcome();
+            if completing_start
+                && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
+                    receipt.action == "start" && receipt.phase == OperationPhase::Accepted
+                })
+            {
+                receipt.phase = OperationPhase::Applied;
+                receipt.outcome = outcome;
+            }
         }
         fit_raw_result_to_record_limit(record)?;
         Ok(())
@@ -5391,6 +5616,8 @@ async fn task_start_with_store_and_binary(
         raw_result: None,
         raw_result_truncated: false,
         pending_interaction_summary: None,
+        pending_interaction_fingerprint: None,
+        prompt_admitted_at: None,
         created_at: now,
         updated_at: now,
         verification: None,
@@ -5451,12 +5678,14 @@ async fn task_start_with_store_and_binary(
 
     let mut registered_runtime = None;
     let start_result = async {
+        let create_permit = ensure_current_active_instance(&owner, session).await?;
         let created = client
             .session_create(&json!({
                 "title": format!("temote-{task_id}"),
                 "agent": agent,
             }))
             .await?;
+        drop(create_permit);
         let opencode_session_id = created
             .get("id")
             .and_then(Value::as_str)
@@ -5492,6 +5721,9 @@ async fn task_start_with_store_and_binary(
         )}]);
         // Private tools may be called before prompt_async returns. Persist the
         // parent execution authority before registering the bridge runtime.
+        let prompt_permit = ensure_current_active_instance(&owner, session).await?;
+        client.prompt_async(&opencode_session_id, &body).await?;
+        drop(prompt_permit);
         let apply_permit = ensure_current_active_instance(&owner, session).await?;
         record = store.update_if_instance_live(session, task_id, &owner, |record| {
             if record.status.is_terminal() {
@@ -5504,6 +5736,7 @@ async fn task_start_with_store_and_binary(
                 record.status = TaskStatus::Running;
             }
             record.generation = 1;
+            record.prompt_admitted_at = Some(config::unix_time());
             record.revision = record.revision.saturating_add(1);
             Ok(())
         })?;
@@ -5631,14 +5864,16 @@ async fn task_get_with_store_and_binary(
     }
     let _load_permit = ensure_current_active_instance(&owner, session).await?;
     let (record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
+    // Check after loading: if a control begins later its durable acceptance
+    // advances the revision and the snapshot fence rejects this older read.
+    // Cross-process reads are already fenced by the task runtime lease.
+    if control_is_active(&record) {
+        return Ok(task_view_at_revision(&record, after_revision));
+    }
 
     if record.status.is_terminal() {
         if after_revision == Some(record.revision) {
-            return Ok(json!({
-                "task_id": task_id,
-                "status": "not_modified",
-                "revision": record.revision,
-            }));
+            return Ok(not_modified_view(&record));
         }
         let evidence_ref = terminal_evidence_ref(&owner, session, &record);
         return Ok(task_view(&record, evidence_ref.as_ref()));
@@ -5658,53 +5893,46 @@ async fn task_get_with_store_and_binary(
             Ok(EnsuredRuntime::OwnedElsewhere) => {
                 return Ok(task_view_at_revision(&record, after_revision));
             }
-            Err(_) => {
-                let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                    if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
-                        record.status = TaskStatus::Unknown;
-                        record.revision = record.revision.saturating_add(1);
-                    }
-                    Ok(())
-                })?;
-                return Ok(task_view_at_revision(&record, after_revision));
+            Err(error) => {
+                let reconciled = reconcile_read_failure(session, &owner, store, &record, &error)?;
+                let record = reconciled.record;
+                if reconciled.deferred {
+                    return Ok(task_view_at_revision(&record, after_revision));
+                }
+                return Ok(if after_revision == Some(record.revision) {
+                    not_modified_view(&record)
+                } else {
+                    task_view(&record, None)
+                });
             }
         };
 
+    let expected = record.clone();
     let record = reconcile_task(session, &owner, store, record, &client).await;
-    let record = match record {
-        Ok(record) => record,
+    let (reconciled, interactions) = match record {
+        Ok(result) => result,
         Err(error) => {
-            let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
-                    let last_error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
-                    if record.status != TaskStatus::Unknown
-                        || record.last_error.as_ref() != Some(&last_error)
-                    {
-                        record.status = TaskStatus::Unknown;
-                        record.last_error = Some(last_error);
-                        record.revision = record.revision.saturating_add(1);
-                    }
-                }
-                Ok(())
-            })?;
-            return Ok(task_view_at_revision(&record, after_revision));
+            let reconciled = reconcile_read_failure(session, &owner, store, &expected, &error)?;
+            let record = reconciled.record;
+            if reconciled.deferred {
+                return Ok(task_view_at_revision(&record, after_revision));
+            }
+            return Ok(if after_revision == Some(record.revision) {
+                not_modified_view(&record)
+            } else {
+                task_view(&record, None)
+            });
         }
     };
-
-    let interactions = if record.status.is_terminal() {
-        Ok(Vec::new())
-    } else if let Some(opencode_session_id) = record.opencode_session_id.as_deref() {
-        pending_interactions(&client, task_id, opencode_session_id).await
-    } else {
-        Ok(Vec::new())
-    };
+    let record = reconciled.record;
+    if reconciled.deferred {
+        // The returned revision belongs to a newer task; the earlier scoped
+        // interaction/evidence observation must not be attached to it.
+        return Ok(task_view_at_revision(&record, after_revision));
+    }
 
     if after_revision == Some(record.revision) {
-        return Ok(json!({
-            "task_id": task_id,
-            "status": "not_modified",
-            "revision": record.revision,
-        }));
+        return Ok(not_modified_view(&record));
     }
 
     // Store bounded evidence for the final assistant turn on terminal states.
@@ -5715,17 +5943,7 @@ async fn task_get_with_store_and_binary(
     };
 
     let mut view = task_view(&record, evidence_ref.as_ref());
-    match interactions {
-        Ok(interactions) => {
-            view["pending_interactions"] = json!(pending_interaction_views(&interactions));
-        }
-        Err(error) => {
-            view["pending_interactions"] = json!([]);
-            view["pending_interactions_unavailable"] = json!(true);
-            view["pending_interactions_error"] =
-                json!(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
-        }
-    }
+    view["pending_interactions"] = json!(pending_interaction_views(&interactions));
     Ok(view)
 }
 
@@ -5850,6 +6068,9 @@ async fn task_control_with_store_and_binary(
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
+    // Keep live control admission distinct from a retained Accepted receipt.
+    // The guard disappears on return/crash so durable recovery is not blocked.
+    let _control_guard = ActiveControlGuard::enter(session, task_id)?;
     let (mut record, acquired_lease) = match store.accept_control_if_instance_live(
         session,
         task_id,
@@ -5883,7 +6104,10 @@ async fn task_control_with_store_and_binary(
     // create), reconcile first before applying the control action.
     if record.opencode_session_id.is_none() {
         record = match reconcile_task(session, &owner, store, record, &client).await {
-            Ok(record) => record,
+            Ok((result, _)) if result.deferred => {
+                return Ok(task_view_at_revision(&result.record, None));
+            }
+            Ok((result, _)) => result.record,
             Err(_) => {
                 let shutting_down = session_instance_is_closing(&owner);
                 let record =
@@ -5923,6 +6147,7 @@ async fn task_control_with_store_and_binary(
     }
 
     let message_id = prompt_message_id(operation_id);
+    let send_permit = ensure_current_active_instance(&owner, session).await?;
     let result = match action {
         "steer" => {
             let mut body = prompt_body(
@@ -5947,6 +6172,7 @@ async fn task_control_with_store_and_binary(
         "interrupt" => client.abort(&opencode_session_id).await,
         _ => unreachable!(),
     };
+    drop(send_permit);
     if result.is_err() {
         let shutting_down = session_instance_is_closing(&owner);
         let record = apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
@@ -5962,6 +6188,7 @@ async fn task_control_with_store_and_binary(
         record.status = if action == "interrupt" {
             TaskStatus::Interrupted
         } else {
+            record.prompt_admitted_at = Some(config::unix_time());
             TaskStatus::Running
         };
         record.revision = record.revision.saturating_add(1);
@@ -6281,6 +6508,7 @@ async fn answer_pending_interaction(
         }
     };
 
+    let reply_permit = ensure_current_active_instance(owner, session).await?;
     let reply = match validated {
         ValidatedInteractionAnswer::Permission { reply, message } => {
             client
@@ -6298,6 +6526,7 @@ async fn answer_pending_interaction(
                 .await
         }
     };
+    drop(reply_permit);
 
     // Re-read the queue even when the transport reported an error. The server
     // may have applied the exact request just before a connection failure.
@@ -6475,6 +6704,9 @@ struct FakeServe {
     question_list_calls: usize,
     pending_permissions: Vec<Value>,
     pending_questions: Vec<Value>,
+    session_status_error: Option<String>,
+    session_status_delay: Option<Duration>,
+    messages_error: Option<String>,
     session_list_error: Option<String>,
     permission_list_error: Option<String>,
     question_list_error: Option<String>,
@@ -6598,6 +6830,9 @@ impl FakeServe {
 
     fn session_status(&mut self) -> Result<Value> {
         self.require_live()?;
+        if let Some(error) = &self.session_status_error {
+            anyhow::bail!("{error}");
+        }
         let status = self
             .sessions
             .iter()
@@ -6613,6 +6848,9 @@ impl FakeServe {
 
     fn messages(&mut self, session_id: &str, limit: u32) -> Result<Vec<Value>> {
         self.require_live()?;
+        if let Some(error) = &self.messages_error {
+            anyhow::bail!("{error}");
+        }
         let session = self
             .sessions
             .get(session_id)
@@ -6901,6 +7139,498 @@ mod tests {
             "task": task,
             "model": "anthropic/claude-sonnet-4",
         })
+    }
+
+    fn retained_running_task(
+        session: &config::Session,
+        store: &TaskStore,
+    ) -> (TaskRecord, Arc<Mutex<FakeServe>>, Uuid) {
+        let task_id = Uuid::new_v4();
+        let record = record_for(session, task_id, TaskStatus::Running, Some("ses_running"));
+        store.save(&record).unwrap();
+        let (client, fake) = fake_client();
+        fake.lock().unwrap().sessions.insert(
+            "ses_running".to_owned(),
+            FakeSession {
+                busy: true,
+                ..FakeSession::default()
+            },
+        );
+        let runtime_id = install_observer_runtime(session, store, task_id, client);
+        (record, fake, runtime_id)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchanged_get_keeps_revision_retention_and_verification() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let store = test_store(&root);
+        let (mut record, fake, runtime_id) = retained_running_task(&session, &store);
+        record.updated_at = record.updated_at.saturating_sub(10);
+        record.verification = Some(passed_verification_at(record.revision));
+        store.save(&record).unwrap();
+
+        for _ in 0..2 {
+            let view = task_get_with_store_and_binary(
+                &json!({"task_id": record.task_id, "after_revision": record.revision}),
+                &session,
+                &store,
+                Path::new("opencode"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(view["status"], "not_modified");
+            assert_eq!(view["revision"], record.revision);
+            assert_eq!(store.read_record(record.task_id).unwrap(), record);
+        }
+        {
+            let fake = fake.lock().unwrap();
+            // The same observation supplies both state and interactions; a get
+            // must not re-read these endpoints after reconciliation.
+            assert_eq!(fake.session_list_calls, 2);
+            assert_eq!(fake.permission_list_calls, 2);
+            assert_eq!(fake.question_list_calls, 2);
+            assert!(fake.prompt_calls.is_empty());
+        }
+        fake.lock()
+            .unwrap()
+            .sessions
+            .get_mut("ses_running")
+            .unwrap()
+            .messages
+            .push(json!({
+                "info": {
+                    "role": "assistant",
+                    "providerID": "test",
+                    "modelID": "model",
+                    "tokens": {"inputTokens": 7},
+                    "time": {"created": 1}
+                },
+                "parts": []
+            }));
+        let changed = task_get_with_store_and_binary(
+            &json!({"task_id": record.task_id, "after_revision": record.revision}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed["status"], "running");
+        assert_eq!(changed["revision"], record.revision + 1);
+        assert_eq!(changed["usage"]["inputTokens"], 7);
+        assert_eq!(changed["verification"]["stale"], true);
+        uninstall_observer_runtime(record.task_id, runtime_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_failures_are_unknown_and_repeated_failure_keeps_cursor() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let store = test_store(&root);
+        let (record, fake, runtime_id) = retained_running_task(&session, &store);
+        // An old completed assistant message must never turn a failed status
+        // read into evidence that the still-busy execution completed.
+        complete_turn_with_text(&fake, "ses_running", "old reply", None);
+        fake.lock()
+            .unwrap()
+            .sessions
+            .get_mut("ses_running")
+            .unwrap()
+            .busy = true;
+        let mut revision = record.revision;
+        for endpoint in ["status", "messages", "sessions", "permissions", "questions"] {
+            {
+                let mut fake = fake.lock().unwrap();
+                let field = match endpoint {
+                    "status" => &mut fake.session_status_error,
+                    "messages" => &mut fake.messages_error,
+                    "sessions" => &mut fake.session_list_error,
+                    "permissions" => &mut fake.permission_list_error,
+                    "questions" => &mut fake.question_list_error,
+                    _ => unreachable!(),
+                };
+                *field = Some(format!("temporary {endpoint} read failure"));
+            }
+            let args = json!({"task_id": record.task_id, "after_revision": revision});
+            let failed =
+                task_get_with_store_and_binary(&args, &session, &store, Path::new("opencode"))
+                    .await
+                    .unwrap();
+            assert_eq!(failed["status"], "unknown", "{endpoint}");
+            assert!(failed["last_error"].as_str().unwrap().contains(endpoint));
+            assert!(failed["report"].is_null());
+            assert!(failed["evidence"].is_null());
+            revision = failed["revision"].as_u64().unwrap();
+            let failed_record = store.read_record(record.task_id).unwrap();
+            let repeated = task_get_with_store_and_binary(
+                &json!({"task_id": record.task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("opencode"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(repeated["status"], "not_modified", "{endpoint}");
+            assert_eq!(store.read_record(record.task_id).unwrap(), failed_record);
+            {
+                let mut fake = fake.lock().unwrap();
+                fake.session_status_error = None;
+                fake.messages_error = None;
+                fake.session_list_error = None;
+                fake.permission_list_error = None;
+                fake.question_list_error = None;
+            }
+            let recovered = task_get_with_store_and_binary(
+                &json!({"task_id": record.task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("opencode"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered["status"], "running");
+            assert!(recovered["last_error"].is_null());
+            assert!(recovered["revision"].as_u64().unwrap() > revision);
+            revision = recovered["revision"].as_u64().unwrap();
+        }
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        uninstall_observer_runtime(record.task_id, runtime_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_interaction_is_not_hidden_by_unchanged_waiting_status() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let store = test_store(&root);
+        let (record, fake, runtime_id) = retained_running_task(&session, &store);
+        fake.lock().unwrap().pending_permissions.push(json!({
+            "id": "per_1",
+            "sessionID": "ses_running",
+            "action": "bash",
+            "resources": ["cargo test"]
+        }));
+        let args = json!({"task_id": record.task_id});
+        let first = task_get_with_store_and_binary(&args, &session, &store, Path::new("opencode"))
+            .await
+            .unwrap();
+        assert_eq!(first["status"], "waiting_approval");
+        let revision = first["revision"].as_u64().unwrap();
+        let unchanged_args = json!({"task_id": record.task_id, "after_revision": revision});
+        let unchanged = task_get_with_store_and_binary(
+            &unchanged_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["status"], "not_modified");
+        fake.lock().unwrap().pending_permissions[0]["resources"] = json!(["cargo check"]);
+        let changed = task_get_with_store_and_binary(
+            &unchanged_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed["status"], "waiting_approval");
+        assert_eq!(changed["revision"], revision + 1);
+        assert_ne!(
+            first["pending_interactions"][0]["interaction_id"],
+            changed["pending_interactions"][0]["interaction_id"]
+        );
+        fake.lock().unwrap().pending_permissions.clear();
+        let resumed =
+            task_get_with_store_and_binary(&args, &session, &store, Path::new("opencode"))
+                .await
+                .unwrap();
+        assert_eq!(resumed["status"], "running");
+        assert!(resumed["last_error"].is_null());
+        uninstall_observer_runtime(record.task_id, runtime_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchanged_get_does_not_extend_missing_assistant_grace() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let store = test_store(&root);
+        let (mut record, fake, runtime_id) = retained_running_task(&session, &store);
+        fake.lock()
+            .unwrap()
+            .sessions
+            .get_mut("ses_running")
+            .unwrap()
+            .busy = false;
+        record.updated_at = config::unix_time().saturating_sub(5);
+        record.prompt_admitted_at = Some(record.updated_at);
+        store.save(&record).unwrap();
+        let args = json!({"task_id": record.task_id, "after_revision": record.revision});
+        let unchanged =
+            task_get_with_store_and_binary(&args, &session, &store, Path::new("opencode"))
+                .await
+                .unwrap();
+        assert_eq!(unchanged["status"], "not_modified");
+        assert_eq!(store.read_record(record.task_id).unwrap(), record);
+        // Expire the actual prompt while keeping a recent diagnostic/metadata
+        // timestamp. Observation traffic must not extend its admission grace.
+        record.updated_at = config::unix_time();
+        record.prompt_admitted_at =
+            Some(config::unix_time().saturating_sub(PROMPT_ADMISSION_GRACE_SECONDS + 1));
+        store.save(&record).unwrap();
+        let expired =
+            task_get_with_store_and_binary(&args, &session, &store, Path::new("opencode"))
+                .await
+                .unwrap();
+        assert_eq!(expired["status"], "retryable_failed");
+        assert_eq!(expired["revision"], record.revision + 1);
+        let repeated = task_get_with_store_and_binary(
+            &json!({"task_id": record.task_id, "after_revision": expired["revision"]}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated["status"], "not_modified");
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        uninstall_observer_runtime(record.task_id, runtime_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observation_uses_one_bounded_read_budget() {
+        let (client, fake) = fake_client();
+        fake.lock().unwrap().sessions.insert(
+            "ses_running".to_owned(),
+            FakeSession {
+                busy: true,
+                ..FakeSession::default()
+            },
+        );
+        fake.lock().unwrap().session_status_delay = Some(Duration::from_secs(1));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_serve_observation(&client, "ses_running", Duration::from_millis(10)),
+        )
+        .await
+        .expect("observation ignored the shared read budget");
+        let error = result.expect_err("stalled observation unexpectedly succeeded");
+        assert!(format!("{error:#}").contains("observation timed out"));
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        assert!(fake.lock().unwrap().abort_calls.is_empty());
+    }
+
+    #[test]
+    fn v2_observation_shapes_reject_malformed_success_payloads() {
+        for malformed in [Value::Null, json!(true), json!(42), json!("unexpected")] {
+            assert!(v2_session_status(&malformed).is_err());
+            assert!(v2_messages(&malformed).is_err());
+            assert!(v2_session_status(&json!({"data": malformed})).is_err());
+            assert!(v2_messages(&json!({"data": malformed})).is_err());
+        }
+        assert!(v2_session_status(&json!([])).is_err());
+        assert!(v2_messages(&json!({})).is_err());
+        assert_eq!(v2_session_status(&json!({"data": {}})).unwrap(), json!({}));
+        assert!(v2_messages(&json!({"data": []})).unwrap().is_empty());
+        assert_eq!(
+            v2_session_status(&json!({"data": {"ses_1": {}}})).unwrap(),
+            json!({"ses_1": {"type": "busy"}})
+        );
+        let newest_first = json!([{"id": "newest"}, {"id": "oldest"}]);
+        let expected = vec![json!({"id": "oldest"}), json!({"id": "newest"})];
+        assert_eq!(v2_messages(&newest_first).unwrap(), expected);
+        assert_eq!(
+            v2_messages(&json!({"data": newest_first})).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_reconciliation_keeps_cursor_and_prompt_grace_without_host_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), &test_id());
+        let owner = SessionInstance::from_session(&session);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), LifecycleEntry::new());
+        let store = test_store(root.path());
+        let mut record = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("ses_running"),
+        );
+        record.updated_at = config::unix_time().saturating_sub(5);
+        record.prompt_admitted_at = Some(record.updated_at);
+        store.save(&record).unwrap();
+        let (client, fake) = fake_client();
+        fake.lock().unwrap().sessions.insert(
+            "ses_running".to_owned(),
+            FakeSession {
+                busy: true,
+                ..FakeSession::default()
+            },
+        );
+        for _ in 0..2 {
+            let (observed, interactions) =
+                reconcile_task(&session, &owner, &store, record.clone(), &client)
+                    .await
+                    .unwrap();
+            assert!(!observed.deferred);
+            assert_eq!(observed.record, record);
+            assert!(interactions.is_empty());
+        }
+        assert_eq!(fake.lock().unwrap().session_list_calls, 2);
+        fake.lock().unwrap().session_status_error = Some("temporary status failure".to_owned());
+        let error = reconcile_task(&session, &owner, &store, record.clone(), &client)
+            .await
+            .expect_err("failed status must not become a successful empty observation");
+        let failed = reconcile_read_failure(&session, &owner, &store, &record, &error).unwrap();
+        assert_eq!(failed.record.status, TaskStatus::Unknown);
+        assert_eq!(failed.record.revision, record.revision + 1);
+        let repeated =
+            reconcile_read_failure(&session, &owner, &store, &failed.record, &error).unwrap();
+        assert_eq!(repeated.record, failed.record);
+        fake.lock().unwrap().session_status_error = None;
+        let (recovered, _) = reconcile_task(&session, &owner, &store, failed.record, &client)
+            .await
+            .unwrap();
+        assert_eq!(recovered.record.status, TaskStatus::Running);
+        assert!(recovered.record.last_error.is_none());
+        record = recovered.record;
+        record.prompt_admitted_at =
+            Some(config::unix_time().saturating_sub(PROMPT_ADMISSION_GRACE_SECONDS + 1));
+        record.updated_at = config::unix_time();
+        store.save(&record).unwrap();
+        fake.lock()
+            .unwrap()
+            .sessions
+            .get_mut("ses_running")
+            .unwrap()
+            .busy = false;
+        let (expired, _) = reconcile_task(&session, &owner, &store, record, &client)
+            .await
+            .unwrap();
+        assert_eq!(expired.record.status, TaskStatus::RetryableFailed);
+        let (repeated, _) =
+            reconcile_task(&session, &owner, &store, expired.record.clone(), &client)
+                .await
+                .unwrap();
+        assert_eq!(repeated.record, expired.record);
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        lifecycle_registry().lock().unwrap().entries.remove(&owner);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_observations_preserve_the_newer_control_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), &test_id());
+        let owner = SessionInstance::from_session(&session);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), LifecycleEntry::new());
+        let store = test_store(root.path());
+        let expected = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("ses_running"),
+        );
+        store.save(&expected).unwrap();
+        let current = store
+            .update(&session, expected.task_id, |record| {
+                record.revision += 1;
+                record.generation += 1;
+                record.prompt_admitted_at = Some(config::unix_time());
+                record.operations.push(OperationReceipt {
+                    operation_id: Uuid::new_v4(),
+                    request_fingerprint: Uuid::new_v4(),
+                    action: "steer".to_owned(),
+                    phase: OperationPhase::Applied,
+                    outcome: record.outcome(),
+                    interaction_result: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let completed = apply_derived(
+            &session,
+            &owner,
+            &store,
+            expected.clone(),
+            DerivedServeState {
+                status: TaskStatus::Completed,
+                usage: None,
+                observed_model: None,
+                report: Some(json!({"status": "completed", "summary": "old turn"})),
+                report_status: Some(ReportStatus::Valid),
+                raw_result: Some("old turn".to_owned()),
+                raw_result_truncated: false,
+                last_error: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(completed.deferred);
+        assert_eq!(completed.record, current);
+        let failed = reconcile_read_failure(
+            &session,
+            &owner,
+            &store,
+            &expected,
+            &anyhow::anyhow!("old read failed"),
+        )
+        .unwrap();
+        assert!(failed.deferred);
+        assert_eq!(failed.record, current);
+        let unadmitted = reconcile_unadmitted_start(&session, &owner, &store, &expected).unwrap();
+        assert!(unadmitted.deferred);
+        assert_eq!(unadmitted.record, current);
+        assert_eq!(store.read_record(expected.task_id).unwrap(), current);
+        let view = task_view_at_revision(&current, Some(current.revision));
+        assert_eq!(view["status"], "not_modified");
+        assert_eq!(view["reconciliation_deferred"], true);
+        assert!(view.get("pending_interactions").is_none());
+        lifecycle_registry().lock().unwrap().entries.remove(&owner);
+    }
+
+    #[test]
+    fn active_control_guard_is_counted_scoped_and_not_a_durable_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), &test_id());
+        let mut record = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("ses_running"),
+        );
+        let first = ActiveControlGuard::enter(&session, record.task_id).unwrap();
+        let second = ActiveControlGuard::enter(&session, record.task_id).unwrap();
+        assert!(control_is_active(&record));
+        let mut replacement = record.clone();
+        replacement.owner.started_at += 1;
+        assert!(!control_is_active(&replacement));
+        let mut foreign = record.clone();
+        foreign.scope_cwd = root.path().join("different-scope");
+        assert!(!control_is_active(&foreign));
+        drop(first);
+        assert!(control_is_active(&record));
+        drop(second);
+        record.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "steer".to_owned(),
+            phase: OperationPhase::Accepted,
+            outcome: record.outcome(),
+            interaction_result: None,
+        });
+        assert!(!control_is_active(&record));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8789,6 +9519,8 @@ mod tests {
             raw_result: None,
             raw_result_truncated: false,
             pending_interaction_summary: None,
+            pending_interaction_fingerprint: None,
+            prompt_admitted_at: None,
             created_at: now,
             updated_at: now,
             verification: None,
@@ -8933,10 +9665,10 @@ mod tests {
             raw_result_truncated: false,
             last_error: None,
         };
-        let first = apply_derived(&owner, &instance, &store, record, derived)
+        let first = apply_derived(&owner, &instance, &store, record, derived, None)
             .await
             .unwrap();
-        assert_eq!(first.revision, 1);
+        assert_eq!(first.record.revision, 1);
         let same = DerivedServeState {
             status: TaskStatus::Running,
             usage: None,
@@ -8947,10 +9679,10 @@ mod tests {
             raw_result_truncated: false,
             last_error: None,
         };
-        let first = apply_derived(&owner, &instance, &store, first, same)
+        let first = apply_derived(&owner, &instance, &store, first.record, same, None)
             .await
             .unwrap();
-        assert_eq!(first.revision, 1);
+        assert_eq!(first.record.revision, 1);
         let changed = DerivedServeState {
             status: TaskStatus::WaitingApproval,
             usage: None,
@@ -8961,10 +9693,10 @@ mod tests {
             raw_result_truncated: false,
             last_error: None,
         };
-        let second = apply_derived(&owner, &instance, &store, first, changed)
+        let second = apply_derived(&owner, &instance, &store, first.record, changed, None)
             .await
             .unwrap();
-        assert_eq!(second.revision, 2);
+        assert_eq!(second.record.revision, 2);
         begin_session_instance_shutdown(&instance);
         finish_session_shutdown(&instance).unwrap();
     }
@@ -9242,13 +9974,18 @@ mod tests {
         let owner = session(workspace.path(), &test_id());
         let record = record_for(&owner, Uuid::new_v4(), TaskStatus::Running, None);
         let mut serialized = serde_json::to_value(record).unwrap();
-        serialized
-            .as_object_mut()
-            .unwrap()
-            .remove("pending_interaction_summary");
+        for field in [
+            "pending_interaction_summary",
+            "pending_interaction_fingerprint",
+            "prompt_admitted_at",
+        ] {
+            serialized.as_object_mut().unwrap().remove(field);
+        }
 
         let restored: TaskRecord = serde_json::from_value(serialized).unwrap();
         assert!(restored.pending_interaction_summary.is_none());
+        assert!(restored.pending_interaction_fingerprint.is_none());
+        assert!(restored.prompt_admitted_at.is_none());
     }
 
     #[tokio::test]

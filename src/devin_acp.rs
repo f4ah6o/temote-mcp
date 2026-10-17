@@ -122,6 +122,7 @@ struct LifecycleEntry {
     closing: bool,
     cleanup_complete: bool,
     in_flight: usize,
+    task_controls: HashMap<(PathBuf, Uuid), usize>,
     cancellation: watch::Sender<bool>,
     drain_notify: Arc<tokio::sync::Notify>,
 }
@@ -133,6 +134,7 @@ impl LifecycleEntry {
             closing: false,
             cleanup_complete: false,
             in_flight: 0,
+            task_controls: HashMap::new(),
             cancellation,
             drain_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -179,6 +181,56 @@ fn finish_session_shutdown(owner: &SessionInstance) -> Result<()> {
     entry.cleanup_complete = true;
     registry.entries.remove(owner);
     Ok(())
+}
+
+// Only live control calls defer reads. Retained accepted receipts must still
+// reconcile after a caller or backend crashes.
+struct TaskControlGuard {
+    owner: SessionInstance,
+    key: (PathBuf, Uuid),
+}
+
+impl TaskControlGuard {
+    fn acquire(session: &config::Session, task_id: Uuid) -> Result<Self> {
+        let owner = SessionInstance::from_session(session);
+        let key = (config::canonical_directory(&session.cwd)?, task_id);
+        let mut registry = lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get_mut(&owner)
+            .context("Devin session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Devin session instance is closing");
+        *entry.task_controls.entry(key.clone()).or_default() += 1;
+        Ok(Self { owner, key })
+    }
+}
+
+impl Drop for TaskControlGuard {
+    fn drop(&mut self) {
+        let mut registry = lifecycle_registry().lock().unwrap();
+        let Some(entry) = registry.entries.get_mut(&self.owner) else {
+            return;
+        };
+        if let Some(count) = entry.task_controls.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                entry.task_controls.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn task_control_in_flight(record: &TaskRecord) -> bool {
+    lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(&record.owner)
+        .is_some_and(|entry| {
+            entry
+                .task_controls
+                .contains_key(&(record.scope_cwd.clone(), record.task_id))
+        })
 }
 
 fn session_instance_is_closing(owner: &SessionInstance) -> bool {
@@ -757,7 +809,11 @@ impl TaskStore {
     {
         let _guard = self.lock()?;
         let mut record = self.load_locked(session, task_id)?;
+        let previous = record.clone();
         f(&mut record)?;
+        if record == previous {
+            return Ok(record);
+        }
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
@@ -1693,16 +1749,19 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
     view
 }
 
-fn task_view_after_reconciliation(record: &TaskRecord, after_revision: Option<u64>) -> Value {
+fn reconciled_task_view(
+    record: &TaskRecord,
+    evidence_ref: Option<&evidence::EvidenceRef>,
+    after_revision: Option<u64>,
+) -> Value {
     if after_revision == Some(record.revision) {
-        json!({
+        return json!({
             "task_id": record.task_id,
             "status": "not_modified",
             "revision": record.revision,
-        })
-    } else {
-        task_view(record, None)
+        });
     }
+    task_view(record, evidence_ref)
 }
 
 /// Bounded, expiring, session-scoped evidence for a terminal task's final
@@ -3444,25 +3503,52 @@ fn report_shape_valid(report: &Value) -> bool {
     report_contract::validate(report, ReportProfile::TaskReport)
 }
 
+struct ReconciledRecord {
+    record: TaskRecord,
+    deferred: bool,
+}
+
+fn reconcile_snapshot<F>(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    expected: &TaskRecord,
+    apply: F,
+) -> Result<ReconciledRecord>
+where
+    F: FnOnce(&mut TaskRecord) -> Result<()>,
+{
+    let mut deferred = false;
+    let record = store.update_if_instance_live(session, expected.task_id, owner, |record| {
+        if record.revision != expected.revision
+            || record.generation != expected.generation
+            || record.acp_session_id != expected.acp_session_id
+        {
+            deferred = true;
+            return Ok(());
+        }
+        apply(record)
+    })?;
+    Ok(ReconciledRecord { record, deferred })
+}
+
 async fn reconcile_task(
     session: &config::Session,
     owner: &SessionInstance,
     store: &TaskStore,
-    record: TaskRecord,
+    record: &TaskRecord,
     client: &AcpClient,
-) -> Result<TaskRecord> {
+) -> Result<ReconciledRecord> {
     let Some(acp_session_id) = record.acp_session_id.clone() else {
         // Accepted but never bound to an acp session: the spawn failed before
         // session/new, or the crash landed in that window. The task text is
         // never persisted, so this cannot be re-driven safely.
-        return store.update_if_instance_live(session, record.task_id, owner, |record| {
+        return reconcile_snapshot(session, owner, store, record, |record| {
             if record.status.is_terminal() {
                 return Ok(());
             }
-            if record.status != TaskStatus::ReconciliationRequired {
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
-            }
+            let previous = record.clone();
+            record.status = TaskStatus::ReconciliationRequired;
             let outcome = record.outcome();
             if let Some(receipt) = record
                 .operations
@@ -3470,6 +3556,18 @@ async fn reconcile_task(
                 .find(|receipt| receipt.action == "start")
             {
                 receipt.phase = OperationPhase::Accepted;
+                receipt.outcome = outcome;
+            }
+            if *record == previous {
+                return Ok(());
+            }
+            record.revision = record.revision.saturating_add(1);
+            let outcome = record.outcome();
+            if let Some(receipt) = record
+                .operations
+                .iter_mut()
+                .find(|receipt| receipt.action == "start")
+            {
                 receipt.outcome = outcome;
             }
             Ok(())
@@ -3485,7 +3583,7 @@ async fn reconcile_task(
         match client.session_load(&acp_session_id, &scope).await {
             Ok(()) => {}
             Err(_) if session_instance_is_closing(owner) => {
-                return store.update_if_instance_live(session, record.task_id, owner, |record| {
+                return reconcile_snapshot(session, owner, store, record, |record| {
                     if record.status.is_terminal() {
                         return Ok(());
                     }
@@ -3498,8 +3596,11 @@ async fn reconcile_task(
             }
             Err(error) => {
                 let error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
-                return store.update_if_instance_live(session, record.task_id, owner, |record| {
-                    if record.status.is_terminal() {
+                return reconcile_snapshot(session, owner, store, record, |record| {
+                    if record.status.is_terminal()
+                        || (record.status == TaskStatus::ReconciliationRequired
+                            && record.last_error.as_ref() == Some(&error))
+                    {
                         return Ok(());
                     }
                     if record.status != TaskStatus::ReconciliationRequired
@@ -3516,7 +3617,7 @@ async fn reconcile_task(
     }
 
     let snap = client.snapshot();
-    let derived = derive_acp_state(&record, &snap);
+    let derived = derive_acp_state(record, &snap);
     apply_derived(session, owner, store, record, derived).await
 }
 
@@ -3542,10 +3643,10 @@ async fn apply_derived(
     session: &config::Session,
     owner: &SessionInstance,
     store: &TaskStore,
-    record: TaskRecord,
+    record: &TaskRecord,
     derived: DerivedAcpState,
-) -> Result<TaskRecord> {
-    store.update_if_instance_live(session, record.task_id, owner, |record| {
+) -> Result<ReconciledRecord> {
+    reconcile_snapshot(session, owner, store, record, |record| {
         if record.status.is_terminal() {
             return Ok(());
         }
@@ -3569,20 +3670,18 @@ async fn apply_derived(
             record.raw_result = derived.raw_result.clone();
             record.raw_result_truncated = derived.raw_result_truncated;
         }
-        if derived.last_error.is_some() {
+        if derived.last_error.is_some()
+            || matches!(
+                derived.status,
+                TaskStatus::Running | TaskStatus::Completed | TaskStatus::Interrupted
+            )
+        {
             record.last_error = derived.last_error.clone();
         }
-        if record.status != previous.status
-            || record.usage != previous.usage
-            || record.observed_model != previous.observed_model
-            || record.report != previous.report
-            || record.report_status != previous.report_status
-            || record.raw_result != previous.raw_result
-            || record.raw_result_truncated != previous.raw_result_truncated
-            || record.last_error != previous.last_error
-        {
-            record.revision = record.revision.saturating_add(1);
+        if *record == previous {
+            return Ok(());
         }
+        record.revision = record.revision.saturating_add(1);
         let outcome = record.outcome();
         if derived.status.is_terminal()
             && let Some(receipt) = record.operations.iter_mut().find(|receipt| {
@@ -4115,6 +4214,9 @@ async fn task_get_with_store_and_binary(
     }
     let _load_permit = ensure_current_active_instance(&owner, session).await?;
     let (record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
+    if task_control_in_flight(&record) {
+        return Ok(task_view_at_revision(&record, after_revision));
+    }
 
     if record.status.is_terminal() {
         if after_revision == Some(record.revision) {
@@ -4142,45 +4244,51 @@ async fn task_get_with_store_and_binary(
             Ok(EnsuredRuntime::OwnedElsewhere) => {
                 return Ok(task_view_at_revision(&record, after_revision));
             }
-            Err(_) => {
-                let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                    if !record.status.is_terminal() && record.status != TaskStatus::Unknown {
+            Err(error) => {
+                let error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
+                let reconciled = reconcile_snapshot(session, &owner, store, &record, |record| {
+                    if !record.status.is_terminal()
+                        && (record.status != TaskStatus::Unknown
+                            || record.last_error.as_ref() != Some(&error))
+                    {
                         record.status = TaskStatus::Unknown;
+                        record.last_error = Some(error.clone());
                         record.revision = record.revision.saturating_add(1);
                     }
                     Ok(())
                 })?;
-                return Ok(task_view_after_reconciliation(&record, after_revision));
+                return Ok(if reconciled.deferred {
+                    task_view_at_revision(&reconciled.record, after_revision)
+                } else {
+                    reconciled_task_view(&reconciled.record, None, after_revision)
+                });
             }
         };
 
-    let record = reconcile_task(session, &owner, store, record, &client).await;
-    let record = match record {
-        Ok(record) => record,
+    let reconciled = match reconcile_task(session, &owner, store, &record, &client).await {
+        Ok(reconciled) => reconciled,
         Err(error) => {
-            let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
-                    let last_error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
-                    if record.status != TaskStatus::Unknown
-                        || record.last_error.as_ref() != Some(&last_error)
-                    {
-                        record.status = TaskStatus::Unknown;
-                        record.last_error = Some(last_error);
-                        record.revision = record.revision.saturating_add(1);
-                    }
+            let error = bound_text(&format!("{error:#}"), MAX_ERROR_BYTES);
+            reconcile_snapshot(session, &owner, store, &record, |record| {
+                if !record.status.is_terminal()
+                    && (record.status != TaskStatus::Unknown
+                        || record.last_error.as_ref() != Some(&error))
+                {
+                    record.status = TaskStatus::Unknown;
+                    record.last_error = Some(error.clone());
+                    record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
-            })?;
-            return Ok(task_view_after_reconciliation(&record, after_revision));
+            })?
         }
     };
+    if reconciled.deferred {
+        return Ok(task_view_at_revision(&reconciled.record, after_revision));
+    }
+    let record = reconciled.record;
 
     if after_revision == Some(record.revision) {
-        return Ok(json!({
-            "task_id": task_id,
-            "status": "not_modified",
-            "revision": record.revision,
-        }));
+        return Ok(reconciled_task_view(&record, None, after_revision));
     }
 
     // Store bounded evidence for the final assistant turn on terminal states.
@@ -4190,7 +4298,11 @@ async fn task_get_with_store_and_binary(
         None
     };
 
-    Ok(task_view(&record, evidence_ref.as_ref()))
+    Ok(reconciled_task_view(
+        &record,
+        evidence_ref.as_ref(),
+        after_revision,
+    ))
 }
 
 /// Read-only projection of the tasks this session instance owns.
@@ -4286,6 +4398,7 @@ async fn task_control_with_store_and_binary(
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
+    let _control_guard = TaskControlGuard::acquire(session, task_id)?;
     let (mut record, acquired_lease) = match store.accept_control_if_instance_live(
         session,
         task_id,
@@ -4318,8 +4431,11 @@ async fn task_control_with_store_and_binary(
     // For records that never bound a session (crash between accept and
     // create), reconcile first before applying the control action.
     if record.acp_session_id.is_none() {
-        record = match reconcile_task(session, &owner, store, record, &client).await {
-            Ok(record) => record,
+        record = match reconcile_task(session, &owner, store, &record, &client).await {
+            Ok(reconciled) if reconciled.deferred => {
+                return Ok(task_view_at_revision(&reconciled.record, None));
+            }
+            Ok(reconciled) => reconciled.record,
             Err(_) => {
                 let shutting_down = session_instance_is_closing(&owner);
                 let record =
@@ -4810,6 +4926,33 @@ mod tests {
         (AcpClient::Fake(Arc::clone(&fake)), fake)
     }
 
+    async fn retained_reconciliation_runtime(
+        session: &config::Session,
+        store: &TaskStore,
+        task_id: Uuid,
+    ) -> Arc<Mutex<FakeAcp>> {
+        let (client, fake) = fake_client(true);
+        let shared = {
+            let mut backend = fake.lock().unwrap();
+            backend
+                .sessions
+                .insert("retained-session".to_owned(), false);
+            Arc::clone(&backend.state)
+        };
+        {
+            let mut state = shared.lock().unwrap();
+            state.session_id = Some("retained-session".to_owned());
+            state.session_loaded = true;
+            state.pending_state_ready = true;
+            state.prompts_in_flight = 1;
+        }
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        insert_runtime(session, task_id, store, client, lease)
+            .await
+            .unwrap();
+        fake
+    }
+
     fn install_fake(fake: Arc<Mutex<FakeAcp>>) {
         let hook: Arc<SpawnHook> = Arc::new(move |_, _, _| Ok(AcpClient::Fake(Arc::clone(&fake))));
         *SPAWN_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(hook);
@@ -4972,6 +5115,374 @@ mod tests {
         clear_fake();
         assert!(format!("{error:#}").contains("cloud must be a boolean"));
         assert!(fake.lock().unwrap().prompt_calls.len() == 1);
+    }
+
+    #[test]
+    fn reconciliation_snapshot_preserves_retention_and_fences_newer_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "acp-snapshot-fence");
+        let owner = SessionInstance::from_session(&session);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), LifecycleEntry::new());
+        let store = test_store(root.path());
+        let mut expected = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("retained-session"),
+        );
+        expected.generation = 1;
+        expected.updated_at = expected.updated_at.saturating_sub(60);
+        store.save(&expected).unwrap();
+        for _ in 0..2 {
+            let result =
+                reconcile_snapshot(&session, &owner, &store, &expected, |_| Ok(())).unwrap();
+            assert!(!result.deferred);
+            assert_eq!(result.record, expected);
+        }
+        for changed_field in ["revision", "generation", "session"] {
+            let mut newer = expected.clone();
+            match changed_field {
+                "revision" => newer.revision += 1,
+                "generation" => newer.generation += 1,
+                "session" => newer.acp_session_id = Some("new-session".to_owned()),
+                _ => unreachable!(),
+            }
+            store.save(&newer).unwrap();
+            for stale_status in [
+                TaskStatus::Completed,
+                TaskStatus::Unknown,
+                TaskStatus::ReconciliationRequired,
+            ] {
+                let result = reconcile_snapshot(&session, &owner, &store, &expected, |record| {
+                    record.status = stale_status;
+                    record.last_error = Some("stale backend error".to_owned());
+                    record.revision += 1;
+                    Ok(())
+                })
+                .unwrap();
+                assert!(result.deferred);
+                assert_eq!(result.record, newer);
+                assert_eq!(store.read_record(expected.task_id).unwrap(), newer);
+            }
+        }
+        lifecycle_registry().lock().unwrap().entries.remove(&owner);
+    }
+
+    #[test]
+    fn in_flight_control_guard_is_scoped_counted_and_not_a_retained_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "acp-control-guard");
+        let owner = SessionInstance::from_session(&session);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), LifecycleEntry::new());
+        let mut record = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("retained-session"),
+        );
+        let first = TaskControlGuard::acquire(&session, record.task_id).unwrap();
+        let second = TaskControlGuard::acquire(&session, record.task_id).unwrap();
+        assert!(task_control_in_flight(&record));
+        let mut replacement = record.clone();
+        replacement.owner.started_at += 1;
+        assert!(!task_control_in_flight(&replacement));
+        replacement = record.clone();
+        replacement.scope_cwd = root.path().join("other-scope");
+        assert!(!task_control_in_flight(&replacement));
+        drop(first);
+        assert!(task_control_in_flight(&record));
+        record.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "steer".to_owned(),
+            phase: OperationPhase::Accepted,
+            outcome: record.outcome(),
+        });
+        drop(second);
+        assert!(!task_control_in_flight(&record));
+        lifecycle_registry().lock().unwrap().entries.remove(&owner);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_derived_state_changes_once_without_host_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "acp-derived-revision");
+        let owner = SessionInstance::from_session(&session);
+        lifecycle_registry()
+            .lock()
+            .unwrap()
+            .entries
+            .insert(owner.clone(), LifecycleEntry::new());
+        let store = test_store(root.path());
+        let mut record = record_for(
+            &session,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            Some("retained-session"),
+        );
+        record.generation = 1;
+        record.updated_at = record.updated_at.saturating_sub(60);
+        store.save(&record).unwrap();
+        let (client, fake) = fake_client(true);
+        let shared = fake.lock().unwrap().state.clone();
+        {
+            let mut state = shared.lock().unwrap();
+            state.session_loaded = true;
+            state.prompts_in_flight = 1;
+        }
+        for _ in 0..2 {
+            let out = reconcile_task(&session, &owner, &store, &record, &client)
+                .await
+                .unwrap();
+            assert!(!out.deferred);
+            assert_eq!(out.record, record);
+        }
+        for (revision, expected_status) in [
+            (2, TaskStatus::Running),
+            (3, TaskStatus::WaitingApproval),
+            (4, TaskStatus::Completed),
+        ] {
+            {
+                let mut state = shared.lock().unwrap();
+                match revision {
+                    2 => {
+                        state.usage = Some(BTreeMap::from([("total_tokens".to_owned(), 6)]));
+                        state.observed_model = Some("observed-model".to_owned());
+                    }
+                    3 => state.pending_permissions = 1,
+                    4 => {
+                        state.pending_permissions = 0;
+                        state.prompts_in_flight = 0;
+                        state.last_stop_reason = Some("end_turn".to_owned());
+                        state.assistant_text =
+                            json!({"status": "completed", "summary": "done"}).to_string();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let out = reconcile_task(&session, &owner, &store, &record, &client)
+                .await
+                .unwrap();
+            assert!(!out.deferred);
+            assert_eq!(out.record.revision, revision);
+            assert_eq!(out.record.status, expected_status);
+            record = out.record;
+            let again = reconcile_task(&session, &owner, &store, &record, &client)
+                .await
+                .unwrap();
+            assert!(!again.deferred);
+            assert_eq!(again.record, record);
+        }
+        assert_eq!(record.report.as_ref().unwrap()["summary"], "done");
+        assert_eq!(record.report_status, Some(ReportStatus::Valid));
+        assert!(record.last_error.is_none());
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        lifecycle_registry().lock().unwrap().entries.remove(&owner);
+    }
+
+    #[tokio::test]
+    async fn get_semantic_revision_tracks_usage_report_and_state_without_poll_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, session) = active_test_session(root.path(), &test_id(), false).await;
+        let store = test_store(root.path());
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(
+            &session,
+            task_id,
+            TaskStatus::Running,
+            Some("retained-session"),
+        );
+        record.generation = 1;
+        record.revision = 7;
+        record.updated_at = record.updated_at.saturating_sub(60);
+        record.verification = Some(passed_verification_at(record.revision));
+        store.save(&record).unwrap();
+        let fake = retained_reconciliation_runtime(&session, &store, task_id).await;
+        let shared = fake.lock().unwrap().state.clone();
+
+        for _ in 0..2 {
+            let out = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": 7}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                out,
+                json!({"task_id": task_id, "status": "not_modified", "revision": 7})
+            );
+        }
+        let unchanged = store.read_record(task_id).unwrap();
+        assert_eq!(unchanged.updated_at, record.updated_at);
+        assert_eq!(
+            task_view(&unchanged, None)["verification"]["status"],
+            "passed"
+        );
+
+        for (revision, expected_status) in
+            [(8, "running"), (9, "waiting_approval"), (10, "completed")]
+        {
+            {
+                let mut state = shared.lock().unwrap();
+                match revision {
+                    8 => {
+                        state.usage = Some(BTreeMap::from([("total_tokens".to_owned(), 6)]));
+                        state.observed_model = Some("observed-model".to_owned());
+                    }
+                    9 => state.pending_permissions = 1,
+                    10 => {
+                        state.pending_permissions = 0;
+                        state.prompts_in_flight = 0;
+                        state.last_stop_reason = Some("end_turn".to_owned());
+                        state.assistant_text =
+                            json!({"status": "completed", "summary": "done"}).to_string();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let changed = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision - 1}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(changed["status"], expected_status);
+            assert_eq!(changed["revision"], revision);
+            assert_eq!(changed["usage"]["total_tokens"], 6);
+            assert_eq!(changed["observed_model"], "observed-model");
+            assert_eq!(changed["verification"]["status"], "not_run");
+            assert_eq!(changed["verification"]["stale"], true);
+            if expected_status == "completed" {
+                assert_eq!(changed["report_status"], "valid");
+                assert_eq!(changed["report"]["summary"], "done");
+                assert!(changed["evidence"].is_object());
+            }
+            let again = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                again,
+                json!({"task_id": task_id, "status": "not_modified", "revision": revision})
+            );
+        }
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        assert!(fake.lock().unwrap().cancel_calls.is_empty());
+        remove_session(&session).await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_semantic_revision_tracks_reconciliation_errors_without_poll_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, session) = active_test_session(root.path(), &test_id(), false).await;
+        let store = test_store(root.path());
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(
+            &session,
+            task_id,
+            TaskStatus::Running,
+            Some("retained-session"),
+        );
+        record.generation = 1;
+        record.revision = 7;
+        store.save(&record).unwrap();
+        let fake = retained_reconciliation_runtime(&session, &store, task_id).await;
+        let shared = fake.lock().unwrap().state.clone();
+        shared.lock().unwrap().session_loaded = false;
+
+        for (revision, error) in [(8, "load unavailable"), (9, "load response invalid")] {
+            fake.lock().unwrap().load_fail = Some(error.to_owned());
+            let changed = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision - 1}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(changed["status"], "reconciliation_required");
+            assert_eq!(changed["revision"], revision);
+            assert_eq!(changed["last_error"], error);
+            let again = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("must-not-start"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                again,
+                json!({"task_id": task_id, "status": "not_modified", "revision": revision})
+            );
+        }
+
+        fake.lock().unwrap().load_fail = None;
+        let recovered = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": 9}),
+            &session,
+            &store,
+            Path::new("must-not-start"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered["status"], "running");
+        assert_eq!(recovered["revision"], 10);
+        assert!(recovered["last_error"].is_null());
+
+        // A backend lacking loadSession produces the task_get error path,
+        // whose first public error change must also invalidate the cursor.
+        shared.lock().unwrap().session_loaded = false;
+        fake.lock().unwrap().capabilities.load_session = false;
+        let unknown = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": 10}),
+            &session,
+            &store,
+            Path::new("must-not-start"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown["status"], "unknown");
+        assert_eq!(unknown["revision"], 11);
+        assert!(
+            unknown["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("loadSession")
+        );
+        let again = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": 11}),
+            &session,
+            &store,
+            Path::new("must-not-start"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again,
+            json!({"task_id": task_id, "status": "not_modified", "revision": 11})
+        );
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        assert!(fake.lock().unwrap().cancel_calls.is_empty());
+        remove_session(&session).await.unwrap();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5304,8 +5815,29 @@ mod tests {
         )
         .await
         .unwrap();
-        clear_fake();
         assert_eq!(out["status"], "reconciliation_required");
+        let revision = out["revision"].as_u64().unwrap();
+        let settled = store.read_record(task_id).unwrap();
+        for _ in 0..2 {
+            let again = task_get_with_store_and_binary(
+                &json!({"task_id": task_id, "after_revision": revision}),
+                &session,
+                &store,
+                Path::new("devin"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                again,
+                json!({"task_id": task_id, "status": "not_modified", "revision": revision})
+            );
+        }
+        let reread = store.read_record(task_id).unwrap();
+        assert_eq!(reread.operations, settled.operations);
+        assert_eq!(reread.updated_at, settled.updated_at);
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
+        assert!(fake.lock().unwrap().sessions.is_empty());
+        clear_fake();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5507,9 +6039,10 @@ mod tests {
                 last_error: None,
             };
             assert_eq!(
-                apply_derived(&owner, &instance, &store, current, unchanged)
+                apply_derived(&owner, &instance, &store, &current, unchanged)
                     .await
                     .unwrap()
+                    .record
                     .revision,
                 1
             );
@@ -5530,9 +6063,10 @@ mod tests {
         };
         let current = store.read_record(task_id).unwrap();
         assert_eq!(
-            apply_derived(&owner, &instance, &store, current, changed)
+            apply_derived(&owner, &instance, &store, &current, changed)
                 .await
                 .unwrap()
+                .record
                 .revision,
             2
         );
@@ -5548,17 +6082,17 @@ mod tests {
             last_error: None,
         };
         let current = store.read_record(task_id).unwrap();
-        let finished = apply_derived(&owner, &instance, &store, current, completed)
+        let finished = apply_derived(&owner, &instance, &store, &current, completed)
             .await
             .unwrap();
-        assert_eq!(finished.revision, 3);
-        assert_eq!(finished.report, Some(report));
+        assert_eq!(finished.record.revision, 3);
+        assert_eq!(finished.record.report, Some(report));
         assert_eq!(
-            task_view_after_reconciliation(&finished, Some(2))["status"],
+            reconciled_task_view(&finished.record, None, Some(2))["status"],
             "completed"
         );
         assert_eq!(
-            task_view_after_reconciliation(&finished, Some(3))["status"],
+            reconciled_task_view(&finished.record, None, Some(3))["status"],
             "not_modified"
         );
         begin_session_instance_shutdown(&instance);
